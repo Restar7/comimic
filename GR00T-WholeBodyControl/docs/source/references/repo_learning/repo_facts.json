@@ -1,0 +1,44 @@
+{
+  "repo_root": "/home/wusichen/GR00T-WholeBodyControl",
+  "git": {
+    "branch": "main",
+    "head": "bc38f6d0ce6cab4589e025037ad0bfbab7ba73d8",
+    "origin": "https://github.com/NVlabs/GR00T-WholeBodyControl",
+    "github_url": "https://github.com/NVlabs/GR00T-WholeBodyControl"
+  },
+  "package_systems": [
+    "poetry",
+    "uv",
+    "make"
+  ],
+  "key_files": [
+    "README.md",
+    "pyproject.toml",
+    "Makefile"
+  ],
+  "entrypoints": [
+    "decoupled_wbc/scripts/run_webcam_recorder.py",
+    "decoupled_wbc/sim2mujoco/scripts/run_mujoco_gear_wbc.py",
+    "decoupled_wbc/sim2mujoco/scripts/run_mujoco_gear_wbc_gait.py",
+    "gear_sonic/eval_agent_trl.py",
+    "gear_sonic/eval_exp.py",
+    "gear_sonic/scripts/run_camera_viewer.py",
+    "gear_sonic/scripts/run_data_exporter.py",
+    "gear_sonic/scripts/run_sim_loop.py",
+    "gear_sonic/train_agent_trl.py"
+  ],
+  "modes": [
+    "training",
+    "evaluation"
+  ],
+  "repo_kind": {
+    "primary": "infrastructure",
+    "scores": {
+      "application": 1,
+      "library": 1,
+      "research": 0,
+      "model-training": 2,
+      "infrastructure": 3
+    }
+  }
+}

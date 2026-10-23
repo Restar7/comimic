@@ -1,0 +1,14 @@
+{
+  "task": "handover",
+  "scene": "/home/wusichen/SONIC_DATA/deployment/gear_sonic/data/robot_model/model_data/g1/scene_43dof_handover.xml",
+  "prompt": "pick up the carton with the right hand, hand it over to the left hand, and place it into the box",
+  "seconds": 60.0,
+  "wall_seconds": 314.7,
+  "final_tilt_deg": 17.298340638697518,
+  "final_base": [
+    1.918804251324381,
+    -2.1107747380108757,
+    0.7867307813659612
+  ],
+  "fell": false
+}

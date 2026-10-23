@@ -1,0 +1,217 @@
+{
+  "protocol_version": "task4-random-clean34-initial-token-v1",
+  "evaluation_stamp": "20260802_224410",
+  "seed_hex": "8204bae7d0c91bf43b3246e98785233ea90212633e91ad5a0b693ac6482f8c06",
+  "assignments": {
+    "1": {
+      "episode_index": 0,
+      "file": "task4_episode_000000.json",
+      "sha256": "f48bd906e04c9a0b46f743cc17e3590a9e6d234aa5125709c555ec62f061ffb7",
+      "source_frame_index": 0,
+      "source_stream_mode": 1
+    },
+    "2": {
+      "episode_index": 3,
+      "file": "task4_episode_000003.json",
+      "sha256": "a237ee3f23b5b7b4b222d5d952b1e8887d6efe1b8312095201e4d642f9179f16",
+      "source_frame_index": 0,
+      "source_stream_mode": 1
+    },
+    "3": {
+      "episode_index": 31,
+      "file": "task4_episode_000031.json",
+      "sha256": "100235b38359bf05be377aea5f1fa2cb764b0342ddf5e4d755770d410770be2d",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "4": {
+      "episode_index": 29,
+      "file": "task4_episode_000029.json",
+      "sha256": "468326001b70c7b3ecb91c6158fcf0884a0b4f4cbe1a86f802f5f7738d35efc8",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "5": {
+      "episode_index": 19,
+      "file": "task4_episode_000019.json",
+      "sha256": "9a28b9d88e13d00322309ced4a3e2824ae693f1b9d97d5eaab78dc63e9b27782",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "6": {
+      "episode_index": 2,
+      "file": "task4_episode_000002.json",
+      "sha256": "b689fbff6d19e5f133e0fe8ece0d3bfb6ede1fa717666f91ce2fd853be5e812c",
+      "source_frame_index": 0,
+      "source_stream_mode": 1
+    },
+    "7": {
+      "episode_index": 33,
+      "file": "task4_episode_000033.json",
+      "sha256": "b7df6e29773bbb87a1aa92baeaea152a5a6078353bb2af423b43ee8c28a57d62",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "8": {
+      "episode_index": 25,
+      "file": "task4_episode_000025.json",
+      "sha256": "30d7137e509be35390ccf5fdb79b7f075b369708999ad4d633c1386dfd2222a3",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "9": {
+      "episode_index": 26,
+      "file": "task4_episode_000026.json",
+      "sha256": "2441443246daf76508407b8b089c50703f195129cbdf122732b19da458af393c",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "10": {
+      "episode_index": 30,
+      "file": "task4_episode_000030.json",
+      "sha256": "4ad223b6e671e646f25093ae0827427f3873b05bf43ac1e75c143e97a7fa38a9",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "11": {
+      "episode_index": 22,
+      "file": "task4_episode_000022.json",
+      "sha256": "13af71dedc05059e246fb58081a4fd80a34559adf4d764f4cea1bb5083911b72",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "12": {
+      "episode_index": 7,
+      "file": "task4_episode_000007.json",
+      "sha256": "5b8e7d0d4b61a9afd218d90b45d5b39b7e366d7edf27d9ba883f781e058802da",
+      "source_frame_index": 0,
+      "source_stream_mode": 1
+    },
+    "13": {
+      "episode_index": 6,
+      "file": "task4_episode_000006.json",
+      "sha256": "8c2ca79da0af3dacf58845fa6b375515a1799e79264fd7cefcbc23f64370b655",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "14": {
+      "episode_index": 11,
+      "file": "task4_episode_000011.json",
+      "sha256": "92657323bc76b53abddc37c5586eaf9722fc985e6413a338b353c0bd6d8cf38e",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "15": {
+      "episode_index": 10,
+      "file": "task4_episode_000010.json",
+      "sha256": "e62c9bb6fc77cb19ee0f8ee1f7ba4e481103776109f36cb969491f1afff509a9",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "16": {
+      "episode_index": 18,
+      "file": "task4_episode_000018.json",
+      "sha256": "526397ad85053ec8ed9ecf4ed177f216c20f3794606fcd54c99e21cdf4a0f7d4",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "17": {
+      "episode_index": 27,
+      "file": "task4_episode_000027.json",
+      "sha256": "4645d272e7801b1eeb20f42c11cefef63b58467a8a1f5e3073c093251b1602dd",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "18": {
+      "episode_index": 28,
+      "file": "task4_episode_000028.json",
+      "sha256": "4ae3b33803efc402a17f5adf11357ff475adc617dbf0b4a96e7dbdb18852bf6d",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "19": {
+      "episode_index": 20,
+      "file": "task4_episode_000020.json",
+      "sha256": "14c90c2f434bc274dabd26959b0dc543a6cdb7deab336b839150c4e55bf20c94",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "20": {
+      "episode_index": 24,
+      "file": "task4_episode_000024.json",
+      "sha256": "d323a0df0266c74dd7f7948247a202ff40b78bab544d6597ad0b9e1166c0a289",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "21": {
+      "episode_index": 17,
+      "file": "task4_episode_000017.json",
+      "sha256": "7059bc0a5ebbe662371890fe5c73f078b72c7c6eaf894c608a76c1b864e2c7b2",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "22": {
+      "episode_index": 21,
+      "file": "task4_episode_000021.json",
+      "sha256": "8731e44f4a54a368c9e2582f6685e7419ff5794914cc70971e817a3a9f17d159",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "23": {
+      "episode_index": 23,
+      "file": "task4_episode_000023.json",
+      "sha256": "b76745c48a9430cdffb4a85000e7fba4d76b6d7be012f422eed13d7c49053991",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "24": {
+      "episode_index": 13,
+      "file": "task4_episode_000013.json",
+      "sha256": "0aa0e7fe5b5bad39f77ed06e555dad50c174082c6ce48fa9936049de0615d3ac",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "25": {
+      "episode_index": 16,
+      "file": "task4_episode_000016.json",
+      "sha256": "ccb5e97b9e5481f6f7b40f436ba0917fd39b7dde623bbc73c67cd593161fa139",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "26": {
+      "episode_index": 9,
+      "file": "task4_episode_000009.json",
+      "sha256": "0e4f4ea895e5e1cd3f1cc6cc55fea294485ce5efd4c5b7bb22af17b1df0d0e1c",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "27": {
+      "episode_index": 5,
+      "file": "task4_episode_000005.json",
+      "sha256": "024e64d7c93bae7701e48dc6d7c4c34735ced2c7893e3de2d2b001432ff936cb",
+      "source_frame_index": 0,
+      "source_stream_mode": 5
+    },
+    "28": {
+      "episode_index": 32,
+      "file": "task4_episode_000032.json",
+      "sha256": "5c1e217d2ac10334a4cb337dfbba69da8ecad51c243801dd8e99a50e3fe55a63",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "29": {
+      "episode_index": 14,
+      "file": "task4_episode_000014.json",
+      "sha256": "fdbb17b974155b75082c50cd00ed74d147c09d0d3d384e81a3a81d736613a053",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    },
+    "30": {
+      "episode_index": 8,
+      "file": "task4_episode_000008.json",
+      "sha256": "33879e2ce6ab7451bdd543c8003c1d479df91ee0ea5c6269199110ed0f4dc52a",
+      "source_frame_index": 0,
+      "source_stream_mode": 3
+    }
+  }
+}

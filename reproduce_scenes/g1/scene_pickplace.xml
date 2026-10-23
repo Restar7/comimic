@@ -1,0 +1,181 @@
+<mujoco model="g1_pickplace scene">
+  <!--
+    ============================================================
+    G1 WALK + PICK YCB OBJECT + PLACE IN BOX
+    ============================================================
+    G1 walks 2.0m to a table, picks ONE OF 4 YCB objects
+    (apple, mug, banana, foam_brick) specified by language prompt,
+    places it in an open box.
+
+    YCB objects (real 3D meshes from ycbbenchmarks.com):
+      013_apple       (0.068 kg, red sphere-ish)
+      025_mug         (0.118 kg, white cylinder+handle)
+      011_banana      (0.066 kg, yellow curved)
+      061_foam_brick  (0.028 kg, blue rectangular)
+
+    IMPORTANT: before running, download YCB meshes:
+      bash install_scripts/download_ycb_objects.sh
+
+    Language prompts (4 variants):
+      "pick up the apple and place it in the box"
+      "pick up the mug and place it in the box"
+      "pick up the banana and place it in the box"
+      "pick up the foam brick and place it in the box"
+
+    Design references (see PICKPLACE_TASK.md for full citations):
+      - HumanoidBench cube (G1):       table 0.895m
+      - RoboCasa Counter:              0.92m (industry standard)
+      - Unitree G1 IsaacLab sim:       official cylinder r=1.8cm h=35cm
+      - ManiSkill PickSingleYCB:       reference for YCB in benchmarks
+      - LIBERO libero_object:          multi-object language grounding
+      - HumanoidBench package walk:    up to 2.8m; we use 2.0m fixed
+  -->
+
+  <include file="g1_29dof_with_hand.xml"/>
+  <compiler texturedir="meshes"/>
+
+  <statistic center="1.5 0 0.9" extent="4.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <!-- Ground / sky -->
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <!-- Table + box materials -->
+    <material name="table_wood"  rgba="0.55 0.35 0.20 1"/>
+    <material name="box_gray"    rgba="0.65 0.65 0.65 1"/>
+
+    <!-- YCB textures + meshes -->
+    <!-- (paths relative to meshdir="ycb"; expects files at gear_sonic/.../g1/ycb/) -->
+    <texture name="apple_tex"      type="2d" file="ycb/013_apple/texture_map.png"/>
+    <material name="apple_mat"     texture="apple_tex"      specular="0.2" shininess="0.3"/>
+    <mesh name="apple_mesh"        file="ycb/013_apple/textured.obj"/>
+
+    <texture name="mug_tex"        type="2d" file="ycb/025_mug/texture_map.png"/>
+    <material name="mug_mat"       texture="mug_tex"        specular="0.2" shininess="0.3"/>
+    <mesh name="mug_mesh"          file="ycb/025_mug/textured.obj"/>
+
+    <texture name="banana_tex"     type="2d" file="ycb/011_banana/texture_map.png"/>
+    <material name="banana_mat"    texture="banana_tex"     specular="0.2" shininess="0.3"/>
+    <mesh name="banana_mesh"       file="ycb/011_banana/textured.obj"/>
+
+    <texture name="brick_tex"      type="2d" file="ycb/061_foam_brick/texture_map.png"/>
+    <material name="brick_mat"     texture="brick_tex"      specular="0.2" shininess="0.3"/>
+    <mesh name="brick_mesh"        file="ycb/061_foam_brick/textured.obj"/>
+  </asset>
+
+  <worldbody>
+    <!-- Lighting -->
+    <light pos="0 0 3" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+    <light pos="2.0 0 2.5" dir="0 0 -1" diffuse="0.4 0.4 0.4"/>
+
+    <!-- Ground -->
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- ================================================================ -->
+    <!-- TABLE — 85cm top, LARGE: 70×110cm (was 50×80cm)                    -->
+    <!-- X (depth, front-back):  70cm      (1.65 to 2.35)                   -->
+    <!-- Y (width, left-right): 110cm      (-0.55 to +0.55)                 -->
+    <!-- Layout: 4 objects row on RIGHT (Y+), box on LEFT (Y-)              -->
+    <!-- ================================================================ -->
+    <body name="table" pos="2.0 0 0.415">
+      <geom name="table_top" type="box" pos="0 0 0.415" size="0.35 0.55 0.02"
+            material="table_wood" friction="1.0 0.005 0.0001"/>
+      <geom name="table_leg_1" type="cylinder" pos=" 0.32  0.52 0" size="0.025 0.415" material="table_wood"/>
+      <geom name="table_leg_2" type="cylinder" pos="-0.32  0.52 0" size="0.025 0.415" material="table_wood"/>
+      <geom name="table_leg_3" type="cylinder" pos=" 0.32 -0.52 0" size="0.025 0.415" material="table_wood"/>
+      <geom name="table_leg_4" type="cylinder" pos="-0.32 -0.52 0" size="0.025 0.415" material="table_wood"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- 4 YCB OBJECTS — arranged in 2×2 grid on left half of table         -->
+    <!-- Table top at z=0.90; objects sit slightly above to avoid penetration -->
+    <!-- ================================================================ -->
+
+    <!-- 013_apple: real mass 68g, sphere-ish, red -->
+    <body name="apple" pos="1.80 0.05 0.89">
+      <freejoint name="apple_freejoint"/>
+      <inertial pos="0 0 0" mass="0.068" diaginertia="4.4e-5 4.4e-5 4.4e-5"/>
+      <geom name="apple_geom" type="mesh" mesh="apple_mesh" material="apple_mat"
+            friction="1.0 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001"
+            contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- 025_mug: real mass 118g, cylinder w/ handle, white -->
+    <body name="mug" pos="1.80 0.15 0.89">
+      <freejoint name="mug_freejoint"/>
+      <inertial pos="0 0 0" mass="0.118" diaginertia="1.5e-4 1.5e-4 8.0e-5"/>
+      <geom name="mug_geom" type="mesh" mesh="mug_mesh" material="mug_mat"
+            friction="1.0 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001"
+            contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- 011_banana: real mass 66g, elongated curved, yellow -->
+    <body name="banana" pos="1.80 0.25 0.88">
+      <freejoint name="banana_freejoint"/>
+      <inertial pos="0 0 0" mass="0.066" diaginertia="1.5e-4 3.0e-5 1.5e-4"/>
+      <geom name="banana_geom" type="mesh" mesh="banana_mesh" material="banana_mat"
+            friction="1.0 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001"
+            contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- 061_foam_brick: real mass 28g, box, blue -->
+    <body name="foam_brick" pos="1.80 0.35 0.88">
+      <freejoint name="brick_freejoint"/>
+      <inertial pos="0 0 0" mass="0.028" diaginertia="4.0e-5 4.0e-5 4.0e-5"/>
+      <geom name="brick_geom" type="mesh" mesh="brick_mesh" material="brick_mat"
+            friction="1.0 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001"
+            contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- OPEN BOX — 5 walls (no top), LARGER: 24×24×15cm interior           -->
+    <!-- Interior: 24×24×15cm; walls 1.5cm thick                            -->
+    <!-- Position: (2.00, -0.30, 0.85) — LEFT side of table                 -->
+    <!-- ================================================================ -->
+    <body name="box" pos="1.80 -0.30 0.85">
+      <geom name="box_floor"      type="box" pos="0 0 0.008"      size="0.13 0.13 0.008" material="box_gray"/>
+      <geom name="box_wall_north" type="box" pos=" 0.123 0 0.083" size="0.008 0.13 0.075" material="box_gray"/>
+      <geom name="box_wall_south" type="box" pos="-0.123 0 0.083" size="0.008 0.13 0.075" material="box_gray"/>
+      <geom name="box_wall_east"  type="box" pos=" 0  0.123 0.083" size="0.13 0.008 0.075" material="box_gray"/>
+      <geom name="box_wall_west"  type="box" pos=" 0 -0.123 0.083" size="0.13 0.008 0.075" material="box_gray"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- SITES for success detection (invisible)                            -->
+    <!-- ================================================================ -->
+    <site name="apple_init"       pos="1.80  0.05 0.89" size="0.005" rgba="1 0 0 0.3"/>
+    <site name="mug_init"         pos="1.80  0.15 0.89" size="0.005" rgba="1 1 1 0.3"/>
+    <site name="banana_init"      pos="1.80  0.25 0.88" size="0.005" rgba="1 1 0 0.3"/>
+    <site name="foam_brick_init"  pos="1.80  0.35 0.88" size="0.005" rgba="0 0 1 0.3"/>
+    <site name="box_center"       pos="1.80 -0.30 0.93" size="0.005" rgba="0.5 0.5 0.5 0.3"/>
+    <site name="table_center"     pos="2.00  0.00 0.85" size="0.005" rgba="1 1 0 0.3"/>
+
+    <!-- CoM marker removed for cleaner renders (was: red sphere at 0.1,0,0) -->
+
+    <!-- ================================================================ -->
+    <!-- CAMERAS                                                            -->
+    <!-- ================================================================ -->
+    <camera name="ego_view"   mode="fixed" pos="0 0 1.65"     euler="1.4 0 -1.5708" fovy="60"/>
+    <camera name="agentview"  mode="fixed" pos="1.0 0 1.75"   xyaxes="0 -1 0 0.5 0 0.87" fovy="55"/>
+    <camera name="side_view"  mode="fixed" pos="1.5 -2.5 1.5" xyaxes="1 0.5 0 -0.3 0.6 1" fovy="55"/>
+    <camera name="top_down"   mode="fixed" pos="2.0 0 3.0"    euler="0 0 0" fovy="45"/>
+  </worldbody>
+
+  <default>
+    <geom friction="1.0"/>
+  </default>
+
+  <!--
+    NO explicit keyframe — MuJoCo uses each body's `pos` attribute as initial state.
+    G1 pelvis: (0,0,0.78) from g1_29dof_with_hand.xml; objects: their <body pos="...">.
+  -->
+</mujoco>

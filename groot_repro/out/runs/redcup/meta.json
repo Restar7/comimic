@@ -1,0 +1,14 @@
+{
+  "task": "redcup",
+  "scene": "/home/wusichen/SONIC_DATA/deployment/gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml",
+  "prompt": "Pick up the red cup, place it into the upper drawer of the cabinet, and close the drawer.",
+  "seconds": 60.0,
+  "wall_seconds": 305.9,
+  "final_tilt_deg": 4.683795627510082,
+  "final_base": [
+    0.039091455763367935,
+    0.005165591188413024,
+    0.7840020460742599
+  ],
+  "fell": false
+}

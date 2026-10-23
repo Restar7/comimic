@@ -1,0 +1,15 @@
+<mujoco model="livingroom_with_bed">
+  <compiler angle="degree"/>
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.35 0.35 0.35" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+  </visual>
+  <worldbody>
+    <light name="sun" pos="4 4 6" dir="0 0 -1" directional="true" diffuse="0.9 0.9 0.9"/>
+    <light name="fill" pos="8 0 3" dir="-1 1 -0.6" directional="true" diffuse="0.4 0.4 0.4"/>
+    <attach model="/home/wusichen/groot_repro/assets/livingroom/model_eb5ee53f325bf417_2144154.xml" body="world" prefix="room_"/>
+    <body name="bed_anchor" pos="2.0 3.0 0.0">
+      <attach model="/home/wusichen/groot_repro/scenes/bed_static.xml" body="bed_anchor" prefix="bed_"/>
+    </body>
+  </worldbody>
+</mujoco>

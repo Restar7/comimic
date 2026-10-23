@@ -1,0 +1,14 @@
+{
+  "task": "apple",
+  "scene": "/home/wusichen/SONIC_DATA/deployment/gear_sonic/data/robot_model/model_data/g1/scene_pickplace.xml",
+  "prompt": "Pick up the apple from the table in front of you, turn around, walk to the table behind you, and place the apple into the box.",
+  "seconds": 60.0,
+  "wall_seconds": 296.8,
+  "final_tilt_deg": 14.014338306947664,
+  "final_base": [
+    0.7183505992940578,
+    -1.0080299568968674,
+    0.7828621340272846
+  ],
+  "fell": false
+}

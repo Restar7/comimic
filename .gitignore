@@ -1,0 +1,19 @@
+# Python / test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local scratch
+*.log
+
+# Large G1 mesh assets (163 MB). Fetch separately, then run scripts/setup_assets.sh.
+reproduce_scenes/g1/meshes/
+GR00T-WholeBodyControl/gear_sonic_deploy/g1/meshes

@@ -1,0 +1,172 @@
+<mujoco model="g1_43dof bimanual-handover scene">
+  <!--
+    ============================================================
+    T6 — BIMANUAL HANDOVER  (stationary: right hand -> midline -> left hand)
+    ============================================================
+    ACTIVE task scene (config ROBOT_SCENE points here, original path).
+    Stationary tabletop task, both within arm reach:
+      - RIGHT: a large flat TRAY (source, robot's -Y side) holding three objects
+      - LEFT : a large open BOX (target, robot's +Y side), empty
+    Coupling axis: cross-midline hand-to-hand relay (both arms coordinate).
+
+    Layout (robot spawns at origin (0,0,0.78), facing +X; right = -Y, left = +Y):
+      - Table (wood)  center (0.60, 0), top 0.75 m, 0.54(X) x 1.10(Y) m
+      - Source TRAY   center (0.48, -0.32) on the table  (0.30 x 0.24 m, low ~3.6cm rim)
+      - Target BOX    center (0.44, +0.34) on the table  (interior ~0.21 x 0.21 x 0.11 m, open top)
+      - Objects       three items on the tray (pick one to hand over)
+      Tray/box ~0.66 m apart -> each reached by its OWN arm; the far one is
+      awkward for the near arm, so a real handover is encouraged.
+
+    Phases (all reachable standing in place):
+      1. RIGHT hand picks one box off the tray (-Y)
+      2. bring it to the body midline; hand it to the LEFT hand
+      3. LEFT hand places it into the target box (+Y)
+
+    Success (see tasks/T6_bimanual_handover/check_handover_success.py):
+      - object inside the TARGET (left) box (near site "tgt_box_inside")
+      - object handed across the midline, not dropped, robot not fallen
+
+    YCB objects (google_16k, must exist under meshes/ycb/) — all single-hand graspable:
+      004_sugar_box       ~3.8 x 8.9 x 17.5 cm  (tall slim box)
+      008_pudding_box     ~3.5 x 11 x 9 cm      (slim flat box)
+      005_tomato_soup_can ~6.6 dia x 10 cm      (can)
+    Covered by install_scripts/download_ycb_objects.sh.
+  -->
+
+  <include file="g1_29dof_with_hand.xml"/>
+  <!-- Note that the hand model in g1_29dof_with_hand.xml is not stable for simulation. -->
+  <compiler texturedir="meshes"/>
+
+  <statistic center="0.4 0 0.7" extent="3.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-20" offwidth="1280" offheight="960"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <material name="table_wood"  rgba="0.55 0.35 0.20 1"/>
+    <material name="tray_mat"    rgba="0.72 0.72 0.75 1"/>   <!-- source (right): light-gray tray -->
+    <material name="tgt_box_mat" rgba="0.25 0.45 0.55 1"/>   <!-- target (left): teal, "put here" -->
+
+    <!-- YCB objects: two slim rectangular boxes (carton-like, easy single-hand grasp) -->
+    <texture name="sugar_tex" type="2d" file="ycb/004_sugar_box/texture_map.png"/>
+    <material name="sugar_mat" texture="sugar_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="sugar_mesh" file="ycb/004_sugar_box/textured.obj"/>
+
+    <texture name="pudding_tex" type="2d" file="ycb/008_pudding_box/texture_map.png"/>
+    <material name="pudding_mat" texture="pudding_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="pudding_mesh" file="ycb/008_pudding_box/textured.obj"/>
+
+    <texture name="can_tex" type="2d" file="ycb/005_tomato_soup_can/texture_map.png"/>
+    <material name="can_mat" texture="can_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="can_mesh" file="ycb/005_tomato_soup_can/textured.obj"/>
+  </asset>
+
+  <worldbody>
+    <!-- Lighting -->
+    <light pos="0 0 3" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+    <light pos="0.6  0.4 2.5" dir="0 0 -1" diffuse="0.35 0.35 0.35"/>
+    <light pos="0.6 -0.4 2.5" dir="0 0 -1" diffuse="0.35 0.35 0.35"/>
+
+    <!-- Ground -->
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- ================================================================ -->
+    <!-- TABLE (wood) — center (0.60, 0), top 0.75 m, 0.54(X) x 1.10(Y)    -->
+    <!-- moved back a touch so the robot has a small gap to the table      -->
+    <!-- ================================================================ -->
+    <body name="table_A" pos="0.60 0 0.365">
+      <geom name="tableA_top" type="box" pos="0 0 0.365" size="0.27 0.55 0.02"
+            material="table_wood" friction="1.0 0.005 0.0001"/>
+      <geom name="tableA_leg_1" type="cylinder" pos=" 0.24  0.52 0" size="0.025 0.365" material="table_wood"/>
+      <geom name="tableA_leg_2" type="cylinder" pos="-0.24  0.52 0" size="0.025 0.365" material="table_wood"/>
+      <geom name="tableA_leg_3" type="cylinder" pos=" 0.24 -0.52 0" size="0.025 0.365" material="table_wood"/>
+      <geom name="tableA_leg_4" type="cylinder" pos="-0.24 -0.52 0" size="0.025 0.365" material="table_wood"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- SOURCE TRAY (right, -Y) — large flat tray with a low rim         -->
+    <!-- center (0.48, -0.32), pulled to the near table edge; 0.30 x 0.24 m -->
+    <!-- ================================================================ -->
+    <body name="src_tray" pos="0.48 -0.32 0.756">
+      <geom name="tray_floor" type="box" pos="0 0 0"        size="0.15 0.12 0.006" material="tray_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tray_rim_px" type="box" pos=" 0.144 0 0.018" size="0.006 0.114 0.018" material="tray_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tray_rim_nx" type="box" pos="-0.144 0 0.018" size="0.006 0.114 0.018" material="tray_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tray_rim_py" type="box" pos="0  0.114 0.018" size="0.15 0.006 0.018" material="tray_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tray_rim_ny" type="box" pos="0 -0.114 0.018" size="0.15 0.006 0.018" material="tray_mat"
+            friction="1.0 0.005 0.0001"/>
+      <site name="src_tray_inside" pos="0 0 0.03" size="0.008" rgba="1 0.6 0 0.4" type="sphere"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- TARGET BOX (left, +Y) — large open-top box (place object here)   -->
+    <!-- center (0.44, +0.34), pulled to the near table edge; interior ~0.21x0.21x0.11 -->
+    <!-- ================================================================ -->
+    <body name="tgt_box" pos="0.44 0.34 0.816">
+      <geom name="tgt_floor" type="box" pos="0 0 -0.06"  size="0.11 0.11 0.006" material="tgt_box_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tgt_wall_px" type="box" pos=" 0.11 0 0" size="0.006 0.11 0.06" material="tgt_box_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tgt_wall_nx" type="box" pos="-0.11 0 0" size="0.006 0.11 0.06" material="tgt_box_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tgt_wall_py" type="box" pos="0  0.11 0" size="0.11 0.006 0.06" material="tgt_box_mat"
+            friction="1.0 0.005 0.0001"/>
+      <geom name="tgt_wall_ny" type="box" pos="0 -0.11 0" size="0.11 0.006 0.06" material="tgt_box_mat"
+            friction="1.0 0.005 0.0001"/>
+      <!-- success site: interior of the target box -->
+      <site name="tgt_box_inside" pos="0 0 -0.03" size="0.012" rgba="0 1 0 0.5" type="sphere"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- OBJECTS — three items on the SOURCE tray (pick one to hand over) -->
+    <!-- friction 2.0 for a stable single-hand grasp.                     -->
+    <!-- ================================================================ -->
+    <!-- 004_sugar_box: tall slim box (~3.8 x 8.9 x 17.5 cm, milk-carton-like) -->
+    <body name="sugar_box" pos="0.40 -0.28 0.83">
+      <freejoint name="sugar_freejoint"/>
+      <inertial pos="0 0 0" mass="0.17" diaginertia="5.0e-4 4.0e-4 1.5e-4"/>
+      <geom name="sugar_geom" type="mesh" mesh="sugar_mesh" material="sugar_mat"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <!-- 008_pudding_box: slim flat box (~3.5 x 11 x 9 cm) -->
+    <body name="pudding_box" pos="0.56 -0.29 0.80">
+      <freejoint name="pudding_freejoint"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="2.5e-4 3.0e-4 1.2e-4"/>
+      <geom name="pudding_geom" type="mesh" mesh="pudding_mesh" material="pudding_mat"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <!-- 005_tomato_soup_can: ~10 cm tall, ~6.6 cm dia cylinder -->
+    <body name="tomato_soup_can" pos="0.48 -0.37 0.82">
+      <freejoint name="can_freejoint"/>
+      <inertial pos="0 0 0" mass="0.349" diaginertia="4.0e-4 4.0e-4 2.0e-4"/>
+      <geom name="can_geom" type="mesh" mesh="can_mesh" material="can_mat"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <!-- Reference sites -->
+    <site name="handover_zone" pos="0.42 0 0.95" size="0.006" rgba="1 1 0 0.3" type="sphere"/>
+
+    <!-- Cameras -->
+    <camera name="ego_view"   mode="fixed" pos="0 0 1.65" euler="1.4 0 -1.5708" fovy="90"/>
+    <camera name="front_view" mode="fixed" pos="-1.4 0 1.5" xyaxes="0 -1 0 0.5 0 0.87" fovy="55"/>
+    <camera name="top_down"   mode="fixed" pos="0.5 0 2.3" euler="0 0 0" fovy="60"/>
+    <camera name="q3_view"    mode="fixed" pos="-0.7 -1.3 1.6" xyaxes="0.88 -0.47 0 0.22 0.41 0.88" fovy="55"/>
+  </worldbody>
+
+  <default>
+    <geom friction="1.0"/>
+  </default>
+</mujoco>

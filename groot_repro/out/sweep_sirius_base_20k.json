@@ -1,0 +1,84 @@
+{
+  "checkpoint": "ckpt_views/sirius_base_20k",
+  "embodiment_tag": "unitree_g1_sonic",
+  "dataset": "/home/wusichen/SONIC_DATA/2026-07-14/datasets/2026-07-14-20-30-01",
+  "episode": 0,
+  "prompt": "Pick up the apple from the table in front of you, turn around, walk to the table behind you, and place the apple into the box.",
+  "device": "cpu",
+  "load_seconds": 13.6,
+  "frames": [
+    {
+      "frame_index": 800,
+      "image_shape": [
+        480,
+        640,
+        3
+      ],
+      "samples": [
+        {
+          "sample_index": 0,
+          "seconds": 29.102,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.03654858097434044,
+              "rmse": 0.045115645974874496,
+              "max_abs_error": 0.12249755859375,
+              "correlation": 0.9484513998031616,
+              "quantized_1_16_match_fraction": 0.496875,
+              "pred_min": -0.37188720703125,
+              "pred_max": 0.267578125,
+              "target_min": -0.375,
+              "target_max": 0.25
+            },
+            "left_hand_joints": {
+              "mae": 0.0014278738526627421,
+              "rmse": 0.0029450629372149706,
+              "max_abs_error": 0.01171875,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.01171875,
+              "pred_max": 0.0068359375,
+              "target_min": 0.0,
+              "target_max": 0.0
+            },
+            "right_hand_joints": {
+              "mae": 0.008423549123108387,
+              "rmse": 0.011919035576283932,
+              "max_abs_error": 0.03515625,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 0.9821428571428571,
+              "pred_min": -0.01503906212747097,
+              "pred_max": 0.03515625,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "motion_token": {
+      "mae_mean": 0.03654858097434044,
+      "mae_min": 0.03654858097434044,
+      "correlation_mean": 0.9484513998031616
+    },
+    "left_hand_joints": {
+      "mae_mean": 0.0014278738526627421,
+      "mae_min": 0.0014278738526627421,
+      "correlation_mean": NaN
+    },
+    "right_hand_joints": {
+      "mae_mean": 0.008423549123108387,
+      "mae_min": 0.008423549123108387,
+      "correlation_mean": NaN
+    }
+  },
+  "num_frames": 1,
+  "num_samples_per_frame": 1,
+  "seconds_per_inference": {
+    "mean": 29.102,
+    "min": 29.102,
+    "max": 29.102
+  }
+}

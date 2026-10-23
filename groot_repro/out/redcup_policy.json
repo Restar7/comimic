@@ -1,0 +1,50 @@
+[
+  {
+    "chunk": 0,
+    "infer_seconds": 28.67
+  },
+  {
+    "chunk": 1,
+    "infer_seconds": 26.9
+  },
+  {
+    "chunk": 2,
+    "infer_seconds": 27.69
+  },
+  {
+    "chunk": 3,
+    "infer_seconds": 28.98
+  },
+  {
+    "chunk": 4,
+    "infer_seconds": 26.29
+  },
+  {
+    "chunk": 5,
+    "infer_seconds": 28.16
+  },
+  {
+    "chunk": 6,
+    "infer_seconds": 26.92
+  },
+  {
+    "chunk": 7,
+    "infer_seconds": 27.7
+  },
+  {
+    "chunk": 8,
+    "infer_seconds": 25.75
+  },
+  {
+    "chunk": 9,
+    "infer_seconds": 25.99
+  },
+  {
+    "chunk": 10,
+    "infer_seconds": 28.63
+  },
+  {
+    "chunk": 11,
+    "infer_seconds": 23.78
+  }
+]

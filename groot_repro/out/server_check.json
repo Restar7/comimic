@@ -1,0 +1,85 @@
+{
+  "host": "127.0.0.1",
+  "port": 5550,
+  "frame": 1000,
+  "samples": [
+    {
+      "sample_index": 0,
+      "metrics": {
+        "motion_token": {
+          "mae": 0.05110524967312813,
+          "rmse": 0.06875061988830566,
+          "max_abs_error": 0.2457275390625,
+          "correlation": 0.8870750069618225,
+          "quantized_1_16_match_fraction": 0.428125,
+          "pred_min": -0.2958984375,
+          "pred_max": 0.310546875,
+          "target_min": -0.4375,
+          "target_max": 0.3125
+        },
+        "left_hand_joints": {
+          "mae": 0.0013943916419520974,
+          "rmse": 0.0032713490072637796,
+          "max_abs_error": 0.017578125,
+          "correlation": NaN,
+          "quantized_1_16_match_fraction": 1.0,
+          "pred_min": -0.017578125,
+          "pred_max": 0.0068359375,
+          "target_min": 0.0,
+          "target_max": 0.0
+        },
+        "right_hand_joints": {
+          "mae": 0.001986606977880001,
+          "rmse": 0.003438316285610199,
+          "max_abs_error": 0.01171875,
+          "correlation": NaN,
+          "quantized_1_16_match_fraction": 1.0,
+          "pred_min": -0.00820312462747097,
+          "pred_max": 0.01171875,
+          "target_min": 0.0,
+          "target_max": 0.0
+        }
+      },
+      "info_keys": []
+    },
+    {
+      "sample_index": 1,
+      "metrics": {
+        "motion_token": {
+          "mae": 0.04797818511724472,
+          "rmse": 0.06429196894168854,
+          "max_abs_error": 0.236572265625,
+          "correlation": 0.9037619829177856,
+          "quantized_1_16_match_fraction": 0.42578125,
+          "pred_min": -0.328857421875,
+          "pred_max": 0.30810546875,
+          "target_min": -0.4375,
+          "target_max": 0.3125
+        },
+        "left_hand_joints": {
+          "mae": 0.0025857980363070965,
+          "rmse": 0.004715073853731155,
+          "max_abs_error": 0.017578125,
+          "correlation": NaN,
+          "quantized_1_16_match_fraction": 1.0,
+          "pred_min": -0.017578125,
+          "pred_max": 0.0068359375,
+          "target_min": 0.0,
+          "target_max": 0.0
+        },
+        "right_hand_joints": {
+          "mae": 0.002438616007566452,
+          "rmse": 0.004296304192394018,
+          "max_abs_error": 0.017578125,
+          "correlation": NaN,
+          "quantized_1_16_match_fraction": 1.0,
+          "pred_min": -0.010937499813735485,
+          "pred_max": 0.017578125,
+          "target_min": 0.0,
+          "target_max": 0.0
+        }
+      },
+      "info_keys": []
+    }
+  ]
+}

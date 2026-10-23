@@ -1,0 +1,171 @@
+<mujoco model="g1_43dof scene">
+  <!--
+    ============================================================
+    TWO-TABLE CARRY TASK (walk → pick → turn → walk → place)
+    ============================================================
+    DATASET-ALIGNED EVALUATION VARIANT.
+
+    Keeps the exact two-table object layout used by carton data collection
+    (including the blue pitcher) while selecting the carton-aligned robot
+    root/camera placement used by the deployment evaluation.
+    Only OBJECT friction raised to 2.0; global default friction
+    kept at the original 1.0.
+
+    Layout:
+      - G1 spawns at world origin (0, 0, 0.78), facing +X
+      - Table A (source, wood)  at ( 1.5, 0): 4 YCB objects on near edge
+      - Table B (target, white) at (-1.5, 0): open box on near edge
+    Task:
+      1. walk ~1.2m forward to Table A
+      2. pick the target object
+      3. turn 180°
+      4. walk ~2.6m to Table B
+      5. place object into the open box
+
+    YCB objects (google_16k, must exist in meshes/ycb/):
+      019_pitcher_base     13.3×19.2cm cross (w/ handle), 24.6cm tall
+      006_mustard_bottle   5.8×9.6cm cross, 19.1cm tall
+      021_bleach_cleanser  6.8×9.8cm cross, 25.4cm tall
+      004_sugar_box        4.5×9.3cm cross, 17.6cm tall
+  -->
+
+  <include file="g1_29dof_with_hand_carton_aligned.xml"/>
+  <!-- Note that the hand model in g1_29dof_with_hand.xml is not stable for simulation. -->
+  <compiler texturedir="meshes"/>
+
+  <statistic center="0 0 0.7" extent="5.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <material name="table_wood"  rgba="0.55 0.35 0.20 1"/>
+    <material name="table_white" rgba="0.85 0.85 0.82 1"/>
+    <material name="box_gray"    rgba="0.65 0.65 0.65 1"/>
+
+    <!-- YCB assets -->
+    <texture name="mustard_tex" type="2d" file="ycb/006_mustard_bottle/texture_map.png"/>
+    <material name="mustard_mat" texture="mustard_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="mustard_mesh" file="ycb/006_mustard_bottle/textured.obj"/>
+
+    <texture name="bleach_tex" type="2d" file="ycb/021_bleach_cleanser/texture_map.png"/>
+    <material name="bleach_mat" texture="bleach_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="bleach_mesh" file="ycb/021_bleach_cleanser/textured.obj"/>
+
+    <texture name="sugar_tex" type="2d" file="ycb/004_sugar_box/texture_map.png"/>
+    <material name="sugar_mat" texture="sugar_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="sugar_mesh" file="ycb/004_sugar_box/textured.obj"/>
+
+    <texture name="pitcher_tex" type="2d" file="ycb/019_pitcher_base/texture_map.png"/>
+    <material name="pitcher_mat" texture="pitcher_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="pitcher_mesh" file="ycb/019_pitcher_base/textured.obj"/>
+  </asset>
+
+  <worldbody>
+    <!-- Lighting -->
+    <light pos="0 0 3" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+    <light pos="1.5 0 2.5" dir="0 0 -1" diffuse="0.35 0.35 0.35"/>
+    <light pos="-1.5 0 2.5" dir="0 0 -1" diffuse="0.35 0.35 0.35"/>
+
+    <!-- Ground -->
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- ================================================================ -->
+    <!-- TABLE A (source, wood) — center (1.5, 0), top 0.85m, 70×110cm     -->
+    <!-- X span: 1.15 → 1.85 (near edge at 1.15 facing robot)              -->
+    <!-- ================================================================ -->
+    <body name="table_A" pos="1.5 0 0.415">
+      <geom name="tableA_top" type="box" pos="0 0 0.415" size="0.35 0.55 0.02"
+            material="table_wood" friction="1.0 0.005 0.0001"/>
+      <geom name="tableA_leg_1" type="cylinder" pos=" 0.32  0.52 0" size="0.025 0.415" material="table_wood"/>
+      <geom name="tableA_leg_2" type="cylinder" pos="-0.32  0.52 0" size="0.025 0.415" material="table_wood"/>
+      <geom name="tableA_leg_3" type="cylinder" pos=" 0.32 -0.52 0" size="0.025 0.415" material="table_wood"/>
+      <geom name="tableA_leg_4" type="cylinder" pos="-0.32 -0.52 0" size="0.025 0.415" material="table_wood"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- TABLE B (target, white) — center (-1.5, 0), top 0.85m, 70×110cm   -->
+    <!-- X span: -1.15 → -1.85 (near edge at -1.15 facing robot)           -->
+    <!-- ================================================================ -->
+    <body name="table_B" pos="-1.5 0 0.415">
+      <geom name="tableB_top" type="box" pos="0 0 0.415" size="0.35 0.55 0.02"
+            material="table_white" friction="1.0 0.005 0.0001"/>
+      <geom name="tableB_leg_1" type="cylinder" pos=" 0.32  0.52 0" size="0.025 0.415" material="table_white"/>
+      <geom name="tableB_leg_2" type="cylinder" pos="-0.32  0.52 0" size="0.025 0.415" material="table_white"/>
+      <geom name="tableB_leg_3" type="cylinder" pos=" 0.32 -0.52 0" size="0.025 0.415" material="table_white"/>
+      <geom name="tableB_leg_4" type="cylinder" pos="-0.32 -0.52 0" size="0.025 0.415" material="table_white"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- 4 YCB OBJECTS on Table A near edge (x=1.22), spread along Y       -->
+    <!-- Spawn slightly above table; physics settles them on reset         -->
+    <!-- NOTE: object friction raised to 2.0 (easier stable grasp);        -->
+    <!--       tables/floor keep original friction                          -->
+    <!-- ================================================================ -->
+    <!-- 019_pitcher_base: 178g, blue pitcher w/ handle (Stanley-like), 24.6cm tall -->
+    <body name="pitcher" pos="1.22 -0.30 0.99">
+      <freejoint name="pitcher_freejoint"/>
+      <inertial pos="0 0 0" euler="0 0 180" mass="0.178" diaginertia="1.1e-3 1.1e-3 4.0e-4"/>
+      <geom name="pitcher_geom" type="mesh" mesh="pitcher_mesh" material="pitcher_mat"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <body name="mustard_bottle" pos="1.22 -0.10 0.96">
+      <freejoint name="mustard_freejoint"/>
+      <inertial pos="0 0 0" mass="0.19" diaginertia="6.0e-4 6.0e-4 1.2e-4"/>
+      <geom name="mustard_geom" type="mesh" mesh="mustard_mesh" material="mustard_mat"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <body name="bleach_cleanser" pos="1.22 0.10 0.98">
+      <freejoint name="bleach_freejoint"/>
+      <inertial pos="0 0 0" mass="0.30" diaginertia="1.4e-3 1.4e-3 2.0e-4"/>
+      <geom name="bleach_geom" type="mesh" mesh="bleach_mesh" material="bleach_mat"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <body name="sugar_box" pos="1.22 0.30 0.95">
+      <freejoint name="sugar_freejoint"/>
+      <inertial pos="0 0 0" mass="0.17" diaginertia="5.0e-4 4.0e-4 1.5e-4"/>
+      <geom name="sugar_geom" type="mesh" mesh="sugar_mesh" material="sugar_mat"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+
+    <!-- ================================================================ -->
+    <!-- OPEN BOX on Table B near edge — interior 24×24×15cm               -->
+    <!-- ================================================================ -->
+    <body name="box" pos="-1.22 0 0.85">
+      <geom name="box_floor"      type="box" pos="0 0 0.008"      size="0.13 0.13 0.008" material="box_gray"/>
+      <geom name="box_wall_north" type="box" pos=" 0.123 0 0.083" size="0.008 0.13 0.075" material="box_gray"/>
+      <geom name="box_wall_south" type="box" pos="-0.123 0 0.083" size="0.008 0.13 0.075" material="box_gray"/>
+      <geom name="box_wall_east"  type="box" pos=" 0  0.123 0.083" size="0.13 0.008 0.075" material="box_gray"/>
+      <geom name="box_wall_west"  type="box" pos=" 0 -0.123 0.083" size="0.13 0.008 0.075" material="box_gray"/>
+    </body>
+
+    <!-- Sites for success detection -->
+    <site name="tableA_center" pos="1.50 0 0.85"  size="0.005" rgba="1 1 0 0.3"/>
+    <site name="tableB_center" pos="-1.50 0 0.85" size="0.005" rgba="1 1 0 0.3"/>
+    <site name="box_center"    pos="-1.22 0 0.93" size="0.005" rgba="0.5 0.5 0.5 0.3"/>
+
+    <!-- Site from original scene (kept) -->
+    <site name="com_marker" pos="0.1 0 0" size="0.05" rgba="1 0 0 1" type="sphere"/>
+
+    <!-- Cameras -->
+    <camera name="ego_view"  mode="fixed" pos="0 0 1.65" euler="1.4 0 -1.5708" fovy="90"/>
+    <camera name="side_view" mode="fixed" pos="0 -3.5 2.0" xyaxes="1 0 0 0 0.5 0.87" fovy="60"/>
+    <camera name="top_down"  mode="fixed" pos="0 0 4.5" euler="0 0 0" fovy="60"/>
+    <camera name="tableA_view" mode="fixed" pos="2.8 -1.2 1.6" xyaxes="-0.4 -0.9 0 0.3 -0.15 0.94" fovy="55"/>
+  </worldbody>
+
+  <default>
+    <geom friction="1.0"/>
+  </default>
+</mujoco>

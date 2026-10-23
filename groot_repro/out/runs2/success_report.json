@@ -1,0 +1,76 @@
+{
+  "handover": {
+    "success": false,
+    "success_time_s": null,
+    "final_delta": [
+      -0.04,
+      -0.62,
+      -0.055
+    ],
+    "seconds": 60.0,
+    "final_tilt_deg": 17.298340638697518,
+    "fell": false
+  },
+  "redcup": {
+    "success": false,
+    "stage": "object_moved",
+    "in_drawer": false,
+    "drawer_max_open_m": 0.0,
+    "drawer_final_offset_m": 0.0,
+    "cup_lift_m": 0.0,
+    "cup_final": [
+      0.4,
+      -0.2,
+      0.749
+    ],
+    "drawer_final": [
+      0.585,
+      0.0,
+      0.825
+    ],
+    "seconds": 60.0,
+    "final_tilt_deg": 6.435992154846123,
+    "fell": false
+  },
+  "apple": {
+    "success": false,
+    "success_time_s": null,
+    "object_final": [
+      1.801,
+      0.047,
+      0.85
+    ],
+    "box_final": [
+      1.8,
+      -0.3,
+      0.85
+    ],
+    "min_obj_box_dist_m": 0.347,
+    "max_lift_m": 0.0,
+    "ever_inside_box": false,
+    "seconds": 60.0,
+    "final_tilt_deg": 14.014338306947664,
+    "fell": false
+  },
+  "carton": {
+    "success": false,
+    "success_time_s": null,
+    "object_final": [
+      1.22,
+      0.3,
+      0.849
+    ],
+    "box_final": [
+      -1.22,
+      0.0,
+      0.85
+    ],
+    "min_obj_box_dist_m": 2.4584,
+    "max_lift_m": 0.0,
+    "ever_inside_box": false,
+    "min_carton_box_dist_m": 2.4584,
+    "seconds": 60.0,
+    "final_tilt_deg": 10.938171512469532,
+    "fell": false
+  }
+}

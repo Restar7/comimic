@@ -1,0 +1,14 @@
+{
+  "task": "carton",
+  "scene": "/home/wusichen/SONIC_DATA/deployment/gear_sonic/data/robot_model/model_data/g1/scene_43dof_two_table.xml",
+  "prompt": "Pick up the carton from the table in front of you, turn around, walk to the table behind you, and place the carton into the box.",
+  "seconds": 60.0,
+  "wall_seconds": 317.1,
+  "final_tilt_deg": 10.938171512469532,
+  "final_base": [
+    0.2703724585583401,
+    0.0015422320835491734,
+    0.778040072573502
+  ],
+  "fell": false
+}

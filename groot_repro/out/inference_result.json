@@ -1,0 +1,543 @@
+{
+  "checkpoint": "/home/wusichen/groot_repro/ckpt_sirius_50k",
+  "embodiment_tag": "unitree_g1_sonic",
+  "dataset": "/home/wusichen/SONIC_DATA/2026-07-14/datasets/2026-07-14-20-30-01",
+  "episode": 0,
+  "prompt": "Pick up the apple from the table in front of you, turn around, walk to the table behind you, and place the apple into the box.",
+  "device": "cpu",
+  "load_seconds": 14.2,
+  "frames": [
+    {
+      "frame_index": 0,
+      "image_shape": [
+        480,
+        640,
+        3
+      ],
+      "samples": [
+        {
+          "sample_index": 0,
+          "seconds": 17.39,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.08844878524541855,
+              "rmse": 0.11151840537786484,
+              "max_abs_error": 0.406005859375,
+              "correlation": 0.7005318999290466,
+              "quantized_1_16_match_fraction": 0.196484375,
+              "pred_min": -0.41949462890625,
+              "pred_max": 0.46728515625,
+              "target_min": -0.375,
+              "target_max": 0.3125
+            },
+            "left_hand_joints": {
+              "mae": 0.0018205915112048388,
+              "rmse": 0.0035160123370587826,
+              "max_abs_error": 0.0146484375,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.0146484375,
+              "pred_max": 0.0054687499068677425,
+              "target_min": 0.0,
+              "target_max": 0.0
+            },
+            "right_hand_joints": {
+              "mae": 0.0011886160355061293,
+              "rmse": 0.0025043776258826256,
+              "max_abs_error": 0.01171875,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.009570312686264515,
+              "pred_max": 0.01171875,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 1,
+          "seconds": 25.164,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.04361754283308983,
+              "rmse": 0.05798351392149925,
+              "max_abs_error": 0.23016357421875,
+              "correlation": 0.908704400062561,
+              "quantized_1_16_match_fraction": 0.46484375,
+              "pred_min": -0.3018798828125,
+              "pred_max": 0.294677734375,
+              "target_min": -0.375,
+              "target_max": 0.3125
+            },
+            "left_hand_joints": {
+              "mae": 0.0005559430574066937,
+              "rmse": 0.0016802632017061114,
+              "max_abs_error": 0.01171875,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.01171875,
+              "pred_max": 0.004101562313735485,
+              "target_min": 0.0,
+              "target_max": 0.0
+            },
+            "right_hand_joints": {
+              "mae": 0.0011900111567229033,
+              "rmse": 0.0024684881791472435,
+              "max_abs_error": 0.01171875,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.0068359375,
+              "pred_max": 0.01171875,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 2,
+          "seconds": 25.128,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.05298048257827759,
+              "rmse": 0.067195825278759,
+              "max_abs_error": 0.212890625,
+              "correlation": 0.8802286386489868,
+              "quantized_1_16_match_fraction": 0.387109375,
+              "pred_min": -0.3480224609375,
+              "pred_max": 0.343505859375,
+              "target_min": -0.375,
+              "target_max": 0.3125
+            },
+            "left_hand_joints": {
+              "mae": 0.0015645925886929035,
+              "rmse": 0.003164359601214528,
+              "max_abs_error": 0.017578125,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.017578125,
+              "pred_max": 0.0054687499068677425,
+              "target_min": 0.0,
+              "target_max": 0.0
+            },
+            "right_hand_joints": {
+              "mae": 0.0017264230409637094,
+              "rmse": 0.0032421916257590055,
+              "max_abs_error": 0.015625,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.009570312686264515,
+              "pred_max": 0.015625,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "frame_index": 800,
+      "image_shape": [
+        480,
+        640,
+        3
+      ],
+      "samples": [
+        {
+          "sample_index": 0,
+          "seconds": 25.901,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.06130494922399521,
+              "rmse": 0.07779831439256668,
+              "max_abs_error": 0.251220703125,
+              "correlation": 0.8619178533554077,
+              "quantized_1_16_match_fraction": 0.300390625,
+              "pred_min": -0.332061767578125,
+              "pred_max": 0.3406982421875,
+              "target_min": -0.375,
+              "target_max": 0.25
+            },
+            "left_hand_joints": {
+              "mae": 0.0038448660634458065,
+              "rmse": 0.006123021245002747,
+              "max_abs_error": 0.0234375,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.0234375,
+              "pred_max": 0.00820312462747097,
+              "target_min": 0.0,
+              "target_max": 0.0
+            },
+            "right_hand_joints": {
+              "mae": 0.0024937221314758062,
+              "rmse": 0.004970570094883442,
+              "max_abs_error": 0.0234375,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.012304686941206455,
+              "pred_max": 0.0234375,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 1,
+          "seconds": 27.042,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.057129085063934326,
+              "rmse": 0.07048144936561584,
+              "max_abs_error": 0.24755859375,
+              "correlation": 0.8917171359062195,
+              "quantized_1_16_match_fraction": 0.297265625,
+              "pred_min": -0.36639404296875,
+              "pred_max": 0.3280029296875,
+              "target_min": -0.375,
+              "target_max": 0.25
+            },
+            "left_hand_joints": {
+              "mae": 0.0020549665205180645,
+              "rmse": 0.0042456164956092834,
+              "max_abs_error": 0.0234375,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.0234375,
+              "pred_max": 0.010937499813735485,
+              "target_min": 0.0,
+              "target_max": 0.0
+            },
+            "right_hand_joints": {
+              "mae": 0.0010532924206927419,
+              "rmse": 0.0024840582627803087,
+              "max_abs_error": 0.01171875,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.00820312462747097,
+              "pred_max": 0.01171875,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 2,
+          "seconds": 25.093,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.05955116078257561,
+              "rmse": 0.07998523116111755,
+              "max_abs_error": 0.2674560546875,
+              "correlation": 0.8372195363044739,
+              "quantized_1_16_match_fraction": 0.35546875,
+              "pred_min": -0.321075439453125,
+              "pred_max": 0.309326171875,
+              "target_min": -0.375,
+              "target_max": 0.25
+            },
+            "left_hand_joints": {
+              "mae": 0.004953962285071611,
+              "rmse": 0.006929800380021334,
+              "max_abs_error": 0.0205078125,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.0205078125,
+              "pred_max": 0.009570312686264515,
+              "target_min": 0.0,
+              "target_max": 0.0
+            },
+            "right_hand_joints": {
+              "mae": 0.0020898436196148396,
+              "rmse": 0.003939970396459103,
+              "max_abs_error": 0.017578125,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.010937499813735485,
+              "pred_max": 0.017578125,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "frame_index": 1600,
+      "image_shape": [
+        480,
+        640,
+        3
+      ],
+      "samples": [
+        {
+          "sample_index": 0,
+          "seconds": 27.526,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.07613726705312729,
+              "rmse": 0.09724068641662598,
+              "max_abs_error": 0.31005859375,
+              "correlation": 0.8459795117378235,
+              "quantized_1_16_match_fraction": 0.27734375,
+              "pred_min": -0.541259765625,
+              "pred_max": 0.4158935546875,
+              "target_min": -0.4375,
+              "target_max": 0.3125
+            },
+            "left_hand_joints": {
+              "mae": 0.07465716451406479,
+              "rmse": 0.2404709905385971,
+              "max_abs_error": 1.5,
+              "correlation": 0.9223612546920776,
+              "quantized_1_16_match_fraction": 0.6892857142857143,
+              "pred_min": -1.4296875,
+              "pred_max": 0.658984363079071,
+              "target_min": -1.5,
+              "target_max": 0.699999988079071
+            },
+            "right_hand_joints": {
+              "mae": 0.0014836775371804833,
+              "rmse": 0.0033072177320718765,
+              "max_abs_error": 0.017578125,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.010937499813735485,
+              "pred_max": 0.017578125,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 1,
+          "seconds": 27.394,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.08540935814380646,
+              "rmse": 0.11493905633687973,
+              "max_abs_error": 0.3271484375,
+              "correlation": 0.7793617248535156,
+              "quantized_1_16_match_fraction": 0.331640625,
+              "pred_min": -0.412841796875,
+              "pred_max": 0.3343505859375,
+              "target_min": -0.4375,
+              "target_max": 0.3125
+            },
+            "left_hand_joints": {
+              "mae": 0.3440534174442291,
+              "rmse": 0.6311624646186829,
+              "max_abs_error": 1.5,
+              "correlation": 0.3094467222690582,
+              "quantized_1_16_match_fraction": 0.6785714285714286,
+              "pred_min": -0.0205078125,
+              "pred_max": 0.009570312686264515,
+              "target_min": -1.5,
+              "target_max": 0.699999988079071
+            },
+            "right_hand_joints": {
+              "mae": 0.0012820870615541935,
+              "rmse": 0.002703962381929159,
+              "max_abs_error": 0.01171875,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.009570312686264515,
+              "pred_max": 0.01171875,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 2,
+          "seconds": 26.969,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.06866703182458878,
+              "rmse": 0.08814790844917297,
+              "max_abs_error": 0.294921875,
+              "correlation": 0.856508731842041,
+              "quantized_1_16_match_fraction": 0.282421875,
+              "pred_min": -0.4029541015625,
+              "pred_max": 0.2899169921875,
+              "target_min": -0.4375,
+              "target_max": 0.3125
+            },
+            "left_hand_joints": {
+              "mae": 0.3442658483982086,
+              "rmse": 0.6164017915725708,
+              "max_abs_error": 1.5,
+              "correlation": 0.676855742931366,
+              "quantized_1_16_match_fraction": 0.65,
+              "pred_min": -1.5,
+              "pred_max": 0.699999988079071,
+              "target_min": -1.5,
+              "target_max": 0.699999988079071
+            },
+            "right_hand_joints": {
+              "mae": 0.0014585658209398389,
+              "rmse": 0.003240846795961261,
+              "max_abs_error": 0.017578125,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.00820312462747097,
+              "pred_max": 0.017578125,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "frame_index": 2400,
+      "image_shape": [
+        480,
+        640,
+        3
+      ],
+      "samples": [
+        {
+          "sample_index": 0,
+          "seconds": 27.647,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.10198590904474258,
+              "rmse": 0.12469438463449478,
+              "max_abs_error": 0.3314208984375,
+              "correlation": 0.8035678267478943,
+              "quantized_1_16_match_fraction": 0.175390625,
+              "pred_min": -0.5302734375,
+              "pred_max": 0.4232177734375,
+              "target_min": -0.5,
+              "target_max": 0.4375
+            },
+            "left_hand_joints": {
+              "mae": 0.0,
+              "rmse": 0.0,
+              "max_abs_error": 0.0,
+              "correlation": 1.0,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -1.5,
+              "pred_max": 0.699999988079071,
+              "target_min": -1.5,
+              "target_max": 0.699999988079071
+            },
+            "right_hand_joints": {
+              "mae": 0.0004827008815482259,
+              "rmse": 0.0014439545338973403,
+              "max_abs_error": 0.0068359375,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.0068359375,
+              "pred_max": 0.005859375,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 1,
+          "seconds": 23.723,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.09571061283349991,
+              "rmse": 0.11683899164199829,
+              "max_abs_error": 0.346435546875,
+              "correlation": 0.83668053150177,
+              "quantized_1_16_match_fraction": 0.179296875,
+              "pred_min": -0.6181640625,
+              "pred_max": 0.4105224609375,
+              "target_min": -0.5,
+              "target_max": 0.4375
+            },
+            "left_hand_joints": {
+              "mae": 0.00012137272278778255,
+              "rmse": 0.0006974043208174407,
+              "max_abs_error": 0.005859375,
+              "correlation": 0.9999997019767761,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -1.5,
+              "pred_max": 0.699999988079071,
+              "target_min": -1.5,
+              "target_max": 0.699999988079071
+            },
+            "right_hand_joints": {
+              "mae": 0.00017089843458961695,
+              "rmse": 0.0009044978069141507,
+              "max_abs_error": 0.0087890625,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.0054687499068677425,
+              "pred_max": 0.0087890625,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        },
+        {
+          "sample_index": 2,
+          "seconds": 26.722,
+          "metrics": {
+            "motion_token": {
+              "mae": 0.11138401925563812,
+              "rmse": 0.13839340209960938,
+              "max_abs_error": 0.4105224609375,
+              "correlation": 0.7780013680458069,
+              "quantized_1_16_match_fraction": 0.1625,
+              "pred_min": -0.603515625,
+              "pred_max": 0.4818115234375,
+              "target_min": -0.5,
+              "target_max": 0.4375
+            },
+            "left_hand_joints": {
+              "mae": 0.00024344303528778255,
+              "rmse": 0.0010160132078453898,
+              "max_abs_error": 0.0078125,
+              "correlation": 0.9999993443489075,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -1.5,
+              "pred_max": 0.699999988079071,
+              "target_min": -1.5,
+              "target_max": 0.699999988079071
+            },
+            "right_hand_joints": {
+              "mae": 0.0005852399626746774,
+              "rmse": 0.0019268955802544951,
+              "max_abs_error": 0.0146484375,
+              "correlation": NaN,
+              "quantized_1_16_match_fraction": 1.0,
+              "pred_min": -0.009570312686264515,
+              "pred_max": 0.0146484375,
+              "target_min": 0.0,
+              "target_max": 0.0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "motion_token": {
+      "mae_mean": 0.07519385032355785,
+      "mae_min": 0.04361754283308983,
+      "correlation_mean": 0.8317015965779623
+    },
+    "left_hand_joints": {
+      "mae_mean": 0.06484468067840983,
+      "mae_min": 0.0,
+      "correlation_mean": NaN
+    },
+    "right_hand_joints": {
+      "mae_mean": 0.0012670898419552639,
+      "mae_min": 0.00017089843458961695,
+      "correlation_mean": NaN
+    }
+  },
+  "num_frames": 4,
+  "num_samples_per_frame": 3,
+  "seconds_per_inference": {
+    "mean": 25.47491666666666,
+    "min": 17.39,
+    "max": 27.647
+  }
+}

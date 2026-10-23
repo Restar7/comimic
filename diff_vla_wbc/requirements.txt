@@ -1,0 +1,11 @@
+# Core differentiable framework
+torch>=2.2
+numpy
+scipy
+mujoco>=3.0
+transformers>=4.40
+diffusers>=0.30
+dm-tree
+tyro
+tensorboard
+pytest
