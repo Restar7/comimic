@@ -17,6 +17,10 @@ def test_compact_matches_full():
     from supermimic.envs.tracking_env_cfg import TRACKED_BODIES
 
     files = discover_npz(NPZ, names=["walk1_subject1", "jumps1_subject1"])
+
+    if not files:
+
+        pytest.skip("clips not available (data/npz/lafan1 points elsewhere)")
     q0 = torch.zeros(29)
     full = MotionLibrary(files, TRACKED_BODIES, q0, device="cuda", compact=False)
     comp32 = MotionLibrary(files, TRACKED_BODIES, q0, device="cuda", compact=True, store_dtype=torch.float32)

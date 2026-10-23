@@ -5,7 +5,7 @@ Examples:
     # SONIC per-body CSV export directories
     python scripts/prepare_motion_npz.py \
         --csv-root GR00T-WholeBodyControl/gear_sonic_deploy/reference/example \
-        --out-dir data/npz/example
+        --out-dir data/npz/g1_tasks
 
     # LAFAN1 36-column G1 retarget CSVs
     python scripts/prepare_motion_npz.py \

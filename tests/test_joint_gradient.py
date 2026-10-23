@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -51,10 +52,12 @@ class EndToEndGradientTest(unittest.TestCase):
         assets = build_g1_assets(device="cpu")
         bundle = SuperMimicBundle.random(assets, small=True)
         if SAMPLE_CLIP.is_dir():
-            npz = WORKSPACE_ROOT / "data/npz/example/dance_in_da_party_001__A464.npz"
-            if not npz.exists():
-                npz.parent.mkdir(parents=True, exist_ok=True)
-                motion_npz_from_body_csv_dir(SAMPLE_CLIP, npz)
+            # Convert into a throwaway directory: the repo does not ship a
+            # motion npz dataset, and tests must not repopulate one.
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            npz = Path(tmp.name) / "sample.npz"
+            motion_npz_from_body_csv_dir(SAMPLE_CLIP, npz)
             files = [npz]
         else:
             self.skipTest("no sample motion clip")

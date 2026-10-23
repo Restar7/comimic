@@ -242,6 +242,104 @@ def discounted_return(
     return out
 
 
+def imagine_with_tokens(
+    bundle: SuperMimicBundle,
+    *,
+    tokens: torch.Tensor,
+    state: torch.Tensor,
+    obs_hist: torch.Tensor | None = None,
+    history: torch.Tensor | None = None,
+    xi: torch.Tensor | None = None,
+    references: Sequence[ReferenceFrame] | None = None,
+    prev_action: torch.Tensor | None = None,
+    horizon: int = 8,
+    obs_noise: float = 0.0,
+) -> Rollout:
+    """Token route: the conditioning is the VLA's own 64-d motion token.
+
+    Same rollout/return contract as :func:`imagine_with_goals`, but step ``t`` is conditioned on
+    ``tokens[:, min(t, T-1)]`` directly (no goal encoder, no ``adapter``) — this is the interface a
+    token-conditioned SuperMimic checkpoint expects (``PolicyCfg.token_dim > 0``).
+    ``Rollout.goals`` / ``goal_sequence`` then carry the tokens themselves, so the goal-alignment
+    loss is simply not computed (``compute_joint_loss`` skips it when no teacher goals are passed).
+    """
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    if tokens.ndim != 3:
+        raise ValueError(f"tokens must be (B,T,D), got {tuple(tokens.shape)}")
+    batch = state.shape[0]
+    device = state.device
+    if tokens.shape[0] != batch:
+        raise ValueError(f"tokens batch {tokens.shape[0]} != {batch}")
+    token_dim = int(tokens.shape[-1])
+    if token_dim != int(getattr(bundle.policy, "token_dim", 0)):
+        raise ValueError(f"token dim {token_dim} != policy token_dim {bundle.policy.token_dim}")
+
+    xi = torch.zeros(batch, 33, device=device) if xi is None else xi
+    history = _ensure_history(obs_hist, history, batch, device)
+    if prev_action is None:
+        prev_action = torch.zeros(batch, ACTION_DIM, device=device)
+    if references is not None and len(references) < horizon:
+        raise ValueError(f"need {horizon} reference frames, got {len(references)}")
+
+    def token_at(step: int) -> torch.Tensor:
+        return tokens[:, min(step, tokens.shape[1] - 1)]
+
+    current = state
+    a_prev = prev_action
+    all_states = [current]
+    all_actions, all_rewards, all_terms = [], [], []
+    all_probs = [torch.zeros(batch, device=device)]
+    all_survival = [torch.ones(batch, device=device)]
+    all_tokens = [token_at(0)]
+    term_names = None
+    survival = torch.ones(batch, device=device)
+
+    for t in range(horizon):
+        if references is None:
+            raise ValueError("references are required for tracking reward in the rollout")
+        ref = references[t]
+        cond = token_at(t)
+        obs_flat = _flat_history(bundle, history)
+        action = bundle.act(obs_flat, cond)
+        next_state = bundle.step(current, action, xi)
+        bodies = bundle.assets.heads.robot_bodies(next_state)
+        terms = bundle.reward(next_state, action, a_prev, ref, bodies)
+        logits = bundle.termination_logits(next_state, ref)
+        prob = torch.sigmoid(logits)
+        survival = survival * (1.0 - prob)
+        clean_obs = bundle.observation(next_state, action, xi)
+        if obs_noise > 0:
+            clean_obs = clean_obs + (torch.rand_like(clean_obs) * 2 - 1) * obs_noise
+        history = torch.cat((history[1:], clean_obs.unsqueeze(0)), dim=0)
+
+        if term_names is None:
+            term_names = [k for k in terms if k != "total"]
+            all_terms = {k: [] for k in term_names}
+        all_terms = {k: v + [terms[k]] for k, v in all_terms.items()} if all_terms else all_terms
+        all_states.append(next_state)
+        all_actions.append(action)
+        all_rewards.append(terms["total"])
+        all_probs.append(prob)
+        all_survival.append(survival)
+        all_tokens.append(cond)
+        a_prev = action
+        current = next_state
+
+    return Rollout(
+        states=torch.stack(all_states, dim=0),
+        actions=torch.stack(all_actions, dim=0),
+        rewards=torch.stack(all_rewards, dim=0),
+        reward_terms={k: torch.stack(v, dim=0) for k, v in (all_terms or {}).items()},
+        termination_probs=torch.stack(all_probs, dim=0),
+        survival=torch.stack(all_survival, dim=0),
+        goals=torch.stack(all_tokens, dim=0),
+        goal_sequence=tokens,
+        references=list(references) if references is not None else [],
+        history=history,
+    )
+
+
 def compute_joint_loss(
     rollout: Rollout,
     *,

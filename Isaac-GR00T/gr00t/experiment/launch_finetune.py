@@ -57,20 +57,26 @@ if __name__ == "__main__":
         load_modality_config(ft_config.modality_config_path)
 
     dataset_paths = [path for path in ft_config.dataset_path.split(os.pathsep) if path]
+    if ft_config.dataset_specs_json:
+        dataset_specs = json.loads(ft_config.dataset_specs_json)
+        if not isinstance(dataset_specs, list) or not dataset_specs:
+            raise ValueError("dataset_specs_json must be a non-empty JSON list")
+        for spec in dataset_specs:
+            if not spec.get("dataset_paths"):
+                raise ValueError("each dataset spec needs a non-empty dataset_paths list")
+            spec.setdefault("mix_ratio", 1.0)
+            spec.setdefault("embodiment_tag", embodiment_tag)
+    else:
+        dataset_specs = [
+            {
+                "dataset_paths": dataset_paths,
+                "mix_ratio": 1.0,
+                "embodiment_tag": embodiment_tag,
+            }
+        ]
 
     config = get_default_config().load_dict(
-        {
-            "data": {
-                "download_cache": False,
-                "datasets": [
-                    {
-                        "dataset_paths": dataset_paths,
-                        "mix_ratio": 1.0,
-                        "embodiment_tag": embodiment_tag,
-                    }
-                ],
-            }
-        }
+        {"data": {"download_cache": False, "datasets": dataset_specs}}
     )
     config.load_config_path = None
 

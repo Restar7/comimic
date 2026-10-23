@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Joint training / gradient smoke CLI for the differentiable framework.
 
-The default run uses random FM tokens and the tiny real GR00T action head is
-optional (``--real-gr00t-head``).  For a real experiment, plug a
-``Gr00tTokenSource`` wrapping a loaded ``Gr00tN1d7`` and a token source that
-returns the paired tokens for each motion window; the rest of the loop is
-unchanged.
+Three token sources, most synthetic first:
+
+* default: random FM tokens (fast CPU smoke of the whole graph);
+* ``--real-gr00t-head``: the real ``Gr00tN1d7ActionHead`` with a tiny DiT and
+  random backbone features;
+* ``--vlm``: the **real top-level VLM** -- Cosmos-Reason2-2B (local weights) ->
+  GR00T N1.7 flow-matching head -> ``[B, 40, 64]`` chunk, with gradients reaching
+  the head (and the VLM with ``--train-vlm``).  There is no paired RGB data in
+  this repository, so the observation is a deterministic synthetic image unless
+  ``--vlm-image`` is given.
 """
 from __future__ import annotations
 
@@ -45,6 +50,19 @@ def collect_npz(paths: list[Path]) -> list[Path]:
     return out
 
 
+def load_vlm_image(path: Path | None, size: int = 256):
+    """Observation image for the VLM path (deterministic synthetic if unset)."""
+    from PIL import Image
+
+    if path is not None:
+        return Image.open(path).convert("RGB")
+    y, x = torch.meshgrid(
+        torch.linspace(0.0, 1.0, size), torch.linspace(0.0, 1.0, size), indexing="ij"
+    )
+    rgb = torch.stack((x, y, (x + y) / 2.0), dim=-1).numpy()
+    return Image.fromarray((rgb * 255.0).round().astype("uint8"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--motion", nargs="+", type=Path, required=True)
@@ -65,6 +83,31 @@ def main() -> None:
     ap.add_argument("--save", action="store_true")
     ap.add_argument("--real-gr00t-head", action="store_true",
                     help="use the real GR00T action head with a tiny DiT (gradient smoke)")
+    vlm = ap.add_argument_group("top-level VLM (Cosmos-Reason2-2B)")
+    vlm.add_argument("--vlm", action="store_true",
+                     help="use the real Cosmos-Reason2-2B VLM + GR00T head as the token source")
+    vlm.add_argument("--vlm-path", type=Path, default=None,
+                     help="local VLM directory (default: auto-resolve, see diff_vla_wbc.gr00t_vlm)")
+    vlm.add_argument("--vlm-ckpt", type=Path, default=None,
+                     help="optional full GR00T checkpoint (backbone + action head)")
+    vlm.add_argument("--vlm-select-layer", type=int, default=16,
+                     help="LLM layers kept by the backbone (GR00T N1.7 truncation)")
+    vlm.add_argument("--vlm-steps", type=int, default=2,
+                     help="Euler steps of the differentiable flow-matching sampler")
+    vlm.add_argument("--vlm-image", type=Path, default=None,
+                     help="observation image (default: deterministic synthetic RGB)")
+    vlm.add_argument("--vlm-instruction", default="Pick up the carton and hand it over.")
+    vlm.add_argument("--vlm-state-dim", type=int, default=43, help="raw robot state width")
+    vlm.add_argument("--vlm-embodiment-id", type=int, default=0,
+                     help="embodiment id fed to the action head; a GR00T checkpoint needs the "
+                          "id it was trained with (e.g. 11 = unitree_g1_sonic)")
+    vlm.add_argument("--vlm-dataset", action="store_true",
+                     help="feed per-sample REAL observations: each step reads the ego_view frame, "
+                          "46-dim state and instruction belonging to the sampled motion window, "
+                          "preprocessed by the checkpoint's own Gr00tN1d7Processor. Requires "
+                          "--vlm-ckpt and a --motion directory built by prepare_g1_tasks_npz.py")
+    vlm.add_argument("--train-vlm", action="store_true",
+                     help="also unfreeze the VLM backbone (otherwise only the action head trains)")
     ap.add_argument("--log-every", type=int, default=1)
     args = ap.parse_args()
 
@@ -102,6 +145,96 @@ def main() -> None:
 
         fm_params = [p for p in head.parameters() if p.requires_grad]
         print(f"[info] real GR00T action head params: {sum(p.numel() for p in head.parameters()):,}")
+
+    if args.vlm:
+        if args.real_gr00t_head:
+            raise SystemExit("--vlm and --real-gr00t-head are mutually exclusive")
+        from diff_vla_wbc.gr00t_vlm import Gr00tVLM, describe_vlm, resolve_vlm_source, vlm_available
+
+        if not vlm_available(args.vlm_path) and args.vlm_path is None and args.vlm_ckpt is None:
+            raise SystemExit(
+                "no local Cosmos-Reason2-2B weights found; pass --vlm-path, set "
+                "$GR00T_VLM_PATH, or run scripts/link_vlm_weights.py"
+            )
+        print(f"[info] top-level VLM source: {resolve_vlm_source(args.vlm_path)}")
+        vlm_model = Gr00tVLM.from_pretrained(
+            args.vlm_path,
+            checkpoint=args.vlm_ckpt,
+            select_layer=args.vlm_select_layer,
+            device=device,
+            action_horizon=adapter.cfg.token_horizon,
+            max_state_dim=args.vlm_state_dim,
+            freeze_vlm=not args.train_vlm,
+        )
+        print("[info] top-level VLM: " + json.dumps(describe_vlm(vlm_model), default=str))
+
+        # The head emits its own action width (``Gr00tN1d7Config.max_action_dim``:
+        # 64 for the standalone default, 132 for a GR00T checkpoint).  GR00T packs
+        # an embodiment's action vector into that width following modality-key
+        # order, so for ``unitree_g1_sonic`` columns 0:64 are the motion token and
+        # the rest is unsupervised padding.  Sample at the head's width, then slice.
+        head_action_dim = int(vlm_model.action_head.action_dim)
+
+        def _sample(inputs) -> torch.Tensor:
+            noise = torch.randn(
+                int(inputs["input_ids"].shape[0]),
+                adapter.cfg.token_horizon,
+                head_action_dim,
+                device=device,
+                dtype=vlm_model.dtype,
+            )
+            tokens = sample_model_with_grad(
+                vlm_model, inputs, initial_noise=noise, num_steps=args.vlm_steps
+            )
+            return tokens[..., : adapter.cfg.token_dim]
+
+        if args.vlm_dataset:
+            if not args.vlm_ckpt:
+                raise SystemExit(
+                    "--vlm-dataset needs --vlm-ckpt: the 46-dim state layout, percentile "
+                    "normalisation and image transform all come from the checkpoint's processor"
+                )
+            from diff_vla_wbc.g1_tasks import (
+                TaskFrameIndex,
+                TaskObservationBuilder,
+                load_gr00t_processor,
+                processed_batch,
+            )
+
+            frame_index = TaskFrameIndex(files)
+            if frame_index.num_frames != library.num_frames:
+                raise SystemExit(
+                    f"npz index has {frame_index.num_frames} frames but the motion library has "
+                    f"{library.num_frames}; rebuild it with scripts/prepare_g1_tasks_npz.py"
+                )
+            builder = TaskObservationBuilder(frame_index)
+            processor = load_gr00t_processor(args.vlm_ckpt, vlm_path=args.vlm_path)
+            print(
+                f"[info] real observations: {frame_index.num_episodes} episodes / "
+                f"{frame_index.num_frames} frames, processor={type(processor).__name__}"
+            )
+
+            def fm_sampler(meta):  # noqa: ANN001
+                return _sample(processed_batch(processor, builder, meta["frames"]))
+
+        else:
+            observations = [load_vlm_image(args.vlm_image)] * args.batch_size
+            instructions = [args.vlm_instruction] * args.batch_size
+            vlm_state = torch.zeros(args.batch_size, args.vlm_state_dim)
+            vlm_batch = vlm_model.build_batch(
+                observations, instructions, vlm_state, embodiment_id=args.vlm_embodiment_id
+            )
+            print(
+                "[warn] --vlm without --vlm-dataset reuses ONE synthetic image every step; "
+                "fine-tuning the head this way collapses its visual conditioning. Use "
+                "--vlm-dataset for anything beyond a gradient smoke test."
+            )
+
+            def fm_sampler(meta):  # noqa: ANN001
+                return _sample(vlm_batch)
+
+        fm_params = [p for p in vlm_model.parameters() if p.requires_grad]
+        print(f"[info] trainable VLM/head params: {sum(p.numel() for p in fm_params):,}")
 
     provider = MotionBatchProvider(
         bundle,

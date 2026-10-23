@@ -132,7 +132,41 @@ def _assign_inv_freq(
     return True
 
 
+def _language_model(model: torch.nn.Module):
+    """Return the Qwen3-VL text stack for both transformers layouts.
+
+    transformers 4.57: ``model.language_model``; transformers 5.x:
+    ``model.model.language_model``.  Fails closed: a future rename must break the
+    load loudly instead of silently training the wrong module.
+    """
+    for holder in (model, getattr(model, "model", None)):
+        language_model = getattr(holder, "language_model", None)
+        if language_model is not None:
+            return language_model
+    raise AttributeError(
+        "cannot find the Qwen3-VL language model on this transformers version; "
+        "expected `model.language_model` (transformers 4.57) or "
+        "`model.model.language_model` (transformers 5.x)"
+    )
+
+
+def _vision_tower(model: torch.nn.Module):
+    """Return the Qwen3-VL vision tower, or ``None`` when the model has none."""
+    for holder in (model, getattr(model, "model", None)):
+        vision = getattr(holder, "visual", None)
+        if vision is not None:
+            return vision
+    return None
+
+
 class Qwen3Backbone(torch.nn.Module):
+    """Qwen3-VL wrapper that keeps only the first ``select_layer`` LLM layers.
+
+    ``transformers`` moved the text stack and vision tower between releases (see
+    :func:`_language_model` / :func:`_vision_tower`), so every access goes through
+    those two helpers instead of a hard-coded attribute path.
+    """
+
     def __init__(
         self,
         model_name: str = "nvidia/Cosmos-Reason2-2B",
@@ -191,8 +225,9 @@ class Qwen3Backbone(torch.nn.Module):
             raise
 
         # needed since we don't use these layers. Also saves compute
-        while len(self.model.language_model.layers) > select_layer:
-            self.model.language_model.layers.pop(-1)
+        language_model = _language_model(self.model)
+        while len(language_model.layers) > select_layer:
+            language_model.layers.pop(-1)
 
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
@@ -217,7 +252,7 @@ class Qwen3Backbone(torch.nn.Module):
         dispatches to a pathologically slow kernel on sm_80; ``channels_last_3d``
         selects the fast one and is numerically equivalent (harmless elsewhere).
         """
-        visual = getattr(self.model, "visual", None)
+        visual = _vision_tower(self.model)
         if visual is None:
             return
 
@@ -251,13 +286,15 @@ class Qwen3Backbone(torch.nn.Module):
         self.tune_visual = tune_visual
         for p in self.parameters():
             p.requires_grad = True
+        language_model = _language_model(self.model)
+        visual = _vision_tower(self.model)
         if not tune_llm:
-            self.model.language_model.requires_grad_(False)
-        if not tune_visual:
-            self.model.visual.requires_grad_(False)
+            language_model.requires_grad_(False)
+        if not tune_visual and visual is not None:
+            visual.requires_grad_(False)
 
         if tune_top_llm_layers > 0:
-            for layer in self.model.language_model.layers[-tune_top_llm_layers:]:
+            for layer in language_model.layers[-tune_top_llm_layers:]:
                 for param in layer.parameters():
                     param.requires_grad = True
 
@@ -277,10 +314,12 @@ class Qwen3Backbone(torch.nn.Module):
         need to call model.eval() for the frozen modules.
         """
         if self.training:
-            if self.model.language_model and not self.tune_llm:
-                self.model.language_model.eval()
-            if self.model.visual and not self.tune_visual:
-                self.model.visual.eval()
+            language_model = _language_model(self.model)
+            if not self.tune_llm:
+                language_model.eval()
+            visual = _vision_tower(self.model)
+            if visual is not None and not self.tune_visual:
+                visual.eval()
 
     def _reset_rotary_inv_freq(self) -> None:
         """Re-derive Qwen3-VL's non-persistent RoPE ``inv_freq`` buffers once at load.
@@ -302,7 +341,7 @@ class Qwen3Backbone(torch.nn.Module):
         )
 
     def _reset_vision_rotary_inv_freq(self, config) -> bool:
-        visual = getattr(self.model, "visual", None)
+        visual = _vision_tower(self.model)
         rotary = getattr(visual, "rotary_pos_emb", None)
         if rotary is None or not hasattr(rotary, "inv_freq"):
             raise RuntimeError(
@@ -328,7 +367,7 @@ class Qwen3Backbone(torch.nn.Module):
         return _assign_inv_freq(rotary, "inv_freq", inv_freq, persistent=False)
 
     def _reset_language_rotary_inv_freq(self) -> bool:
-        language_model = getattr(self.model, "language_model", None)
+        language_model = _language_model(self.model)
         rotary = getattr(language_model, "rotary_emb", None)
         text_config = getattr(rotary, "config", None) or getattr(language_model, "config", None)
         if rotary is None or not hasattr(rotary, "inv_freq") or text_config is None:
@@ -354,11 +393,24 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    #: Tensors the Qwen3-VL processor emits that must reach the model verbatim
+    #: when the installed transformers produces them.  ``mm_token_type_ids`` is
+    #: required for multimodal M-RoPE from transformers 5.x on; the video tensors
+    #: are forwarded for completeness.
+    _OPTIONAL_VL_KEYS = (
+        "mm_token_type_ids",
+        "token_type_ids",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "image_sizes",
+    )
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
-        vl_input = {k: vl_input[k] for k in keys_to_use}
+        optional = [k for k in self._OPTIONAL_VL_KEYS if k in vl_input]
+        vl_input = {k: vl_input[k] for k in [*keys_to_use, *optional]}
         outputs = self.model(**vl_input, output_hidden_states=True)
         outputs = outputs.hidden_states[-1]
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id

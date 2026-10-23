@@ -3,9 +3,32 @@ torch>=2.2
 numpy
 scipy
 mujoco>=3.0
-transformers>=4.40
-diffusers>=0.30
+transformers>=4.57
+diffusers
 dm-tree
 tyro
 tensorboard
 pytest
+
+# Top-level VLM path (Isaac-GR00T Cosmos-Reason2-2B backbone).
+# The vendored GR00T tree imports these at module import time, so the VLM path
+# needs them even when the backbone stays frozen.
+albumentations
+einops
+h5py
+omegaconf
+jsonlines
+click
+termcolor
+pyzmq
+# Optional: only for LoRA / tuned VLM fine-tuning.
+# peft
+
+# Verified environment (2x RTX 4090, CUDA 12.x):
+#   python 3.12, torch 2.8, transformers 5.9, diffusers 0.35.1, mujoco 3.2.3
+# Notes:
+#   * diffusers 0.41 imports `FqnToConfig` from torchao and fails here; 0.35.1 is
+#     what upstream GR00T pins and what was tested.
+#   * transformers 5.x works through small compatibility shims in the vendored
+#     GR00T files (config dataclass, backbone module paths, mm_token_type_ids
+#     pass-through) -- see docs/FRAMEWORK.md section 6.4.

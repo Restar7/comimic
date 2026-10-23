@@ -13,7 +13,22 @@ venv/
 
 # Local scratch
 *.log
-
 # Large G1 mesh assets (163 MB). Fetch separately, then run scripts/setup_assets.sh.
 reproduce_scenes/g1/meshes/
 GR00T-WholeBodyControl/gear_sonic_deploy/g1/meshes
+
+# Local VLM weight view (symlinks only; weights stay in the HF cache)
+groot_repro/nvidia/*-weights/
+
+# Converted G1 task recordings (activedataset ft318: 318 episodes, ≈700 MB). Rebuild with
+# scripts/prepare_g1_tasks_npz.py; the source dataset is not part of this repo.
+data/npz/g1_tasks*/
+
+# Local training artifacts / checkpoints / datasets (rebuildable; never commit)
+runs/
+logs/
+.sii/
+data/library/
+data/assets/
+*.pt
+*.npz

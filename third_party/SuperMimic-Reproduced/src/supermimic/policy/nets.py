@@ -27,6 +27,9 @@ class PolicyCfg:
     goal_term_scale: tuple[float, ...] = (1.0, 5.0, 1.0, 2.0, 1.0, 1.0)
     decoder_last_gain: float = 0.01
     goal_dim: int = GOAL_DIM  # 680 (+9 with anchor_obs)
+    #: SONIC motion-token interface: 0 keeps the paper's 680-d goal encoder;
+    #: >0 replaces it with a frozen-encoder token of this width (e.g. 64).
+    token_dim: int = 0
 
 
 @dataclass
@@ -60,9 +63,10 @@ class MotionEncoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, cfg: PolicyCfg, obs_dim: int = 930):
+    def __init__(self, cfg: PolicyCfg, obs_dim: int = 930, latent_dim: int | None = None):
         super().__init__()
-        self.mlp = MLP(cfg.latent_dim + obs_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
+        latent_dim = cfg.latent_dim if latent_dim is None else int(latent_dim)
+        self.mlp = MLP(latent_dim + obs_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
         self.register_buffer("scale", _obs_scale_vector(cfg))
 
     def forward(self, z: torch.Tensor, obs_hist: torch.Tensor) -> torch.Tensor:
@@ -70,15 +74,34 @@ class Decoder(nn.Module):
 
 
 class Policy(nn.Module):
-    """a = dec(enc_motion(g), o_hist). Extra goal interfaces can be registered later (plan Appendix B)."""
+    """a = dec(z, o_hist), with ``z`` from the goal encoder or a frozen motion token.
+
+    Two conditioning interfaces:
+
+    * ``"motion"`` (default, paper): 680-d goal -> ``MotionEncoder`` -> 32-d latent;
+    * ``"token"`` (SONIC route, ``cfg.token_dim > 0``): the 64-d frozen-encoder
+      motion token is used **as the latent** (no learned goal encoder), so the
+      policy is conditioned on the same token the VLA is trained to output.
+    """
 
     def __init__(self, cfg: PolicyCfg):
         super().__init__()
         self.cfg = cfg
+        self.token_dim = int(cfg.token_dim)
         self.encoders = nn.ModuleDict({"motion": MotionEncoder(cfg)})
-        self.decoder = Decoder(cfg)
+        if self.token_dim > 0:
+            # The token already is a latent: keep an explicit module so parameter
+            # groups / checkpoints stay well-defined, but do not transform it.
+            self.token_in = nn.Identity()
+        self.decoder = Decoder(cfg, latent_dim=(self.token_dim or cfg.latent_dim))
 
     def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion") -> torch.Tensor:
+        if interface == "token":
+            if self.token_dim <= 0:
+                raise RuntimeError("interface='token' requires PolicyCfg.token_dim > 0")
+            if goal.shape[-1] != self.token_dim:
+                raise ValueError(f"token must have {self.token_dim} dims, got {goal.shape[-1]}")
+            return self.decoder(self.token_in(goal), obs_hist)
         return self.decoder(self.encoders[interface](goal), obs_hist)
 
 

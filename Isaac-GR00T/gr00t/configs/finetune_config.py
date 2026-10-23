@@ -45,6 +45,14 @@ class FinetuneConfig:
     If None, use the pre-registered modality config in `gr00t/configs/data/embodiment_configs.py`. 
     """
 
+    dataset_specs_json: str | None = None
+    """Optional JSON list of ``{"dataset_paths": [...], "mix_ratio": float}`` specs.
+
+    When set, each spec becomes one sampling group with its own ``mix_ratio``
+    (equal-weight task sampling), overriding the single group built from
+    ``dataset_path``. ``embodiment_tag`` defaults to the resolved tag.
+    """
+
     # --- Model Tuning Flags ---
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""

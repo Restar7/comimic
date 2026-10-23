@@ -3,7 +3,7 @@
 
 Example:
     python scripts/eval_mujoco.py \
-        --motion data/npz/example \
+        --motion data/npz/g1_tasks \
         --joint-ckpt runs/joint_smoke/joint_latest.pt \
         --clip-index 0 --max-steps 100
 

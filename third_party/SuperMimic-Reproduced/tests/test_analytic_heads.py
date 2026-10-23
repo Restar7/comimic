@@ -28,6 +28,10 @@ def setup():
     from supermimic.world_model.heads import AnalyticHeads
 
     files = discover_npz(NPZ, names=["walk1_subject1", "fight1_subject2"])
+
+    if not files:
+
+        pytest.skip("clips not available (data/npz/lafan1 points elsewhere)")
     args = SuperMimicEnvCfgArgs(npz_files=[str(f) for f in files], num_envs=16, replay_capacity=64, obs_noise=False, seed=3)
     env = make_env(args, device="cuda:0")
     torch.backends.cuda.matmul.allow_tf32 = False  # make_env turns TF32 on; keep the comparison exact
@@ -150,6 +154,10 @@ def test_anchor_relative_obs_matches_env():
     from supermimic.world_model.heads import AnalyticHeads, anchor_relative_obs
 
     files = discover_npz(NPZ, names=["walk1_subject1"])
+
+    if not files:
+
+        pytest.skip("clips not available (data/npz/lafan1 points elsewhere)")
     env = make_env(SuperMimicEnvCfgArgs(npz_files=[str(f) for f in files], num_envs=8, obs_noise=False, anchor_obs=True, record_transitions=False, seed=4), "cuda:0")
     torch.backends.cuda.matmul.allow_tf32 = False
     try:

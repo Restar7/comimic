@@ -55,6 +55,10 @@ def test_world_model_overfits_replay_windows():
     from supermimic.world_model.world_model import WorldModel, WorldModelCfg
 
     files = discover_npz(NPZ, names=["walk1_subject1", "dance1_subject1"])
+
+    if not files:
+
+        pytest.skip("clips not available (data/npz/lafan1 points elsewhere)")
     env = make_env(SuperMimicEnvCfgArgs(npz_files=[str(f) for f in files], num_envs=256, replay_capacity=400, seed=5), "cuda:0")
     try:
         env.reset()

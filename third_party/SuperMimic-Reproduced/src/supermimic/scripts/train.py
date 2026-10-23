@@ -42,6 +42,17 @@ from supermimic.config import TrainConfig
 
 def main() -> None:
     cfg = tyro.cli(TrainConfig)
+    import os
+
+    if os.environ.get("SM_TF32", "0") == "1":
+        # TF32 matmuls: ~1.5-2x on the policy update (BPTT through 32 imagination
+        # steps) on Ada/Ampere/Hopper; numerically fine for RL here.
+        import torch
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        print("[perf] TF32 enabled")
     from supermimic.training.loop import Trainer
 
     Trainer(cfg).run()

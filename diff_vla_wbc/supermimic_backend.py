@@ -291,7 +291,14 @@ class SuperMimicBundle(nn.Module):
     # ------------------------------------------------------------------ forward pieces
 
     def act(self, obs_hist_flat: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-        """``obs_hist_flat`` is ``(B, 930)`` in upstream term-major order."""
+        """``obs_hist_flat`` is ``(B, 930)`` in upstream term-major order.
+
+        ``goal`` is either a 680-d goal window (paper route) or a 64-d SONIC motion token
+        (token route, ``PolicyCfg.token_dim > 0``); the policy dispatches on ``interface``,
+        so a token-conditioned checkpoint must go through ``interface="token"``.
+        """
+        if int(getattr(self.policy, "token_dim", 0)) > 0:
+            return self.policy(obs_hist_flat, goal, interface="token")
         return self.policy(obs_hist_flat, goal)
 
     def step(self, state: torch.Tensor, action: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:

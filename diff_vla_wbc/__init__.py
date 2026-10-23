@@ -4,7 +4,9 @@ GR00T N1.7 flow-matching action head -> motion-goal adapter -> SuperMimic WBC
 -> differentiable world model -> task loss, with one autograd graph.
 
 The upstream SuperMimic reproduction is vendored under
-``third_party/SuperMimic-Reproduced`` (CuboiLeo/SuperMimic-Reproduced).
+``third_party/SuperMimic-Reproduced`` (CuboiLeo/SuperMimic-Reproduced), and the
+top-level VLM is the vendored Isaac-GR00T Cosmos-Reason2-2B backbone wired up in
+:mod:`diff_vla_wbc.gr00t_vlm`.
 """
 from .adapter import AdapterConfig, MotionGoalAdapter, default_goal_prior
 from .compat import ensure_supermimic_importable, install_mjlab_shim
@@ -14,6 +16,7 @@ from .gr00t_fm import (
     sample_fm_with_grad,
     sample_model_with_grad,
 )
+from .gr00t_vlm import Gr00tVLM, Gr00tVLMTokenSource, resolve_vlm_source, vlm_available
 from .data import CachedTokenSource
 from .rollout import (
     LossWeights,
@@ -40,6 +43,8 @@ __all__ = [
     "CachedTokenSource",
     "G1Assets",
     "Gr00tTokenSource",
+    "Gr00tVLM",
+    "Gr00tVLMTokenSource",
     "JointTrainer",
     "JointTrainerConfig",
     "LossWeights",
@@ -58,10 +63,12 @@ __all__ = [
     "install_mjlab_shim",
     "load_motion_library",
     "pretrain_world_model",
+    "resolve_vlm_source",
     "root_height_loss",
     "sample_fm_from_features",
     "sample_fm_with_grad",
     "sample_model_with_grad",
     "unfreeze_world_model",
     "upright_loss",
+    "vlm_available",
 ]

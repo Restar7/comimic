@@ -86,7 +86,17 @@ class Trainer:
         for m in (self.wm, self.policy, self.critic):
             broadcast_params(m)
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
-        self.policy_trainer = PolicyTrainer(self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer)
+        token_fn = None
+        self.token_builder = None
+        if int(getattr(cfg.policy, "token_dim", 0)) > 0:
+            from supermimic.envs.mdp.sonic_tokens import SonicTokenBuilder
+
+            self.token_builder = SonicTokenBuilder(self.lib, device=self.device, num_future=cfg.env.future_frames)
+            token_fn = self.token_builder
+            print(f"[sonic] token conditioning enabled (dim={cfg.policy.token_dim})")
+        self.policy_trainer = PolicyTrainer(
+            self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer, token_fn=token_fn
+        )
         n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
         if self.is_main:
             print(f"[INFO] params: world model {n_params(self.wm)/1e6:.2f}M, policy {n_params(self.policy)/1e6:.2f}M, critic {n_params(self.critic)/1e6:.3f}M")
@@ -141,6 +151,11 @@ class Trainer:
 
     @torch.no_grad()
     def act(self, obs) -> torch.Tensor:
+        if self.token_builder is not None:
+            token = self.token_builder(
+                self.command.frame, robot_quat=self.command.robot_root_quat_w
+            )
+            return self.policy(obs["policy"], token, interface="token")
         return self.policy(obs["policy"], obs["goal"])
 
     def run(self) -> None:

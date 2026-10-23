@@ -26,13 +26,18 @@ from supermimic.eval.benchmark import load_policy_from_checkpoint
 
 
 class _DictPolicy:
-    """Adapts policy(obs_policy, obs_goal) to the viewer's policy(obs) protocol."""
+    """Adapts policy(obs_policy, obs_goal | token) to the viewer's policy(obs) protocol."""
 
-    def __init__(self, policy):
+    def __init__(self, policy, token_fn=None, command=None):
         self.policy = policy
+        self.token_fn = token_fn
+        self.command = command
 
     @torch.no_grad()
     def __call__(self, obs):
+        if self.token_fn is not None:
+            token = self.token_fn(self.command.frame, robot_quat=self.command.robot_root_quat_w)
+            return self.policy(obs["policy"], token, interface="token")
         return self.policy(obs["policy"], obs["goal"])
 
 
@@ -64,7 +69,16 @@ def main(
         debug_vis=ghost,
     )
     env = RslRlVecEnvWrapper(make_env(args, device=device))
-    pol = _DictPolicy(policy)
+    token_fn = None
+    command = None
+    if int(getattr(policy, "token_dim", 0)) > 0:
+        from supermimic.envs.mdp.sonic_tokens import SonicTokenBuilder
+
+        command = env.unwrapped.command_manager.get_term("motion")
+        token_fn = SonicTokenBuilder(
+            command.library, device=torch.device(device), num_future=args.future_frames
+        )
+    pol = _DictPolicy(policy, token_fn=token_fn, command=command)
     if viewer == "auto":
         viewer = "native" if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else "viser"
     print(f"[INFO] {len(files)} clip(s), {num_envs} env(s), viewer={viewer}")

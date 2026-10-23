@@ -61,6 +61,11 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
     try:
         cmd = env.command_manager.get_term("motion")
         lib = cmd.library
+        token_fn = None
+        if int(getattr(policy, "token_dim", 0)) > 0:
+            from supermimic.envs.mdp.sonic_tokens import SonicTokenBuilder
+
+            token_fn = SonicTokenBuilder(lib, device=torch.device(device), num_future=future_frames)
         n_clips = lib.num_clips
         max_r = 0.1  # paper reward upper bound per step (dt * 5)
 
@@ -78,7 +83,14 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         results: dict[int, ClipResult] = {}
         remaining = n_clips
         while remaining > 0:
-            act = policy(obs["policy"], obs["goal"])
+            if token_fn is not None:
+                act = policy(
+                    obs["policy"],
+                    token_fn(cmd.frame, robot_quat=cmd.robot_root_quat_w),
+                    interface="token",
+                )
+            else:
+                act = policy(obs["policy"], obs["goal"])
             obs, rew, term, tout, _ = env.step(act)
             ret_sum += rew
             term_sum += env.reward_manager.term_rewards

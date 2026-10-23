@@ -30,6 +30,9 @@ class ImagRollout:
     e_root: torch.Tensor  # (H+1, n, 4)
     frames: torch.Tensor  # (H+1, n)
     reward_terms: dict  # mean of each reward term over the rollout (diagnostics)
+    #: SONIC motion tokens used for conditioning (H+1, n, token_dim), or None when
+    #: the policy runs on the paper's 680-d goal interface.
+    tokens: torch.Tensor | None = None
 
 
 def imagine(
@@ -42,6 +45,7 @@ def imagine(
     obs_noise: bool = True,
     step_fn: ImagStep | None = None,
     anchor_obs: bool = False,
+    token_fn=None,
 ) -> ImagRollout:
     device = start.state.device
     n = start.state.shape[0]
@@ -92,12 +96,16 @@ def imagine(
     else:
         anchor_pose = None
     goals = [make_goal(frame, ref, anchor_pose)]
+    tokens = [token_fn(frame, ref, s)] if token_fn is not None else []
     e_roots = [wm.heads.root_error_features(s, ref)]
     term_sum = torch.zeros(len(REWARD_TERM_NAMES), device=device)
 
     for t in range(horizon):
         obs_flat = flatten_history_term_major(torch.stack(hist, 0))
-        a = policy(obs_flat, goals[-1])
+        if token_fn is not None:
+            a = policy(obs_flat, tokens[-1], interface="token")
+        else:
+            a = policy(obs_flat, goals[-1])
         s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref)
         d = torch.sigmoid(logits)
         c = c * (1.0 - d)
@@ -114,6 +122,8 @@ def imagine(
         dhats.append(d)
         survivals.append(c)
         goals.append(make_goal(frame, ref, anchor_pose))
+        if token_fn is not None:
+            tokens.append(token_fn(frame, ref, s))
         e_roots.append(wm.heads.root_error_features(s, ref))
         frames.append(frame)
 
@@ -127,4 +137,5 @@ def imagine(
         e_root=torch.stack(e_roots),
         frames=torch.stack(frames),
         reward_terms={k: float(v / horizon) for k, v in zip(REWARD_TERM_NAMES, term_sum.tolist())},
+        tokens=torch.stack(tokens) if token_fn is not None else None,
     )

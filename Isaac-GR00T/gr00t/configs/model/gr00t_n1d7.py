@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import MISSING, asdict, dataclass, field, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, is_dataclass
 from enum import Enum
 import json
 from pathlib import Path
@@ -24,7 +24,37 @@ from transformers import PretrainedConfig
 from . import register_model_config
 
 
-@dataclass
+# transformers>=5.9 turns every ``PretrainedConfig`` subclass into a dataclass
+# itself (``PreTrainedConfig.__init_subclass__`` calls ``dataclass(cls,
+# kw_only=True)``).  Applying ``@dataclass`` a second time re-reads the class
+# body, where ``field(default_factory=...)`` defaults have already been consumed
+# and deleted, so the field is re-interpreted as *required* and the class raises
+# ``TypeError: non-default argument ... follows default argument`` at import
+# time.  Decorate only on older transformers that do not do this themselves.
+_AUTO_DATACLASS = is_dataclass(PretrainedConfig)
+
+
+def _config_dataclass(cls):
+    return cls if _AUTO_DATACLASS else dataclass(cls)
+
+
+# Declared at module scope (not via ``field(default_factory=...)``) so the class
+# body stays valid under both dataclass regimes above.  ``__init__`` deep-copies
+# it into every instance so configurations never share one mutable dict.
+DEFAULT_DIFFUSION_MODEL_CFG = {
+    "positional_embeddings": None,
+    "num_layers": 16,
+    "num_attention_heads": 32,
+    "attention_head_dim": 48,
+    "norm_type": "ada_norm",
+    "dropout": 0.2,
+    "final_dropout": True,
+    "output_dim": 1024,
+    "interleave_self_attention": True,
+}
+
+
+@_config_dataclass
 class Gr00tN1d7Config(PretrainedConfig):
     """Unified configuration for Gr00tN1d7 model with backbone and action head.
 
@@ -88,19 +118,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     use_alternate_vl_dit: bool = True  # True for AlternateVLDiT, False for DiT
     attend_text_every_n_blocks: int = 2
 
-    diffusion_model_cfg: dict = field(
-        default_factory=lambda: {
-            "positional_embeddings": None,
-            "num_layers": 16,
-            "num_attention_heads": 32,
-            "attention_head_dim": 48,
-            "norm_type": "ada_norm",
-            "dropout": 0.2,
-            "final_dropout": True,
-            "output_dim": 1024,
-            "interleave_self_attention": True,
-        }
-    )
+    # ``None`` means "use DEFAULT_DIFFUSION_MODEL_CFG"; ``__init__`` fills it in
+    # with a per-instance copy (see the note above the class).
+    diffusion_model_cfg: dict | None = None
 
     # Flow matching parameters
     num_inference_timesteps: int = 4
@@ -136,6 +156,14 @@ class Gr00tN1d7Config(PretrainedConfig):
                     setattr(self, f.name, f.default)
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
+
+        # Mutable default: always give this instance its own copy.  Under
+        # transformers>=5.9 the auto-dataclass injects the *shared* class-level
+        # default, so this also protects against cross-config mutation.
+        if self.diffusion_model_cfg is None:
+            self.diffusion_model_cfg = dict(DEFAULT_DIFFUSION_MODEL_CFG)
+        else:
+            self.diffusion_model_cfg = dict(self.diffusion_model_cfg)
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

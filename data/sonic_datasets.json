@@ -1,0 +1,241 @@
+{
+  "version": 2,
+  "active": "ft318_frozen_20261023",
+  "summary": "SONIC 四类任务微调集（2026-10-23 frozen 版，已剔除失败 episode）：318 episode / 9 个 LeRobot 子数据集 / 50 fps",
+  "sets": {
+    "ft318_frozen_20261023": {
+      "description": "四类任务：task_1 89 / task_2 70 / task_3 65 / task_4 94，共 318 episode",
+      "root": "/inspire/hdd/global_user/liumengfan-253108110079/flowbody/FlowBody/dataset/groot_sonic_vla_ft318_frozen_20261023",
+      "manifest": "/inspire/hdd/global_user/liumengfan-253108110079/flowbody/FlowBody/dataset/groot_sonic_vla_ft318_frozen_20261023/manifest.json",
+      "task_config": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/SONIC_DATA/deployment/config/sonic_usd_replay_tasks.json",
+      "task_config_sha256": "066abde08e40254e26408680720a54484e65e1b470fb34c442385e9fbef3d29b",
+      "tasks": {
+        "task_1_meeting_room_milk_basket": 89,
+        "task_2_office_red_cup_drawer": 70,
+        "task_3_kitchen_plate_milk_transfer": 65,
+        "task_4_diningroom_can_low_chair": 94
+      },
+      "totals": {
+        "episodes": 318,
+        "frames": 473876,
+        "datasets": 9,
+        "hours_at_50fps": 2.633
+      },
+      "datasets": [
+        {
+          "task_id": "task_1_meeting_room_milk_basket",
+          "instruction": "Navigate to the table ahead, grasp the milk carton, then turn around and proceed to the other table to place the carton into the basket.",
+          "source_root": "2026-07-14/datasets/2026-07-14-20-30-01",
+          "path": "task_1_meeting_room_milk_basket/2026-07-14-20-30-01",
+          "episodes": 84,
+          "frames": 165089,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "ccc90ed3f48329aef34b38d9e75723464b5e70570e51b1bcdb87b7e02d37b1d0"
+        },
+        {
+          "task_id": "task_1_meeting_room_milk_basket",
+          "instruction": "Navigate to the table ahead, grasp the milk carton, then turn around and proceed to the other table to place the carton into the basket.",
+          "source_root": "2026-07-14/datasets/2026-07-14-19-15-12",
+          "path": "task_1_meeting_room_milk_basket/2026-07-14-19-15-12",
+          "episodes": 5,
+          "frames": 18478,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "9a6fdd1f98657c87d432026375c493cfa5c86bf9423f01c80fb11d7f01379462"
+        },
+        {
+          "task_id": "task_2_office_red_cup_drawer",
+          "instruction": "Place the red cup into the drawer and close the drawer completely.",
+          "source_root": "20260722/datasets/2026-07-22-19-33-29",
+          "path": "task_2_office_red_cup_drawer/2026-07-22-19-33-29",
+          "episodes": 56,
+          "frames": 70155,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "5312f89e2e34c696a9648ba0d255cd588f6357135c2bec84dc59b822196a94bb"
+        },
+        {
+          "task_id": "task_2_office_red_cup_drawer",
+          "instruction": "Place the red cup into the drawer and close the drawer completely.",
+          "source_root": "20260722/datasets/2026-07-22-20-13-55",
+          "path": "task_2_office_red_cup_drawer/2026-07-22-20-13-55",
+          "episodes": 14,
+          "frames": 21731,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "9147510d46addcc09f0165fd352fdd5ae067e8285ff451542e984fabe24bb7ad"
+        },
+        {
+          "task_id": "task_3_kitchen_plate_milk_transfer",
+          "instruction": "Retrieve the milk carton from the right plate and place it onto the left plate.",
+          "source_root": "20260723/datasets/2026-07-23-19-14-37",
+          "path": "task_3_kitchen_plate_milk_transfer/2026-07-23-19-14-37",
+          "episodes": 65,
+          "frames": 60647,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "8cdac8a8a1c063e7b7f2d4e3d304d6aafb945390abfbe750e438018a2dde1896"
+        },
+        {
+          "task_id": "task_4_diningroom_can_low_chair",
+          "instruction": "Squat down to grasp the aluminum can on the low chair, then stand up and place it on the table ahead.",
+          "source_root": "20260727/datasets/2026-07-27-20-38-22",
+          "path": "task_4_diningroom_can_low_chair/2026-07-27-20-38-22",
+          "episodes": 18,
+          "frames": 30721,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "7b11323e3adf07da15dffca75e9e8e38c66db31a8f3f296ffffb33e04e38b9a1"
+        },
+        {
+          "task_id": "task_4_diningroom_can_low_chair",
+          "instruction": "Squat down to grasp the aluminum can on the low chair, then stand up and place it on the table ahead.",
+          "source_root": "20260727/datasets/2026-07-27-20-38-30",
+          "path": "task_4_diningroom_can_low_chair/2026-07-27-20-38-30",
+          "episodes": 18,
+          "frames": 30719,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "4d580574b795c91dc9aa6ffdf7c8dc26eaf313982b3beedc2c018127f86525b7"
+        },
+        {
+          "task_id": "task_4_diningroom_can_low_chair",
+          "instruction": "Squat down to grasp the aluminum can on the low chair, then stand up and place it on the table ahead.",
+          "source_root": "20260729/datasets/2026-07-29-19-01-38",
+          "path": "task_4_diningroom_can_low_chair/2026-07-29-19-01-38",
+          "episodes": 29,
+          "frames": 38168,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "bb677ecd1b6ef28e4215141e666d813b409551af4814df203269f5392ed9124d"
+        },
+        {
+          "task_id": "task_4_diningroom_can_low_chair",
+          "instruction": "Squat down to grasp the aluminum can on the low chair, then stand up and place it on the table ahead.",
+          "source_root": "20260729/datasets/2026-07-29-19-01-58",
+          "path": "task_4_diningroom_can_low_chair/2026-07-29-19-01-58",
+          "episodes": 29,
+          "frames": 38168,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "220f33d8c7575c8dd0dad22ab3e983a7845bdefaf8013dc605ff0b646c04a7f0"
+        }
+      ]
+    },
+    "ft271_frozen_20261023": {
+      "description": "同一次冻结的另一版（task_4 只保留 47），共 271 episode；仅作对照，不 active",
+      "root": "/inspire/hdd/global_user/liumengfan-253108110079/flowbody/FlowBody/dataset/groot_sonic_vla_ft271_frozen_20261023",
+      "manifest": "/inspire/hdd/global_user/liumengfan-253108110079/flowbody/FlowBody/dataset/groot_sonic_vla_ft271_frozen_20261023/manifest.json",
+      "task_config": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/SONIC_DATA/deployment/config/sonic_usd_replay_tasks.json",
+      "task_config_sha256": "066abde08e40254e26408680720a54484e65e1b470fb34c442385e9fbef3d29b",
+      "tasks": {
+        "task_1_meeting_room_milk_basket": 89,
+        "task_2_office_red_cup_drawer": 70,
+        "task_3_kitchen_plate_milk_transfer": 65,
+        "task_4_diningroom_can_low_chair": 47
+      },
+      "totals": {
+        "episodes": 271,
+        "frames": 404989,
+        "datasets": 7,
+        "hours_at_50fps": 2.25
+      },
+      "datasets": [
+        {
+          "task_id": "task_1_meeting_room_milk_basket",
+          "instruction": "Navigate to the table ahead, grasp the milk carton, then turn around and proceed to the other table to place the carton into the basket.",
+          "source_root": "2026-07-14/datasets/2026-07-14-20-30-01",
+          "path": "task_1_meeting_room_milk_basket/2026-07-14-20-30-01",
+          "episodes": 84,
+          "frames": 165089,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "ccc90ed3f48329aef34b38d9e75723464b5e70570e51b1bcdb87b7e02d37b1d0"
+        },
+        {
+          "task_id": "task_1_meeting_room_milk_basket",
+          "instruction": "Navigate to the table ahead, grasp the milk carton, then turn around and proceed to the other table to place the carton into the basket.",
+          "source_root": "2026-07-14/datasets/2026-07-14-19-15-12",
+          "path": "task_1_meeting_room_milk_basket/2026-07-14-19-15-12",
+          "episodes": 5,
+          "frames": 18478,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "9a6fdd1f98657c87d432026375c493cfa5c86bf9423f01c80fb11d7f01379462"
+        },
+        {
+          "task_id": "task_2_office_red_cup_drawer",
+          "instruction": "Place the red cup into the drawer and close the drawer completely.",
+          "source_root": "20260722/datasets/2026-07-22-19-33-29",
+          "path": "task_2_office_red_cup_drawer/2026-07-22-19-33-29",
+          "episodes": 56,
+          "frames": 70155,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "5312f89e2e34c696a9648ba0d255cd588f6357135c2bec84dc59b822196a94bb"
+        },
+        {
+          "task_id": "task_2_office_red_cup_drawer",
+          "instruction": "Place the red cup into the drawer and close the drawer completely.",
+          "source_root": "20260722/datasets/2026-07-22-20-13-55",
+          "path": "task_2_office_red_cup_drawer/2026-07-22-20-13-55",
+          "episodes": 14,
+          "frames": 21731,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "9147510d46addcc09f0165fd352fdd5ae067e8285ff451542e984fabe24bb7ad"
+        },
+        {
+          "task_id": "task_3_kitchen_plate_milk_transfer",
+          "instruction": "Retrieve the milk carton from the right plate and place it onto the left plate.",
+          "source_root": "20260723/datasets/2026-07-23-19-14-37",
+          "path": "task_3_kitchen_plate_milk_transfer/2026-07-23-19-14-37",
+          "episodes": 65,
+          "frames": 60647,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "8cdac8a8a1c063e7b7f2d4e3d304d6aafb945390abfbe750e438018a2dde1896"
+        },
+        {
+          "task_id": "task_4_diningroom_can_low_chair",
+          "instruction": "Squat down to grasp the aluminum can on the low chair, then stand up and place it on the table ahead.",
+          "source_root": "20260727/datasets/2026-07-27-20-38-22",
+          "path": "task_4_diningroom_can_low_chair/2026-07-27-20-38-22",
+          "episodes": 18,
+          "frames": 30721,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "7b11323e3adf07da15dffca75e9e8e38c66db31a8f3f296ffffb33e04e38b9a1"
+        },
+        {
+          "task_id": "task_4_diningroom_can_low_chair",
+          "instruction": "Squat down to grasp the aluminum can on the low chair, then stand up and place it on the table ahead.",
+          "source_root": "20260729/datasets/2026-07-29-19-01-38",
+          "path": "task_4_diningroom_can_low_chair/2026-07-29-19-01-38",
+          "episodes": 29,
+          "frames": 38168,
+          "fps": 50,
+          "has_motion_token": true,
+          "has_hand_joints": true,
+          "fingerprint_sha256": "bb677ecd1b6ef28e4215141e666d813b409551af4814df203269f5392ed9124d"
+        }
+      ]
+    }
+  }
+}

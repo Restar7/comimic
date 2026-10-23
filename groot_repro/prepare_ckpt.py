@@ -17,14 +17,20 @@ import os
 import shutil
 from pathlib import Path
 
-STUB = "/home/wusichen/groot_repro/nvidia/Cosmos-Reason2-2B"
+ROOT = Path(__file__).resolve().parents[1]
+#: 16-layer donor config (no weights): GR00T checkpoints carry the backbone
+#: weights themselves, and this stub tells transformers which shapes to build.
+STUB = str(ROOT / "groot_repro" / "nvidia" / "Cosmos-Reason2-2B")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
     ap.add_argument("--dest", required=True)
+    ap.add_argument("--stub", default=STUB, help="local model_name to rewrite into the checkpoint view")
     args = ap.parse_args()
+    if not Path(args.stub).is_dir():
+        raise SystemExit(f"missing donor config directory: {args.stub}")
 
     src, dst = Path(args.source), Path(args.dest)
     dst.mkdir(parents=True, exist_ok=True)
@@ -37,13 +43,13 @@ def main() -> None:
         os.symlink(entry.resolve(), target)
 
     cfg = json.loads((src / "config.json").read_text())
-    cfg["model_name"] = STUB
+    cfg["model_name"] = args.stub
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
 
     proc = json.loads((src / "processor_config.json").read_text())
-    proc["processor_kwargs"]["model_name"] = STUB
+    proc["processor_kwargs"]["model_name"] = args.stub
     (dst / "processor_config.json").write_text(json.dumps(proc, indent=2))
-    print(f"{src} -> {dst}")
+    print(f"{src} -> {dst} (model_name -> {args.stub})")
 
 
 if __name__ == "__main__":

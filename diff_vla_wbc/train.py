@@ -30,6 +30,7 @@ from .rollout import (
     compute_joint_loss,
     freeze_world_model,
     imagine_with_goals,
+    imagine_with_tokens,
     unfreeze_world_model,
 )
 from .supermimic_backend import SuperMimicBundle
@@ -120,27 +121,51 @@ class JointTrainer:
         freeze_world_model(self.bundle.wm)
 
         tokens = self._tokens(batch)
-        rollout = imagine_with_goals(
-            self.bundle,
-            fm_tokens=tokens,
-            adapter=self.adapter,
-            state=batch.start_state,
-            obs_hist=batch.obs_hist,
-            history=batch.history,
-            xi=batch.xi,
-            references=batch.references,
-            prev_action=batch.prev_action,
-            horizon=self.cfg.horizon,
-            obs_noise=self.cfg.obs_noise,
-        )
-        loss, terms = compute_joint_loss(
-            rollout,
-            teacher_goals=batch.teacher_goals,
-            teacher_goal_sequence=batch.teacher_goal_sequence,
-            teacher_states=batch.teacher_states,
-            gamma=self.cfg.gamma,
-            weights=self.cfg.weights,
-        )
+        # Token 路线：SuperMimic ckpt 是 token 条件化（PolicyCfg.token_dim > 0），conditioning 就是
+        # VLA 自己输出的 64 维 motion token，不再经 adapter 生成 680 维 goal（FINAL_HANDOVER §0）。
+        token_route = int(getattr(self.bundle.policy, "token_dim", 0)) > 0
+        if token_route:
+            rollout = imagine_with_tokens(
+                self.bundle,
+                tokens=tokens,
+                state=batch.start_state,
+                obs_hist=batch.obs_hist,
+                history=batch.history,
+                xi=batch.xi,
+                references=batch.references,
+                prev_action=batch.prev_action,
+                horizon=self.cfg.horizon,
+                obs_noise=self.cfg.obs_noise,
+            )
+            # 没有 680 维 goal → goal 对齐项由 compute_joint_loss 自动跳过
+            loss, terms = compute_joint_loss(
+                rollout,
+                teacher_states=batch.teacher_states,
+                gamma=self.cfg.gamma,
+                weights=self.cfg.weights,
+            )
+        else:
+            rollout = imagine_with_goals(
+                self.bundle,
+                fm_tokens=tokens,
+                adapter=self.adapter,
+                state=batch.start_state,
+                obs_hist=batch.obs_hist,
+                history=batch.history,
+                xi=batch.xi,
+                references=batch.references,
+                prev_action=batch.prev_action,
+                horizon=self.cfg.horizon,
+                obs_noise=self.cfg.obs_noise,
+            )
+            loss, terms = compute_joint_loss(
+                rollout,
+                teacher_goals=batch.teacher_goals,
+                teacher_goal_sequence=batch.teacher_goal_sequence,
+                teacher_states=batch.teacher_states,
+                gamma=self.cfg.gamma,
+                weights=self.cfg.weights,
+            )
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if self.fm_parameters:

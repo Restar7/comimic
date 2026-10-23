@@ -1,26 +1,34 @@
 # Differentiable VLA–Whole-Body Co-Training Framework
 
 > **新增主线（2026-10）**：把 GR00T N1.7 的 Flow Matching action head 与
-> CuboiLeo/SuperMimic-Reproduced 的可微 WBC + world model 接成一张计算图：
-> `FM tokens -> motion goal adapter -> SuperMimic WBC -> differentiable world model -> task loss`。
-> 代码在 `diff_vla_wbc/`，说明与复现命令见 [`docs/FRAMEWORK.md`](docs/FRAMEWORK.md)。
+> CuboiLeo/SuperMimic-Reproduced 的可微 WBC + world model 接成一张计算图，并把
+> **顶层 VLM（Cosmos-Reason2-2B）**接在它的上游：
+> `RGB + instruction -> Cosmos-Reason2-2B -> FM head -> motion goal adapter -> SuperMimic WBC -> differentiable world model -> task loss`。
+> 代码在 `diff_vla_wbc/`（VLM 在 `gr00t_vlm.py`），说明与复现命令见
+> [`docs/FRAMEWORK.md`](docs/FRAMEWORK.md)。
 >
 > 已通过真实 `Gr00tN1d7ActionHead`（tiny DiT）+ 真实 SuperMimic `Policy/WorldModel` +
-> 真实 G1 MJCF 的端到端梯度测试；**尚未**用真实 2B VLA 权重、BONES-SEED 全量数据或
-> 带物体接触的世界模型训练。边界写在框架文档第 8 节。
+> 真实 G1 MJCF 的端到端梯度测试；顶层 VLM 用本机真实的 Cosmos-Reason2-2B 权重跑通
+> `backbone -> FM head -> tokens -> adapter` 并反传到 head（`scripts/smoke_vlm.py`）。
+> **尚未**有 GR00T 的 action head checkpoint、与 motion 对齐的 RGB 训练数据、BONES-SEED
+> 全量训练或带物体接触的世界模型。边界写在框架文档第 8 节。
 
 ```text
 diff_vla_wbc/             可微 VLA-WBC 联合训练框架
 third_party/
   SuperMimic-Reproduced/  clone 的 CuboiLeo 实现（BONES-SEED 管线）
 scripts/                  数据转换 / 联合训练 / MuJoCo 评测
-data/npz/example/         工作区 13 条 G1 动作转成的 SuperMimic npz
+data/npz/g1_tasks/       271 条真机 G1 录制转成的 npz（git-ignored，约 1.8 GB）
 docs/FRAMEWORK.md         架构、张量契约、真实权重接入、限制
-tests/                    9 个测试（含真实 GR00T head 反传）
+tests/                    18 个测试（含真实 GR00T head 反传、VLM 接线）
 ```
 
-> Git 仓库不包含 `reproduce_scenes/g1/meshes/` 的 163 MB G1 mesh 资产。
-> 拿到 mesh 后放到该目录，再执行 `bash scripts/setup_assets.sh`。
+> Git 仓库不包含 `reproduce_scenes/g1/meshes/` 的 G1 mesh 资产（约 170 MB，保留在本地磁盘）。
+> 首次运行执行 `bash scripts/setup_assets.sh` 创建 MJCF 需要的 `g1/meshes` 软链（缺失时按脚本提示补齐）。
+>
+> 顶层 VLM 权重不随仓库分发：`python scripts/link_vlm_weights.py` 会把本地
+> Hugging Face 缓存里的 `nvidia/Cosmos-Reason2-2B` 软链成仓库内视图
+> （`groot_repro/nvidia/Cosmos-Reason2-2B-weights/`，git-ignored）。
 
 ---
 
