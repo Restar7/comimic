@@ -32,3 +32,8 @@ data/library/
 data/assets/
 *.pt
 *.npz
+
+# Orphan URDF hand meshes (~61 MB) that none of the MJCFs reference; the 109 trackable
+# G1 meshes are already committed. Blanket-ignore new STLs so the tree stays clean.
+reproduce_scenes/g1/meshes/*.STL
+reproduce_scenes/g1/meshes/*.stl
