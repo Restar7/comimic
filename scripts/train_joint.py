@@ -81,6 +81,9 @@ def main() -> None:
     ap.add_argument("--pretrain-wm-window", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", action="store_true")
+    ap.add_argument("--recorded-tokens", type=Path, default=None, metavar="DIR",
+                    help="use the tokens recorded in DIR/*.npz (g1_motion_token_64, real ft318) "
+                         "instead of a VLM/FM sampler — the 'real data' token source")
     ap.add_argument("--real-gr00t-head", action="store_true",
                     help="use the real GR00T action head with a tiny DiT (gradient smoke)")
     vlm = ap.add_argument_group("top-level VLM (Cosmos-Reason2-2B)")
@@ -132,6 +135,22 @@ def main() -> None:
 
     fm_sampler = None
     fm_params = None
+    if args.recorded_tokens is not None:
+        from diff_vla_wbc.data import RecordedTokenSource
+
+        fm_sampler = RecordedTokenSource(
+            args.recorded_tokens,
+            library,
+            token_horizon=adapter.cfg.token_horizon,
+            token_dim=adapter.cfg.token_dim,
+            device=device,
+        )
+        fm_params = []
+        print(
+            f"[info] token source: recorded g1_motion_token_64 from {args.recorded_tokens} "
+            f"(real ft318 tokens, horizon={adapter.cfg.token_horizon})"
+        )
+
     if args.real_gr00t_head:
         from diff_vla_wbc.gr00t_tiny import TinyGr00tModel, make_tiny_action_head, tiny_model_inputs
 

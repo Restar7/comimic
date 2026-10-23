@@ -209,6 +209,66 @@ class MotionBatch:
         return self.__dict__.copy()
 
 
+class RecordedTokenSource:
+    """Replay the dataset's own motion tokens (``g1_motion_token_64``) as the conditioning.
+
+    The ft318 recordings store, per frame, the 64-d SONIC motion token that the deploy-time VLA is
+    trained to emit.  Feeding *those* instead of random vectors makes the joint rollout see the
+    real token distribution — this is the "real data" counterpart of the VLM/FM sampler.
+    """
+
+    def __init__(
+        self,
+        npz_dir: str | Path,
+        library,
+        *,
+        token_horizon: int = 40,
+        token_dim: int = 64,
+        device: str | torch.device = "cuda",
+    ) -> None:
+        import bisect
+
+        self.npz_dir = Path(npz_dir)
+        self.library = library
+        self.horizon = int(token_horizon)
+        self.token_dim = int(token_dim)
+        self.device = torch.device(device)
+        self._starts = [int(c.start) for c in library.clips]
+        self._names = [c.name for c in library.clips]
+        self._cache: dict[str, torch.Tensor] = {}
+        self._bisect = bisect.bisect_right
+
+    def _tokens(self, ci: int) -> torch.Tensor:
+        name = self._names[ci]
+        tok = self._cache.get(name)
+        if tok is None:
+            with np.load(self.npz_dir / f"{name}.npz") as d:
+                if "g1_motion_token_64" not in d:
+                    raise KeyError(f"{name}.npz has no g1_motion_token_64 (recorded token)")
+                tok = torch.as_tensor(np.ascontiguousarray(d["g1_motion_token_64"]), dtype=torch.float32)
+            if int(tok.shape[-1]) != self.token_dim:
+                raise ValueError(f"{name}: token dim {tok.shape[-1]} != {self.token_dim}")
+            if len(self._cache) > 128:
+                self._cache.clear()
+            self._cache[name] = tok
+        return tok
+
+    def __call__(self, meta: dict) -> torch.Tensor:
+        frames = meta["frames"]
+        frames = frames.detach().cpu().tolist() if torch.is_tensor(frames) else list(frames)
+        out = torch.zeros(len(frames), self.horizon, self.token_dim)
+        for i, f in enumerate(frames):
+            ci = max(self._bisect(self._starts, int(f)) - 1, 0)
+            local = int(f) - self._starts[ci]
+            tok = self._tokens(ci)
+            seg = tok[local : local + self.horizon]
+            if seg.shape[0] < self.horizon:  # 片段尾部不足：重复最后一帧
+                pad = seg[-1:].expand(self.horizon - seg.shape[0], -1)
+                seg = torch.cat([seg, pad], 0)
+            out[i] = seg
+        return out.to(self.device)
+
+
 class MotionBatchProvider:
     """Sample paired (start state, teacher goal/reference) motion windows."""
 
