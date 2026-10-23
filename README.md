@@ -19,6 +19,9 @@ docs/FRAMEWORK.md         架构、张量契约、真实权重接入、限制
 tests/                    9 个测试（含真实 GR00T head 反传）
 ```
 
+> Git 仓库不包含 `reproduce_scenes/g1/meshes/` 的 163 MB G1 mesh 资产。
+> 拿到 mesh 后放到该目录，再执行 `bash scripts/setup_assets.sh`。
+
 ---
 
 # issac_groot — GR00T N1.7 推理复现与闭环控制

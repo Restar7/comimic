@@ -76,6 +76,11 @@ G1 MJCF：`GR00T-WholeBodyControl/gear_sonic_deploy/g1/g1_29dof.xml`
 （29 DoF，nq=36，nv=35，actuator=29）。`g1/meshes` 指向
 `reproduce_scenes/g1/meshes`（脚本 `scripts/setup_assets.sh` 可重建）。
 
+**注意：163 MB 的 G1 mesh 资产没有上传到 Git。** 先准备
+`reproduce_scenes/g1/meshes/`（可从 Unitree G1 / LAFAN1_Retargeting_Dataset 获取），
+再运行 `bash scripts/setup_assets.sh` 创建 MJCF 需要的软链。没有 mesh 时，
+`build_g1_assets()` 会给出明确的缺失路径错误，但无法编译 MuJoCo 模型。
+
 ## 4. 目录
 
 ```text
@@ -103,7 +108,8 @@ tests/                    9 个测试，包含真实 GR00T head 的反传
 当前测试环境：Python 3.13、torch 2.11、mujoco 3.16、transformers 5.1、diffusers 0.41。
 
 ```bash
-# 0) 如果 meshes 软链不存在
+# 0) G1 mesh 资产不在仓库里；先把 meshes 放到 reproduce_scenes/g1/meshes，
+#    再创建 MJCF 需要的软链
 bash scripts/setup_assets.sh
 
 # 1) 把工作区里的 G1 动作导出为 npz（已生成 13 条 example）
