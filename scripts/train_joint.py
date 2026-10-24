@@ -81,6 +81,13 @@ def main() -> None:
     ap.add_argument("--pretrain-wm-window", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", action="store_true")
+    ap.add_argument("--save-every", type=int, default=0, help="every N steps save joint_<step>.pt (0=off)")
+    ap.add_argument("--save-vla-every", type=int, default=0,
+                    help="every N steps save the fine-tuned VLA head (vla_<step>.pt, ~6.5 GB); "
+                         "trainer.save() alone does NOT include it")
+    ap.add_argument("--eval-every", type=int, default=0, help="every N steps run a fixed-batch eval (0=off)")
+    ap.add_argument("--eval-batches", type=int, default=2, help="how many fixed eval batches")
+    ap.add_argument("--eval-out", type=Path, default=None, help="JSONL file for eval curves")
     ap.add_argument("--recorded-tokens", type=Path, default=None, metavar="DIR",
                     help="use the tokens recorded in DIR/*.npz (g1_motion_token_64, real ft318) "
                          "instead of a VLM/FM sampler — the 'real data' token source")
@@ -165,6 +172,7 @@ def main() -> None:
         fm_params = [p for p in head.parameters() if p.requires_grad]
         print(f"[info] real GR00T action head params: {sum(p.numel() for p in head.parameters()):,}")
 
+    vlm_model = None  # 循环里的 VLA 头存档要用；未走 --vlm 时保持 None
     if args.vlm:
         if args.real_gr00t_head:
             raise SystemExit("--vlm and --real-gr00t-head are mutually exclusive")
@@ -184,6 +192,10 @@ def main() -> None:
             action_horizon=adapter.cfg.token_horizon,
             max_state_dim=args.vlm_state_dim,
             freeze_vlm=not args.train_vlm,
+            # 反传微调里 VLM 输入是 fp32（SuperMimic 侧张量），FlashAttention 只吃
+            # fp16/bf16 会直接抛 "FlashAttention only support fp16 and bf16"。
+            # 强制走 sdpa，数值等价且 dtype 通吃。
+            attn_implementation="sdpa",
         )
         print("[info] top-level VLM: " + json.dumps(describe_vlm(vlm_model), default=str))
 
@@ -284,11 +296,108 @@ def main() -> None:
             m = trainer.train_world_model(windows)
             print(f"[wm {i + 1}/{args.pretrain_wm}] " + json.dumps({k: round(v, 6) for k, v in m.items()}))
 
+    # ---------------------------------------------------------------- 固定评测批次
+    eval_batches = None
+    recorded_src = None
+    if args.eval_every and args.eval_batches:
+        # 只导入这里需要的名字：在 main() 里重复 import MotionBatchProvider 会让它变成
+        # 函数局部变量，后面 line 266 的 MotionBatchProvider(...) 就会 UnboundLocalError。
+        from diff_vla_wbc.data import RecordedTokenSource
+        from diff_vla_wbc.rollout import compute_joint_loss, imagine_with_tokens
+
+        token_dir = args.motion[0] if args.motion[0].is_dir() else args.motion[0].parent
+        recorded_src = RecordedTokenSource(
+            token_dir, library, token_horizon=adapter.cfg.token_horizon,
+            token_dim=adapter.cfg.token_dim, device=device,
+        )
+        eval_provider = MotionBatchProvider(
+            bundle, library, batch_size=args.batch_size, horizon=args.horizon,
+            token_source=None, token_dim=adapter.cfg.token_dim,
+            token_horizon=adapter.cfg.token_horizon, seed=12345,
+        )
+        eval_batches = [eval_provider.sample() for _ in range(args.eval_batches)]
+        print(f"[eval] fixed eval batches: {len(eval_batches)} x batch {args.batch_size}, every {args.eval_every} steps")
+
+    @torch.no_grad()
+    def run_eval(step: int) -> dict:
+        """同一批帧上测：VLA token 与录制 token 的 MSE + 想象 rollout 的状态/奖励项。"""
+        import torch.nn.functional as F
+
+        tok_mse, st, rw = [], [], []
+        # 采样噪声是随机初始化：评测必须固定种子，否则曲线抖动会被误读成训练噪声。
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        for i, b in enumerate(eval_batches):
+            torch.manual_seed(1234 + i)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(1234 + i)
+            try:
+                # VLA 采样要求 grad 打开（flow-matching 走 sample_model_with_grad），
+                # 评测只要数值，所以借用 enable_grad 后立刻 detach，不建反传图。
+                with torch.enable_grad():
+                    vla = fm_sampler(b.as_dict()) if fm_sampler is not None else b.fm_tokens
+            finally:
+                pass
+            vla = vla.detach()
+            rec = recorded_src({"frames": b.frames})
+            n = min(vla.shape[1], rec.shape[1])
+            tok_mse.append(float(F.mse_loss(vla[:, :n], rec[:, :n])))
+            ro = imagine_with_tokens(
+                bundle, tokens=vla, state=b.start_state, obs_hist=b.obs_hist, history=b.history,
+                xi=b.xi, references=b.references, prev_action=b.prev_action,
+                horizon=args.horizon, obs_noise=0.0,
+            )
+            _, terms = compute_joint_loss(
+                ro, teacher_states=b.teacher_states, gamma=trainer.cfg.gamma,
+                weights=trainer.cfg.weights,
+            )
+            st.append(float(terms.get("state", torch.zeros(()))))
+            rw.append(float(ro.rewards.mean()))
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+        m = {
+            "step": step,
+            "token_mse": sum(tok_mse) / len(tok_mse),
+            "state_term": sum(st) / len(st),
+            "rollout_reward": sum(rw) / len(rw),
+        }
+        print(f"[eval {step}] " + json.dumps({k: round(v, 6) for k, v in m.items()}), flush=True)
+        if args.eval_out is not None:
+            args.eval_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(args.eval_out, "a") as f:
+                f.write(json.dumps(m) + "\n")
+        return m
+
+    if eval_batches:
+        run_eval(0)  # 起点基线（= 20k VLA 未做反传微调时的水平）
+
     for step in range(1, args.steps + 1):
         batch = provider.sample()
         metrics = trainer.train_step(batch)
         if step % args.log_every == 0 or step == 1:
-            print(f"[step {step}/{args.steps}] " + json.dumps({k: round(v, 6) for k, v in metrics.items()}))
+            print(f"[step {step}/{args.steps}] " + json.dumps({k: round(v, 6) for k, v in metrics.items()}), flush=True)
+        if args.eval_every and eval_batches and step % args.eval_every == 0:
+            run_eval(step)
+        if args.save_every and step % args.save_every == 0:
+            args.out.mkdir(parents=True, exist_ok=True)
+            trainer.save(args.out / f"joint_{step:06d}.pt")
+            print(f"[saved] {args.out / f'joint_{step:06d}.pt'}", flush=True)
+        if args.save_vla_every and vlm_model is not None and step % args.save_vla_every == 0:
+            args.out.mkdir(parents=True, exist_ok=True)
+            vpath = args.out / f"vla_{step:06d}.pt"
+            torch.save(
+                {
+                    "step": step,
+                    "fm": {
+                        n: p.detach().to("cpu", dtype=torch.float32)
+                        for n, p in vlm_model.named_parameters()
+                        if p.requires_grad
+                    },
+                },
+                vpath,
+            )
+            print(f"[saved] {vpath}", flush=True)
 
     args.out.mkdir(parents=True, exist_ok=True)
     if args.save:

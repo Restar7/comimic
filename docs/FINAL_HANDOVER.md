@@ -488,6 +488,8 @@ nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv -l 2
 | 测试 | `tests/test_sonic_encoder.py`、`test_sonic_token.py`、`test_sonic_dataset.py`、`test_hand_stream.py`、`test_vla_hand_head.py`、`test_goal_head.py` |
 | 4×H200 离线训练 | `scripts/launch_token_train_4xh200.sh` + `scripts/preflight_4xh200_offline.py` |
 | 论文修改方案（idea 定位/逐节改写/数据修正） | `docs/PAPER_REVISION_PLAN.md` |
+| FM 梯度反传消融（pathwise/checkpoint/adjoint/truncated/Q-VGM-lite） | `ablation_fm_grad/README.md` + `results/` |
+| 消融的论文用报告（英文/表格/LaTeX/引用） | `ablation_fm_grad/REPORT.md` |
 
 ---
 

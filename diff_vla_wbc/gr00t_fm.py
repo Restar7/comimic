@@ -66,6 +66,7 @@ def sample_fm_from_features(
     num_steps: int | None = None,
     options: dict[str, Any] | None = None,
     return_features: bool = False,
+    checkpoint_steps: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Differentiable equivalent of ``get_action_with_features``.
 
@@ -117,7 +118,7 @@ def sample_fm_from_features(
             ramp = ramp / ramp[-1].clamp_min(1e-8)
             vel_strength[:, frozen:overlap, :] = ramp[1:-1][None, :, None]
 
-    for index in range(steps):
+    def _euler_step(actions: torch.Tensor, index: int) -> torch.Tensor:
         t_cont = index / float(steps)
         timestep = int(t_cont * buckets)
         timesteps = torch.full((batch_size,), timestep, dtype=torch.long, device=vl_embeds.device)
@@ -141,7 +142,15 @@ def sample_fm_from_features(
         hidden = action_head.model(**kwargs)
         predicted = action_head.action_decoder(hidden, embodiment_id)
         predicted_velocity = predicted[:, -horizon:]
-        actions = actions + dt * predicted_velocity * vel_strength
+        return actions + dt * predicted_velocity * vel_strength
+
+    for index in range(steps):
+        if checkpoint_steps:
+            from torch.utils.checkpoint import checkpoint
+
+            actions = checkpoint(_euler_step, actions, index, use_reentrant=False)
+        else:
+            actions = _euler_step(actions, index)
 
     if return_features:
         return actions, vl_embeds, state_features
@@ -157,6 +166,7 @@ def sample_fm_with_grad(
     num_steps: int | None = None,
     options: dict[str, Any] | None = None,
     return_features: bool = False,
+    checkpoint_steps: bool = False,
 ):
     """Differentiable equivalent of ``Gr00tN1d7ActionHead.get_action``.
 
@@ -175,6 +185,7 @@ def sample_fm_with_grad(
         num_steps=num_steps,
         options=options,
         return_features=return_features,
+        checkpoint_steps=checkpoint_steps,
     )
 
 
@@ -186,6 +197,7 @@ def sample_model_with_grad(
     num_steps: int | None = None,
     options: dict[str, Any] | None = None,
     return_features: bool = False,
+    checkpoint_steps: bool = False,
 ):
     """Full VLA path: preprocess -> VLM backbone -> differentiable FM sampling.
 
@@ -205,6 +217,7 @@ def sample_model_with_grad(
         num_steps=num_steps,
         options=options,
         return_features=return_features,
+        checkpoint_steps=checkpoint_steps,
     )
 
 

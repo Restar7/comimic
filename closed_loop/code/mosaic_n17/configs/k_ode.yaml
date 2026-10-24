@@ -1,0 +1,32 @@
+# K-candidate sampling + arbitration configuration (M1/M4).
+#
+# The sampler never uses RTC: a 64D motion-token prefix has no established
+# physical meaning, and candidate selection must not rewrite executed ticks.
+schema: mosaic.n17.k_ode_config.v1
+
+policy:
+  base_model_path: nvidia/GR00T-N1.7-3B
+  embodiment_tag: unitree_g1_sonic
+  num_inference_timesteps: 4
+
+sampling:
+  K: 4
+  # null means "the official batched randn inside get_action_with_features";
+  # list[int] switches to per-candidate fork_rng seeding (S2, lower VRAM).
+  seeds: null
+
+gate:
+  stage_weight: 1.0
+  support_weight: 0.5
+  uncertainty_weight: 1.0
+  selection_margin: 0.0
+  motion_abs_bound: 1.25
+  hand_abs_bound: null
+
+shadow:
+  enabled: true
+  primary_index: 0
+
+budget:
+  replan_hz: 2.5
+  latency_budget_ms: 400

@@ -163,7 +163,13 @@ def save_run_config_artifacts(
     """Write ``config.yaml`` / ``conf.yaml`` / ``wandb_config.json``."""
     save_cfg_dir.mkdir(parents=True, exist_ok=True)
     config.save(save_cfg_dir / "config.yaml")
-    omegaconf_config = OmegaConf.create(config.__dict__)
+    # 用 Config.save 同一套「纯值树」构建 OmegaConf 结构化配置：
+    # transformers 5.x 给 PretrainedConfig 加了 `dtype: Union[str, torch.dtype]`，
+    # OmegaConf 的结构化路径会报 "Unions of containers are not supported" / NameError。
+    from dataclasses import asdict as _asdict
+    from gr00t.configs.base_config import _build_safe_tree  # noqa: PLC0415
+
+    omegaconf_config = OmegaConf.create(_build_safe_tree(_asdict(config)))
     omegaconf_config["max_steps"] = config.training.max_steps
     omegaconf_config["save_steps"] = config.training.save_steps
     OmegaConf.save(omegaconf_config, save_cfg_dir / "conf.yaml", resolve=True)

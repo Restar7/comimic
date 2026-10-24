@@ -37,3 +37,13 @@ data/assets/
 # G1 meshes are already committed. Blanket-ignore new STLs so the tree stays clean.
 reproduce_scenes/g1/meshes/*.STL
 reproduce_scenes/g1/meshes/*.stl
+
+# Python deps vendored for the GR00T runner (1.5 GB, reinstallable)
+third_party/gr00t_deps/
+
+# G1/YCB mesh assets: kept on disk for MuJoCo, never tracked (fetch separately)
+reproduce_scenes/g1/meshes/
+GR00T-WholeBodyControl/gear_sonic_deploy/g1/meshes
+
+# Ablation scratch outputs
+ablation_fm_grad/results/_isolate/

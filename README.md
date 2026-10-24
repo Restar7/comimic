@@ -23,8 +23,9 @@ docs/FRAMEWORK.md         架构、张量契约、真实权重接入、限制
 tests/                    18 个测试（含真实 GR00T head 反传、VLM 接线）
 ```
 
-> Git 仓库不包含 `reproduce_scenes/g1/meshes/` 的 G1 mesh 资产（约 170 MB，保留在本地磁盘）。
-> 首次运行执行 `bash scripts/setup_assets.sh` 创建 MJCF 需要的 `g1/meshes` 软链（缺失时按脚本提示补齐）。
+> G1/YCB mesh 资产（约 170 MB）**不进 Git**，保留在本地磁盘；首次运行执行
+> `bash scripts/setup_assets.sh` 创建 MJCF 需要的 `g1/meshes` 软链（缺失时按脚本提示从
+> Unitree G1 描述目录补齐）。
 >
 > 顶层 VLM 权重不随仓库分发：`python scripts/link_vlm_weights.py` 会把本地
 > Hugging Face 缓存里的 `nvidia/Cosmos-Reason2-2B` 软链成仓库内视图

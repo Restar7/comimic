@@ -53,10 +53,108 @@ def _decoder_import_error(exc: BaseException) -> ImportError:
     return ImportError(_TORCHCODEC_FFMPEG_HINT.format(error=exc))
 
 
+# ---------------------------------------------------------------------------
+# PyAV fallback（本机没有 CUDA-13 的 torchcodec；ft318 的 ego_view 是普通 H.264 mp4）
+# ---------------------------------------------------------------------------
+class _AVFrames:
+    """torchcodec ``FrameBatch`` 的最小替身：只有 ``.data`` / ``.pts_seconds``。"""
+
+    def __init__(self, frames: np.ndarray, pts: np.ndarray):
+        self._f, self._p = frames, pts
+
+    @property
+    def data(self):
+        import torch
+
+        return torch.from_numpy(self._f)
+
+    @property
+    def pts_seconds(self):
+        import torch
+
+        return torch.from_numpy(self._p)
+
+
+class _AVVideoDecoder:
+    """用 PyAV 复刻 torchcodec.VideoDecoder 用到的那几个接口。"""
+
+    def __init__(self, video_path: str, **_: object):
+        import av
+
+        self.path = str(video_path)
+        self._container = av.open(self.path)
+        self._stream = self._container.streams.video[0]
+        self._fps = float(self._stream.average_rate) if self._stream.average_rate else 30.0
+        self._cache: dict[int, np.ndarray] = {}
+        self._pts: dict[int, float] = {}
+        self._n: int | None = None
+
+    # -- 基础信息 --
+    def __len__(self) -> int:
+        if self._n is None:
+            n = 0
+            for _ in self._container.decode(self._stream):
+                n += 1
+            self._container.seek(0)
+            self._n = max(n, 1)
+        return self._n
+
+    class _Meta:
+        def __init__(self, fps: float):
+            self.average_fps = fps
+
+    @property
+    def metadata(self):
+        return self._Meta(self._fps)
+
+    # -- 取帧 --
+    def _load(self, indices) -> None:
+        want = {int(i) for i in indices}
+        if all(i in self._cache for i in want):
+            return
+        import av
+
+        self._container.close()
+        self._container = av.open(self.path)
+        self._stream = self._container.streams.video[0]
+        hi = max(want)
+        for i, frame in enumerate(self._container.decode(self._stream)):
+            if i > hi:
+                break
+            if i in want and i not in self._cache:
+                self._cache[i] = frame.to_ndarray(format="rgb24")  # HWC uint8
+                self._pts[i] = float(frame.pts * self._stream.time_base) if frame.pts is not None else i / self._fps
+            if i >= hi:
+                break
+
+    def get_frames_at(self, indices):
+        idx = [int(i) for i in indices]
+        self._load(idx)
+        missing = [i for i in idx if i not in self._cache]
+        if missing:
+            raise IndexError(f"{self.path}: frame indices {missing[:5]} out of range")
+        return _AVFrames(np.stack([self._cache[i] for i in idx], 0), np.asarray([self._pts[i] for i in idx], np.float64))
+
+    def get_frames_played_at(self, seconds):
+        idx = [int(round(float(t) * self._fps)) for t in seconds]
+        return self.get_frames_at(idx)
+
+
+def _av_available() -> bool:
+    try:
+        import av  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 def _get_video_decoder_cls():
     try:
         from torchcodec.decoders import VideoDecoder
     except (ImportError, OSError, RuntimeError) as exc:
+        if _av_available():
+            return _AVVideoDecoder
         raise _decoder_import_error(exc) from exc
     return VideoDecoder
 

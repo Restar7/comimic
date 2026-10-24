@@ -71,6 +71,8 @@ def tiny_config(
     backbone_dim: int = 16,
     state_dim: int = 8,
     hidden: int = 32,
+    num_layers: int = 1,
+    num_attention_heads: int = 2,
 ):
     Gr00tN1d7Config, _ = ensure_gr00t_importable()
     return Gr00tN1d7Config(
@@ -87,9 +89,9 @@ def tiny_config(
         use_alternate_vl_dit=False,
         diffusion_model_cfg=dict(
             positional_embeddings=None,
-            num_layers=1,
-            num_attention_heads=2,
-            attention_head_dim=hidden // 2,
+            num_layers=num_layers,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=max(1, hidden // num_attention_heads),
             norm_type="ada_norm",
             dropout=0.0,
             final_dropout=False,
