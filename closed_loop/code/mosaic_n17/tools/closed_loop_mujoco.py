@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -217,6 +218,30 @@ def main() -> None:
         "remaining executed ticks are freshly denoised",
     )
     ap.add_argument(
+        "--hand-mode",
+        choices=("vla", "trend", "fixed-open", "fixed-grasp"),
+        default="trend",
+        help="手部通道怎么驱动：vla=原样用 VLA 手部数值; trend=只看'抓/松趋势'再打到标定姿态点（推荐）; "
+        "fixed-open/fixed-grasp=恒定居中姿态",
+    )
+    ap.add_argument(
+        "--hand-calib-npz",
+        type=Path,
+        default=None,
+        help="该任务的录制 npz（取 g1_hand_joints_14）用于标定 open/grasp 两个姿态点与方向；"
+        "缺省时用 --hand-open/--hand-grasp 的常数",
+    )
+    ap.add_argument("--hand-open", type=float, nargs="*", default=None, help="14 维张开姿态（无 npz 时用）")
+    ap.add_argument("--hand-grasp", type=float, nargs="*", default=None, help="14 维抓握姿态（无 npz 时用）")
+    ap.add_argument("--hand-threshold", type=float, default=0.5,
+                    help="趋势阈值（相对 open→grasp 位移的比例，0.5=走到一半就抓）")
+    ap.add_argument("--hand-ramp-ticks", type=int, default=5, help="开合过渡斜坡 tick 数")
+    ap.add_argument(
+        "--log-hands",
+        action="store_true",
+        help="把 hand_score / hand_state / hand_target 写进 state.jsonl",
+    )
+    ap.add_argument(
         "--log-action",
         action="store_true",
         help="also write the executed token and q_target per tick (for RTC on/off continuity metrics)",
@@ -288,6 +313,19 @@ def main() -> None:
 
     # RTC on/off comparisons are only meaningful at the same seed: the action head
     # draws its own Gaussian initialisation on every plan.
+    #
+    # Determinism: identical (ckpt, seed) must produce identical tokens, otherwise
+    # an A/B difference can be kernel noise.  ``COMIMIC_DETERMINISTIC=0`` disables
+    # this when the deterministic kernels are too slow for a smoke run.
+    det_mode = os.environ.get("COMIMIC_DETERMINISTIC", "1")
+    if det_mode != "0":
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True, warn_only=(det_mode != "strict"))
+        print(f"[det] mode={det_mode} cudnn.deterministic=True tf32=False", flush=True)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -419,6 +457,24 @@ def main() -> None:
     blocks = args.chunks if not args.until_success else 10**9
     max_plans = blocks * (HORIZON // args.execute_steps)
     max_ticks = int(np.ceil(args.max_seconds / CONTROL_DT)) + 1
+    # ---------------- 手部通道：趋势二值化器 ----------------
+    open_pose = np.asarray(args.hand_open, np.float32).reshape(14) if args.hand_open else None
+    grasp_pose = np.asarray(args.hand_grasp, np.float32).reshape(14) if args.hand_grasp else None
+    if args.hand_calib_npz is not None:
+        with np.load(args.hand_calib_npz) as z:
+            h = z["g1_hand_joints_14"].astype(np.float32)
+        ap = h.mean(1)
+        lo, hi = np.quantile(ap, [0.1, 0.9])
+        closed = ap > (lo + hi) / 2
+        if (~closed).any() and closed.any():
+            open_pose = h[~closed].mean(0)
+            grasp_pose = h[closed].mean(0)
+            print(f"[hand] 标定自 {Path(args.hand_calib_npz).name}: open/grasp 两态位移 "
+                  f"{float(np.abs(grasp_pose - open_pose).mean()):.3f} | 闭合帧占比 {closed.mean():.1%}", flush=True)
+    hand_ctrl = HandTrend(args.hand_mode, open_pose, grasp_pose, args.hand_threshold, args.hand_ramp_ticks)
+    print(f"[hand] mode={args.hand_mode} threshold={args.hand_threshold} ramp={args.hand_ramp_ticks} "
+          f"calibrated={hand_ctrl.dir is not None}", flush=True)
+
     tick = 0
     plans = 0
     consumed = 0
@@ -514,7 +570,11 @@ def main() -> None:
                 f"tick {tick}: plan index {index} outside [0,{HORIZON}); the committed plan is stale"
             )
         tokens, hands_l, hands_r = chunk
-        token, hand_l, hand_r = tokens[index], hands_l[index], hands_r[index]
+        token = tokens[index]
+        # 手部：`--hand-mode trend` 时只看"抓/松趋势"，再把手指打到标定姿态点（不做角度回放）
+        hand_raw14 = np.concatenate((hands_l[index], hands_r[index])).astype(np.float32)
+        hand_target14 = hand_ctrl.update(hand_raw14)
+        hand_l, hand_r = hand_target14[:7], hand_target14[7:]
         # smap resolves the 29 body joints by name: the MJCF interleaves the
         # hands (legs+waist, left arm, left hand, right arm, right hand), so a
         # contiguous body slice would feed the left hand in place of the right arm.
@@ -559,6 +619,11 @@ def main() -> None:
             "candidate": plan_info["candidate"],
             "candidate_spread": plan_info["candidate_spread"],
         }
+        if args.log_hands:
+            row["hand_raw"] = np.round(hand_raw14, 5).tolist()
+            row["hand_target"] = np.round(hand_target14, 5).tolist()
+            row["hand_state"] = np.round(hand_ctrl.state, 3).tolist()
+            row["hand_score"] = np.round(hand_ctrl.score, 4).tolist()
         if args.log_action:
             row["token"] = np.round(token, 5).tolist()
             row["q_target"] = np.round(q_target, 5).tolist()
@@ -643,6 +708,69 @@ def _observation(d, smap, renderer, cam, G, cfg, *, hash_ego: bool = False):
         "language": {"annotation.human.task_description": [[cfg["prompt"]]]},
     }
     return obs, digest
+
+
+class HandTrend:
+    """把手部 14 维输出降解成'抓 / 松'两态，再打到标定姿态点上。
+
+    动机：VLA 的手部数值量纲/归一化不可靠（实测当角度用会乱动），但**趋势**是可靠的：
+    只要它朝"抓"的方向走，就把手直接合到抓握姿态；松放同理。方向与两个姿态点由录制
+    数据（`g1_hand_joints_14`）标定，并用 episode 起点的输出做基线，抵消量纲差异。
+    """
+
+    def __init__(self, mode: str, open_pose, grasp_pose, threshold: float, ramp_ticks: int):
+        self.mode = mode
+        self.threshold = float(threshold)
+        self.ramp = max(1, int(ramp_ticks))
+        self.open = None if open_pose is None else np.asarray(open_pose, np.float32).reshape(14)
+        self.grasp = None if grasp_pose is None else np.asarray(grasp_pose, np.float32).reshape(14)
+        if self.open is not None and self.grasp is not None:
+            d = self.grasp - self.open
+            n = float(np.linalg.norm(d))
+            self.dir = d / n if n > 1e-6 else None
+            self.dlen = n
+        else:
+            self.dir = None
+            self.dlen = 0.0
+        self.baseline = None          # 第一个 plan 的手部输出（近似=张开态）
+        self.state = np.zeros(2, np.float32)   # [left, right] 0=松 1=抓
+        self.cur = None               # 当前实际下发的 14 维目标（带斜坡）
+        self.score = np.zeros(2, np.float32)
+
+    def _score(self, hand14: np.ndarray) -> np.ndarray:
+        if self.dir is None:
+            return np.zeros(2, np.float32)
+        if self.baseline is None:
+            self.baseline = hand14.copy()
+        proj = float(np.dot(hand14 - self.baseline, self.dir))
+        # 归一化到 open→grasp 位移的 0..1
+        rel = proj / max(self.dlen, 1e-6)
+        return np.array([rel, rel], np.float32)
+
+    def update(self, hand14: np.ndarray) -> np.ndarray:
+        hand14 = np.asarray(hand14, np.float32).reshape(14)
+        if self.mode == "vla" or self.open is None or self.grasp is None:
+            self.cur = hand14
+            return hand14
+        if self.mode == "fixed-open":
+            target = self.open
+        elif self.mode == "fixed-grasp":
+            target = self.grasp
+        else:  # trend
+            sc = self._score(hand14)
+            self.score = sc
+            thr = self.threshold * self.dlen
+            for k in range(2):
+                if sc[k] > thr:
+                    self.state[k] = 1.0
+                elif sc[k] < -0.25 * thr:
+                    self.state[k] = 0.0
+            target = np.where(self.state.reshape(2, 1) > 0.5, self.grasp.reshape(2, 7), self.open.reshape(2, 7)).reshape(14).astype(np.float32)
+        if self.cur is None:
+            self.cur = target.copy()
+        else:
+            self.cur = self.cur + (target - self.cur) / float(self.ramp)
+        return self.cur
 
 
 def _decode_chunk(action: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

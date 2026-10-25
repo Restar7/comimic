@@ -19,22 +19,26 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
 
-from .compat import G1_JOINT_NAMES, ensure_supermimic_importable, g1_xml_path, load_g1_model, quat_apply_inverse
-from .supermimic_backend import (
-    ACTION_DIM,
-    GOAL_DIM,
-    HISTORY,
-    STATE_DIM,
-    SuperMimicBundle,
-    default_xi,
-)
+# Data plumbing is implementation-agnostic.  The constants below are the shared contract
+# (state 71, action 29, history 10); the MuJoCo/mjlab-specific helpers that used to be imported
+# at module scope are pulled in **lazily inside the legacy functions only**, so the Isaac path
+# (``diff_vla_wbc.isaac_joint``) never imports the mjlab stack.
+ACTION_DIM = 29
+HISTORY = 10
+STATE_DIM = 71
+GOAL_DIM = 680
+XI_DIM = 33
 
-ensure_supermimic_importable()
+
+def _default_xi(batch: int, device) -> torch.Tensor:
+    xi = torch.zeros(batch, XI_DIM, device=device)
+    xi[:, 0] = 0.75   # nominal friction, zero encoder bias, zero CoM offset
+    return xi
 
 
 def _read_csv(path: Path) -> np.ndarray:
@@ -69,6 +73,9 @@ def motion_npz_from_body_csv_dir(
     body order.  Joint velocities are finite differences of the joint angles
     (same convention as mjlab's converter).
     """
+    from .compat import G1_JOINT_NAMES, ensure_supermimic_importable, load_g1_model, quat_apply_inverse
+
+    ensure_supermimic_importable()
     csv_dir = Path(csv_dir)
     out = Path(output)
     joint_q = _read_csv(csv_dir / "joint_pos.csv")
@@ -148,6 +155,9 @@ def motion_npz_from_lafan1_csv(
     module (linear interpolation, finite-difference velocities, SO(3) mean for
     angular velocity).
     """
+    from .compat import G1_JOINT_NAMES, ensure_supermimic_importable, load_g1_model, quat_apply_inverse
+
+    ensure_supermimic_importable()
     raw = np.loadtxt(csv_path, delimiter=",", dtype=np.float64)
     if raw.ndim != 2 or raw.shape[1] != 36:
         raise ValueError(f"{csv_path}: expected (N,36), got {raw.shape}")
@@ -204,6 +214,7 @@ class MotionBatch:
     references: list
     teacher_goal_sequence: torch.Tensor | None = None
     model_inputs: dict | None = None
+    hand_ref: torch.Tensor | None = None   # (B, T, 14) 录制手部标签（左右各 7），用于辅助监督
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
@@ -225,6 +236,7 @@ class RecordedTokenSource:
         token_horizon: int = 40,
         token_dim: int = 64,
         device: str | torch.device = "cuda",
+        port_dir: str | Path | None = None,
     ) -> None:
         import bisect
 
@@ -233,19 +245,45 @@ class RecordedTokenSource:
         self.horizon = int(token_horizon)
         self.token_dim = int(token_dim)
         self.device = torch.device(device)
+        # ---- token 空间口径（2026-10-25）----------------------------------------
+        # HA npz 里的 ``g1_motion_token_64`` 来自部署侧 ``encoder_input (1762)`` 前端，而
+        # trackerlab WBC 的条件空间是 640 维端口装配（未来 10 帧参考 + anchor）。实测（
+        # ``scripts/probe_port_tokens.py``，动作尺度修好之后）端口 token 明显更好：
+        #   端口 token 0.070 / 2.87   vs   存储标签 0.052 / 6.48
+        # 所以默认优先用 ``data/port_tokens/<dataset>/<clip>.npy`` 侧车（
+        # ``scripts/build_port_tokens.py`` 生成），缺失时回退到 npz 标签。
+        import os as _os
+        env_dir = _os.environ.get("COMIMIC_PORT_TOKENS")
+        if port_dir is not None:
+            self.port_dir = Path(port_dir)
+        elif env_dir:
+            self.port_dir = Path(env_dir)
+        else:
+            self.port_dir = self.npz_dir.parent.parent / "port_tokens" / self.npz_dir.name
+        self.port_used = 0
+        self.label_used = 0
         self._starts = [int(c.start) for c in library.clips]
         self._names = [c.name for c in library.clips]
         self._cache: dict[str, torch.Tensor] = {}
         self._bisect = bisect.bisect_right
 
+    def _load_token(self, name: str) -> torch.Tensor:
+        port = self.port_dir / f"{name}.npy"
+        if port.is_file():
+            tok = torch.as_tensor(np.load(port), dtype=torch.float32)
+            self.port_used += 1
+            return tok
+        with np.load(self.npz_dir / f"{name}.npz") as d:
+            if "g1_motion_token_64" not in d:
+                raise KeyError(f"{name}.npz has no g1_motion_token_64 (recorded token)")
+            self.label_used += 1
+            return torch.as_tensor(np.ascontiguousarray(d["g1_motion_token_64"]), dtype=torch.float32)
+
     def _tokens(self, ci: int) -> torch.Tensor:
         name = self._names[ci]
         tok = self._cache.get(name)
         if tok is None:
-            with np.load(self.npz_dir / f"{name}.npz") as d:
-                if "g1_motion_token_64" not in d:
-                    raise KeyError(f"{name}.npz has no g1_motion_token_64 (recorded token)")
-                tok = torch.as_tensor(np.ascontiguousarray(d["g1_motion_token_64"]), dtype=torch.float32)
+            tok = self._load_token(name)
             if int(tok.shape[-1]) != self.token_dim:
                 raise ValueError(f"{name}: token dim {tok.shape[-1]} != {self.token_dim}")
             if len(self._cache) > 128:
@@ -274,7 +312,7 @@ class MotionBatchProvider:
 
     def __init__(
         self,
-        bundle: SuperMimicBundle,
+        bundle: Any,
         library,
         *,
         batch_size: int = 2,
@@ -283,9 +321,14 @@ class MotionBatchProvider:
         token_dim: int = 64,
         token_horizon: int = 40,
         seed: int | None = None,
+        hand_dir: str | Path | None = None,
     ):
         self.bundle = bundle
         self.library = library
+        self.hand_dir = None if hand_dir is None else Path(hand_dir)
+        self._hand_cache: dict[str, torch.Tensor] = {}
+        self._hand_starts = [int(c.start) for c in library.clips]
+        self._hand_names = [c.name for c in library.clips]
         self.batch_size = int(batch_size)
         self.horizon = int(horizon)
         self.token_source = token_source
@@ -304,14 +347,22 @@ class MotionBatchProvider:
         ).to(self.bundle.device)
         start = self.bundle.reference_start(self.library, frames)
         refs = self.bundle.teacher_references(self.library, frames, self.horizon)
-        teacher_goals = self.bundle.teacher_goal(self.library, frames)
-        teacher_goal_sequence = torch.stack(
-            [
-                self.bundle.teacher_goal(self.library, frames + t)
-                for t in range(self.horizon)
-            ],
-            dim=1,
-        )
+        # Token route (the VLA's own 64-d token IS the conditioning): there is no 680-d motion
+        # goal, so building teacher goals would be wasted work — and the Isaac bundle has no
+        # goal encoder at all (it raises rather than faking one).
+        token_route = int(getattr(self.bundle.policy, "token_dim", 0) or 0) > 0
+        if token_route:
+            teacher_goals = None
+            teacher_goal_sequence = None
+        else:
+            teacher_goals = self.bundle.teacher_goal(self.library, frames)
+            teacher_goal_sequence = torch.stack(
+                [
+                    self.bundle.teacher_goal(self.library, frames + t)
+                    for t in range(self.horizon)
+                ],
+                dim=1,
+            )
         teacher_states = self.bundle.teacher_states(self.library, frames, self.horizon)
         meta = {
             "frames": frames,
@@ -334,8 +385,30 @@ class MotionBatchProvider:
             )
         if tokens.ndim != 3 or tokens.shape[0] != self.batch_size:
             raise ValueError(f"token source returned {tuple(tokens.shape)}")
+        hand_ref = None
+        if self.hand_dir is not None:
+            import bisect
+
+            hz = torch.zeros(self.batch_size, self.token_horizon, 14)
+            for i, f in enumerate(frames.detach().cpu().tolist()):
+                ci = max(bisect.bisect_right(self._hand_starts, int(f)) - 1, 0)
+                name = self._hand_names[ci]
+                tok = self._hand_cache.get(name)
+                if tok is None:
+                    with np.load(self.hand_dir / f"{name}.npz") as z:
+                        tok = torch.as_tensor(np.ascontiguousarray(z["g1_hand_joints_14"]), dtype=torch.float32)
+                    if len(self._hand_cache) > 128:
+                        self._hand_cache.clear()
+                    self._hand_cache[name] = tok
+                local = int(f) - self._hand_starts[ci]
+                seg = tok[local : local + self.token_horizon]
+                if seg.shape[0] < self.token_horizon:
+                    seg = torch.cat([seg, seg[-1:].expand(self.token_horizon - seg.shape[0], -1)], 0)
+                hz[i] = seg
+            hand_ref = hz.to(self.bundle.device)
         return MotionBatch(
             fm_tokens=tokens,
+            hand_ref=hand_ref,
             teacher_goals=teacher_goals,
             teacher_states=teacher_states,
             start_state=start["state"],
@@ -349,7 +422,7 @@ class MotionBatchProvider:
         )
 
 
-def _reference_state_at(bundle: SuperMimicBundle, library, frames: torch.Tensor) -> torch.Tensor:
+def _reference_state_at(bundle: Any, library, frames: torch.Tensor) -> torch.Tensor:
     r = library.ref(frames)
     return torch.cat(
         (r.root_pos_w, r.root_quat_w, r.joint_pos, r.root_lin_vel_w, r.root_ang_vel_w, r.joint_vel),
@@ -358,27 +431,54 @@ def _reference_state_at(bundle: SuperMimicBundle, library, frames: torch.Tensor)
 
 
 def sample_reference_windows(
-    bundle: SuperMimicBundle,
+    bundle: Any,
     library,
     *,
     batch_size: int = 8,
     window: int = 8,
     seed: int | None = None,
 ):
-    """Reference windows for world-model pretraining (no simulator required)."""
+    """Reference windows for world-model pretraining (no simulator required).
+
+    Start frames are sampled **inside a single clip**: a window ``[f, f+window]`` that
+    crossed a clip boundary would mix two unrelated motions and feed the world model an
+    impossible transition.  SuperMimic guards this with ``ReplayBuffer.window_mask``
+    (same episode, no terminal inside the window); here the library clips play that role.
+
+    A bundle may provide ``sample_windows`` itself (the Isaac-native bundle does: its windows
+    must come from the Isaac motion library with world-frame root velocities, not from the
+    MuJoCo-style reference state builder below).
+    """
+    own = getattr(bundle, "sample_windows", None)
+    if own is not None:
+        return own(batch_size=batch_size, window=window, seed=seed)
     g = torch.Generator(device="cpu")
     if seed is not None:
         g.manual_seed(seed)
-    max_start = library.num_frames - window - 2
-    frames = torch.randint(2, max_start, (batch_size,), generator=g, dtype=torch.long).to(bundle.device)
+    starts, counts = [], []
+    for clip in library.clips:
+        hi = int(clip.start) + int(clip.length) - 1 - window
+        if hi >= int(clip.start):
+            starts.append(int(clip.start))
+            counts.append(hi - int(clip.start) + 1)
+    if not starts:
+        raise ValueError(f"no clip is longer than window+1={window + 1} frames")
+    counts_t = torch.tensor(counts, dtype=torch.float32, device="cpu")
+    starts_t = torch.tensor(starts, dtype=torch.long, device="cpu")
+    pick = torch.multinomial(counts_t, batch_size, replacement=True, generator=g)
+    offs_in_clip = (torch.rand(batch_size, generator=g) * counts_t[pick]).long()
+    frames = (starts_t[pick] + offs_in_clip).to(bundle.device)
     offs = torch.arange(window + 1, device=bundle.device)
     idx = frames[:, None] + offs[None, :]
     states = _reference_state_at(bundle, library, idx.reshape(-1)).reshape(batch_size, window + 1, STATE_DIM)
     actions = (states[:, 1:, 7:36] - bundle.default_joint_pos) / bundle.action_scale
-    xi = default_xi(batch_size, bundle.device)
+    xi = _default_xi(batch_size, bundle.device)
     done = torch.zeros(batch_size, window, device=bundle.device)
     root = library.ref(idx.reshape(-1))
+    from .compat import ensure_supermimic_importable
     from supermimic.world_model.heads import ReferenceFrame
+
+    ensure_supermimic_importable()
 
     root_pos = root.root_pos_w.reshape(batch_size, window + 1, 3)
     root_quat = root.root_quat_w.reshape(batch_size, window + 1, 4)

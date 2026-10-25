@@ -244,7 +244,28 @@ class SuperMimicBundle(nn.Module):
         strict: bool = True,
     ) -> "SuperMimicBundle":
         assets = assets or build_g1_assets(xml_path, device)
-        ck = torch.load(checkpoint, map_location=assets.device, weights_only=False)
+        ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if "config" not in ck and "pi" in ck and "wm" in ck:
+            # Isaac Lab / trackerlab checkpoint ({"pi", "wm", "args"}): route through the bridge
+            # instead of failing.  policy + world model are the Isaac-trained tensors; the
+            # analytic heads come from the mjlab token run (same FK / reward / observation /
+            # termination definitions, identical for every arm).
+            from .trackerlab_bundle import load_trackerlab_bundle, DEFAULT_ANALYTIC_CKPT
+
+            tl_args = ck.get("args") or {}
+            obs_mode = tl_args.get("obs_mode") or "relative_ori99"
+            hist = int(tl_args.get("hist", 10) or 10)
+            base = cls.from_checkpoint(DEFAULT_ANALYTIC_CKPT, assets)
+            print(
+                f"[bundle] {checkpoint} is an Isaac/trackerlab ckpt "
+                f"(iteration {ck.get('iteration')}, obs_mode={obs_mode}, hist={hist}) -> "
+                f"TrackerLabBundle; analytic heads from {DEFAULT_ANALYTIC_CKPT}",
+                flush=True,
+            )
+            bundle = load_trackerlab_bundle(
+                base, checkpoint, obs_mode=obs_mode, hist=hist, device=assets.device
+            )
+            return bundle.to(assets.device)
         cfg = ck.get("config", {})
         if not cfg:
             raise ValueError(f"{checkpoint} has no 'config' entry; not a SuperMimic checkpoint")
@@ -340,6 +361,15 @@ class SuperMimicBundle(nn.Module):
             ref.root_pos_w,
             ref.root_quat_w,
         )
+
+    def robot_bodies(self, state: torch.Tensor, bodies: dict | None = None) -> dict:
+        """Differentiable FK of the tracked bodies for a batch of **our** flat states.
+
+        ``rollout`` calls this instead of ``assets.heads.robot_bodies`` directly so a bundle
+        that uses a different root-velocity convention (e.g. the trackerlab bridge, which
+        converts world → body ω) can hook in without changing the rollout code.
+        """
+        return self.assets.heads.robot_bodies(state)
 
     # ------------------------------------------------------------------ data helpers
 

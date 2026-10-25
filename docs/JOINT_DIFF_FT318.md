@@ -1,3 +1,10 @@
+# （历史文档）
+
+> ⚠️ 本文记录的是 ft318 时代的联合微调路径。**官方微调产物已写死为 `runs/groot_sonic_vla_ha_b64_lr1e-5/checkpoint-8000`**
+> （选择依据见 `runs/OFFICIAL_CKPT.json`：ckpt-8000 的训练 loss 窗口均值 0.0401±0.0041，
+> 是现存最优；7500 更优但已被 save_total_limit 删除）。联合微调默认值已指向它，
+> 本文里的 ft318 checkpoint 仅作历史对照。
+
 # 反传微调路径（锁定版）：20k VLA → token → SuperMimic → 世界模型 → 奖励 → 梯度回 VLA
 
 > 本文把这条链路**钉死**：命令、路径、评测口径、每步产物。以后只按这里跑，不要再从 GR00T 基座重训。

@@ -47,3 +47,30 @@ GR00T-WholeBodyControl/gear_sonic_deploy/g1/meshes
 
 # Ablation scratch outputs
 ablation_fm_grad/results/_isolate/
+
+# HumanoidArena 原始录制 / 中间数据（几十 GB，可用 scripts/fetch_ha_raw.py 重新拉）
+data/ha_raw/
+data/ha_sessions/
+data/ha_session_template/
+data/_probe_ha/
+data/port_tokens/
+data/token_motions/
+
+# HumanoidArena 场景资产（103 MB USD）与录好的 ffmpeg 二进制
+closed_loop/assets/
+closed_loop/bin/
+
+# trackerlab-supermimic 是外部上游仓库（含 4 GB 级 assetslib），按需单独 clone
+trackerlab-supermimic/
+
+# 外部依赖（都是 clone 下来的大块头，按需重装；third_party/SuperMimic-Reproduced 除外）
+third_party/HumanoidArena/
+third_party/IsaacLab_232/
+third_party/isaaclab_220/
+third_party/isaaclab_232/
+third_party/cyclonedds_prefix/
+third_party/disabled_libs/
+third_party/unitree_sdk2_python/
+
+# 中间 npz 数据集（2.6 GB，由 scripts/prepare_*.py 重建）
+data/npz/

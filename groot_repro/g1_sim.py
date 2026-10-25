@@ -6,6 +6,9 @@ Constants mirror gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/policy_para
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 
 # --- motor model -----------------------------------------------------------
@@ -91,17 +94,15 @@ def projected_gravity(q_wxyz: np.ndarray) -> np.ndarray:
 # so every qpos/ctrl write has to go through a name lookup, never a slice.
 # ---------------------------------------------------------------------------
 
-BODY_JOINT_NAMES = [
-    "left_hip_pitch", "left_hip_roll", "left_hip_yaw", "left_knee",
-    "left_ankle_pitch", "left_ankle_roll",
-    "right_hip_pitch", "right_hip_roll", "right_hip_yaw", "right_knee",
-    "right_ankle_pitch", "right_ankle_roll",
-    "waist_yaw", "waist_roll", "waist_pitch",
-    "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw",
-    "left_elbow", "left_wrist_roll", "left_wrist_pitch", "left_wrist_yaw",
-    "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw",
-    "right_elbow", "right_wrist_roll", "right_wrist_pitch", "right_wrist_yaw",
-]
+# Single source of truth: comimic/joint_contract.py.  The MJCF stores joints in the dataset
+# order (legs, waist, arm, hand interleaved), so we only ever reach them through a name
+# lookup; the policy/MuJoCo contract order itself is defined once, in joint_contract.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+import joint_contract as _JC  # noqa: E402
+
+BODY_JOINT_NAMES = [n[: -len("_joint")] for n in _JC.STANDARD_29]
 HAND_JOINT_NAMES = [
     f"{side}_hand_{finger}_joint" for side in ("left", "right")
     for finger in ("thumb_0", "thumb_1", "thumb_2", "middle_0", "middle_1",

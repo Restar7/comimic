@@ -1,2 +1,8 @@
 WARNING Fri Oct 23 22:22:59 2026: Nan, Inf or huge value in QACC at DOF 0. The simulation is unstable. Time = 0.0900.
 
+Sun Oct 25 12:54:19 2026
+ERROR: mjv_updateCamera: fixed camera id is outside valid range
+
+Sun Oct 25 12:55:17 2026
+ERROR: mjv_updateCamera: fixed camera id is outside valid range
+

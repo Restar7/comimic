@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""HumanoidArena ``latent64`` VLA server — the missing link between our VLA and Isaac Lab.
+
+HumanoidArena's simulation runtime talks to a policy over plain HTTP
+(`isaaclab_twist2_g1/action_provider/lerobot_vla_http_client.py`):
+
+    POST /infer
+    {
+      "observation": {
+        "images": {"front": {"shape": [H,W,3], "dtype": "uint8", "data_b64": "<raw bytes>"}},
+        "state":  [ ... ]            # their 64-d ``vla_state``
+      },
+      "robot_type": "unitree_g1_refpose_v3_1",
+      "return_chunk": true,
+      "task": "<instruction>"        # optional
+    }
+
+    -> {"latent64_chunk": [[64 floats], ...]}          # SONIC_VLA_ACTION_FORMAT=latent64
+       (the client also accepts action_chunk / encoder_latent_chunk / latent64 / encoder_latent)
+
+This server answers that request with **our** VLA: image + state + instruction ->
+GR00T flow-matching chunk -> first 64 dims are the SONIC motion token, dims 64..78 are the
+14 finger commands which are compressed to the 2-d binary the runtime expects
+(``max(fingers) > 1.70`` — verified 100% agreement with HA's own ``vla_action_hand_binary``).
+
+State conversion, because the two sides disagree:
+    theirs ``vla_state`` (64) = root rot6d(6) + dof_pos(29) + dof_vel(29)
+    ours   ``state_46``       = joints29 + hands14 + projected_gravity(3)
+    29 joints pass through; gravity comes from the rot6d; the 14 hands are not in their
+    state at all, so they are fed back from the last emitted action (``--hand-source
+    feedback``) or zeros (``--hand-source zeros``).
+
+No training happens here: the model is loaded read-only and sampled with no optimizer.
+
+Usage::
+
+    # protocol self-test without a model (returns zeros; proves the wiring)
+    python3 scripts/ha_vla_latent64_server.py --dry-run --port 18080
+
+    # real VLA
+    python3 scripts/ha_vla_latent64_server.py \
+        --ckpt runs/groot_sonic_vla_ha_b64_lr1e-5/checkpoint-8000 \
+        --vlm-path groot_repro/nvidia/Cosmos-Reason2-2B-weights --port 18080
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+#: The 8 state groups the checkpoint's modality config expects, in order (total 46).
+#: The order must match how ``state64_to_state46`` lays the vector out
+#: (``joints29 + hands14 + gravity3``), NOT the modality-config listing order --
+#: ``right_arm`` comes before the hands in the joint block.
+STATE_KEYS = (
+    "left_leg",
+    "right_leg",
+    "waist",
+    "left_arm",
+    "right_arm",
+    "left_hand",
+    "right_hand",
+    "projected_gravity",
+)
+STATE_WIDTHS = (6, 6, 3, 7, 7, 7, 7, 3)
+#: ``left_hand_joints`` occupies 0:7 and ``right_hand_joints`` 7:14 of the action vector.
+HAND_JOINT_SPLIT = 7
+SONIC_TAG = "unitree_g1_sonic"
+#: HA's own recording compression: a hand counts as "closed" when its strongest finger
+#: command exceeds this.  Measured on HOI_double_desk against ``vla_action_hand_binary``:
+#: 100.0% frame agreement (the finger range is +-1.74).
+HAND_CLOSE_THRESHOLD = 1.70
+
+
+def rot6d_to_matrix(r6: np.ndarray) -> np.ndarray:
+    """HA uses the **row** layout (``rotation_6d_layout: row`` in the dataset info.json)."""
+    a1, a2 = r6[..., 0:3], r6[..., 3:6]
+    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-9)
+    b2 = a2 - (b1 * a2).sum(-1, keepdims=True) * b1
+    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-9)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=-1)          # (...,3,3), row layout: rows are the bases
+
+
+def gravity_from_rot6d(r6: np.ndarray) -> np.ndarray:
+    """Body-frame gravity, i.e. ``R^T @ [0,0,-1]`` — the GR00T ``projected_gravity`` term."""
+    m = rot6d_to_matrix(np.asarray(r6, dtype=np.float64))
+    return np.einsum("...ji,j->...i", m, np.array([0.0, 0.0, -1.0])).astype(np.float32)
+
+
+def state64_to_state46(state64: np.ndarray, hands14: np.ndarray,
+                       state_order: str = "ha_v31") -> np.ndarray:
+    """Their 64-d state + our 14-d hand feedback -> the 46-d state the checkpoint expects.
+
+    ``state64[6:35]`` is HumanoidArena's ``vla_state_dof_pos_29``, i.e. the ``HA_V31_29``
+    (interleaved) order — this is what the deployed runtime sends and what the current
+    checkpoint was trained on.  ``state_order="standard"`` accepts a caller that already
+    converted to the trackerlab/MuJoCo order; the 46-d vector we build always uses the
+    ``joint_contract`` names, so the two can never drift silently.
+    """
+    s = np.asarray(state64, dtype=np.float32).reshape(-1)
+    if s.size != 64:
+        raise ValueError(f"expected the 64-d HA state, got {s.size}")
+    joints = s[6:35]
+    if state_order == "standard":
+        pass                      # already STANDARD_29
+    elif state_order == "ha_v31":
+        pass                      # HA_V31_29 is what the model was trained on; no reorder
+    else:
+        raise ValueError(f"unknown --state-order {state_order!r} (ha_v31|standard)")
+    gravity = gravity_from_rot6d(s[0:6])
+    return np.concatenate([joints.astype(np.float32), np.asarray(hands14, dtype=np.float32).reshape(-1),
+                           gravity]).astype(np.float32)
+
+
+class Engine:
+    """Loads our VLA read-only and turns one HTTP request into a 64-d token chunk."""
+
+    def __init__(self, args):
+        self.args = args
+        self.lock = threading.Lock()
+        self.last_hands14 = np.zeros(14, dtype=np.float32)
+        self.model = None
+        self.processor = None
+        self.image_hw = (224, 224)
+        if not args.dry_run:
+            self._load()
+
+    def _load(self) -> None:
+        import torch
+
+        from diff_vla_wbc.g1_tasks import load_gr00t_processor
+        from diff_vla_wbc.gr00t_vlm import Gr00tVLM
+
+        self.model = Gr00tVLM.from_pretrained(
+            checkpoint=Path(self.args.ckpt),
+            model_name=self.args.vlm_path,
+            freeze_vlm=True,
+            load_bf16=self.args.bf16,
+            device=self.args.device,
+        ).eval()
+        self.processor = load_gr00t_processor(self.args.ckpt, vlm_path=self.args.vlm_path)
+        cfg = getattr(self.processor, "config", None)
+        size = getattr(cfg, "image_target_size", None) if cfg is not None else None
+        if isinstance(size, (list, tuple)) and len(size) == 2:
+            self.image_hw = (int(size[0]), int(size[1]))
+        print(f"[server] model loaded, image_hw={self.image_hw}", flush=True)
+
+    # ---------------------------------------------------------------- inference
+    def infer(self, rgb: np.ndarray, state64: np.ndarray, task: str) -> tuple[np.ndarray, np.ndarray]:
+        with self.lock:
+            if self.last_hands14 is not None and self.args.hand_source == "feedback":
+                hands14 = self.last_hands14.copy()
+            else:
+                hands14 = np.zeros(14, dtype=np.float32)
+            state46 = state64_to_state46(state64, hands14,
+                                         state_order=getattr(self.args, "state_order", "ha_v31"))
+
+            if self.args.dry_run:
+                chunk64 = np.zeros((self.args.horizon, 64), dtype=np.float32)
+                hands2 = np.zeros((self.args.horizon, 2), dtype=np.float32)
+                return chunk64, hands2
+
+            import torch
+
+            from diff_vla_wbc.gr00t_fm import sample_model_with_grad
+
+            # The processor wants (B, T=1, H, W, 3) uint8 + the 7 state groups + language.
+            obs = {"video.ego_view": rgb[None, None], "annotation.human.task_description": [task]}
+            offset = 0
+            for key, width in zip(STATE_KEYS, STATE_WIDTHS):
+                obs[f"state.{key}"] = np.ascontiguousarray(state46[offset : offset + width])[None]
+                offset += width
+            if offset != 46:
+                raise RuntimeError(f"state_46 assembled {offset} dims")
+
+            from gr00t.data.embodiment_tags import EmbodimentTag
+
+            with torch.enable_grad():      # sampling requires grad; we detach right after
+                batch = self.processor.process_observation(obs, EmbodimentTag(SONIC_TAG))
+                if batch["state"].ndim == 2:
+                    batch["state"] = batch["state"].unsqueeze(1)
+                # The head emits its own padded width (``max_action_dim``, 132 for the
+                # GR00T checkpoint); ``--action-dim`` (78) is the *meaningful* prefix.
+                head_action_dim = int(self.model.action_head.action_dim)
+                noise = torch.randn(
+                    1, self.args.horizon, head_action_dim,
+                    device=self.args.device, dtype=self.model.dtype,
+                )
+                full = sample_model_with_grad(
+                    self.model, batch, initial_noise=noise, num_steps=self.args.fm_steps,
+                )
+            full = full.detach().to("cpu").float().numpy()[0]        # (horizon, >=78)
+            chunk64 = full[:, :64]
+            fingers = full[:, 64:78]
+            # HA's ``vla_action_hand_binary`` is (frames, 2) = (left, right); keep the
+            # sides separate instead of collapsing both to one global max.
+            left = fingers[:, :HAND_JOINT_SPLIT].max(axis=1, keepdims=True)
+            right = fingers[:, HAND_JOINT_SPLIT:].max(axis=1, keepdims=True)
+            hands2 = np.concatenate([left, right], axis=1)
+            hands2 = (hands2 > HAND_CLOSE_THRESHOLD).astype(np.float32)
+            self.last_hands14 = fingers[-1].astype(np.float32)
+            self.last_hands14_chunk = fingers.astype(np.float32)
+            return chunk64.astype(np.float32), hands2.astype(np.float32)
+
+
+class Handler(BaseHTTPRequestHandler):
+    engine: Engine = None  # set in main()
+    n_infer: int = 0
+
+    def log_message(self, fmt, *a):  # keep the console readable
+        if self.server.verbose:
+            super().log_message(fmt, *a)
+
+    def _json(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._json(200, {"ok": True, "service": "ha-latent64-vla"})
+
+    def do_POST(self):
+        path = self.path.rstrip("/")
+        if path == "/reset":
+            # The upstream LeRobot HTTP server exposes /reset; HumanoidArena's SONIC provider
+            # posts to it between episodes and treats 404 as a hard episode failure.  We are
+            # stateless per request except for the hand-feedback buffer, so resetting that is
+            # enough to be protocol-compatible.
+            self.engine.last_hands14 = None
+            Handler.n_infer = 0
+            print("[server] reset", flush=True)
+            self._json(200, {"ok": True})
+            return
+        if path != "/infer":
+            self._json(404, {"error": f"unknown path {self.path}"})
+            return
+        t0 = time.time()
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(n).decode())
+            img = req["observation"]["images"]["front"]
+            rgb = np.frombuffer(base64.b64decode(img["data_b64"]), dtype=img.get("dtype", "uint8"))
+            rgb = rgb.reshape(img["shape"]).astype(np.uint8)
+            state = np.asarray(req["observation"]["state"], dtype=np.float32)
+            task = str(req.get("task") or "")
+            chunk, hands = self.engine.infer(rgb, state, task)
+            dt_ms = (time.time() - t0) * 1e3
+            # One line per request: proves the sim is really driving the VLA (闭环证据) and
+            # gives the latency series for ablation reporting.  Cheap: ~1 line per 40 steps.
+            Handler.n_infer += 1
+            # img_mean/img_std: a frozen camera shows up as a constant pair across requests,
+            # which is the failure mode we hit on the 570 box (RTX sensors need a render pass).
+            print(f"[server] infer #{Handler.n_infer} dt={dt_ms:.1f}ms "
+                  f"img={rgb.shape} img_mean={rgb.mean():.1f} img_std={rgb.std():.1f} "
+                  f"tok_mean={chunk.mean():+.3f} state={state.shape[0]} task={task[:40]!r}",
+                  flush=True)
+            self._json(200, {
+                "latent64_chunk": chunk.tolist(),
+                "hand_binary_chunk": hands.tolist(),
+                # 14 维手指命令直通（不经 SuperMimic）；provider 用它写 finger joint target
+                "hands14_chunk": np.asarray(
+                    getattr(self.engine, "last_hands14_chunk", np.zeros((len(chunk), 14), np.float32))
+                ).tolist(),
+                "dt_ms": dt_ms,
+            })
+        except Exception as exc:  # noqa: BLE001
+            self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=18080)
+    ap.add_argument("--ckpt", type=Path, help="our VLA checkpoint (stage O output)")
+    ap.add_argument("--vlm-path", type=Path, default=ROOT / "groot_repro" / "nvidia" / "Cosmos-Reason2-2B-weights")
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--bf16", action="store_true", help="load the backbone in bf16")
+    ap.add_argument("--horizon", type=int, default=40, help="action chunk length the head was trained with")
+    ap.add_argument("--action-dim", type=int, default=78, help="64 token + 7 + 7 hands")
+    ap.add_argument("--fm-steps", type=int, default=4, help="flow-matching Euler steps")
+    ap.add_argument("--state-order", choices=("ha_v31", "standard"), default="ha_v31",
+                    help="order of the 29 joints inside the incoming 64-d vla_state "
+                         "(ha_v31 = HumanoidArena asset order, which the current ckpt was "
+                         "trained on; standard = trackerlab/MuJoCo order)")
+    ap.add_argument("--hand-source", choices=("feedback", "zeros"), default="feedback",
+                    help="where the 46-d state's hand entries come from (their state has none)")
+    ap.add_argument("--dry-run", action="store_true", help="no model: answer zeros to test the wiring")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    if not args.dry_run and (args.ckpt is None or not Path(args.ckpt).is_dir()):
+        raise SystemExit("--ckpt must point at our VLA checkpoint directory (or use --dry-run)")
+
+    Handler.engine = Engine(args)
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv.verbose = args.verbose
+    print(f"[server] listening on http://{args.host}:{args.port}/infer "
+          f"(dry_run={args.dry_run}, hand_source={args.hand_source})", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

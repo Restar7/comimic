@@ -33,7 +33,10 @@ from .rollout import (
     imagine_with_tokens,
     unfreeze_world_model,
 )
-from .supermimic_backend import SuperMimicBundle
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotation only: the Isaac path never imports the mjlab stack
+    from .supermimic_backend import SuperMimicBundle  # noqa: F401
 
 
 @dataclass
@@ -44,6 +47,9 @@ class JointTrainerConfig:
     policy_lr: float = 1e-5
     fm_lr: float = 1e-5
     wm_lr: float = 2e-4
+    # SuperMimic 的 WMTrainerCfg 用 weight_decay=0.0 / grad_clip=1.0（wm_trainer.py）
+    wm_weight_decay: float | None = None
+    wm_grad_clip: float = 1.0
     weight_decay: float = 1e-4
     adapter_clip: float = 1.0
     policy_clip: float = 1.0
@@ -66,15 +72,43 @@ class JointTrainer:
         fm_parameters: Iterable[torch.nn.Parameter] | None = None,
         cfg: JointTrainerConfig | None = None,
         device: str | torch.device | None = None,
+        hand_weight: float = 0.0,
+        hand_grasp_boost: float = 5.0,
+        # 只在“有手部信号”的帧上算 hand loss：HA 的 7 个任务里 4 个手全程为 0
+        # （实测 pp_box/open_door/sit_sofa/vision_navi），全帧 MSE 会把 14 维输出拉向常零。
+        hand_mask_threshold: float = 0.05,
+        fm_full_sampler: Callable | None = None,
+        sync_gradients: bool = False,
+        # token 锚定：把 VLA 输出的 64 维 token 拉向"执行器能吃的"端口 token。
+        # 不加这一项时，reward 一饱和就没有任何东西钉住 token，模型会在 reward 平坦区里
+        # 随机漂移（实测 token_mse 2000 步 0.077 → 3000 步 0.093/0.108）。
+        token_anchor: Callable | None = None,
+        token_anchor_weight: float = 0.0,
     ):
         self.bundle = bundle
         self.adapter = adapter
         self.fm_sampler = fm_sampler
+        # 手部辅助监督：不经过 SuperMimic，直接用录制 label 回归 VLA 的 14 维手部输出。
+        self.hand_weight = float(hand_weight)
+        self.hand_grasp_boost = float(hand_grasp_boost)
+        self.hand_mask_threshold = float(hand_mask_threshold)
+        self.fm_full_sampler = fm_full_sampler
+        # 2 卡数据并行：梯度在 optimizer.step() 之前手动 all-reduce（仓库既有做法，
+        # 不用 DDP 包 module，避免和 torch.compile 的自定义前向打架）。
+        self.sync_gradients = bool(sync_gradients)
+        self.token_anchor = token_anchor
+        self.token_anchor_weight = float(token_anchor_weight)
         self.cfg = cfg or JointTrainerConfig()
         self.device = torch.device(device or bundle.device)
         self.bundle.to(self.device)
         self.adapter.to(self.device)
-        if self.bundle.goal_dim != self.adapter.goal_dim:
+        # Goal-width compatibility is only meaningful on the **paper route** (680-d motion goal
+        # -> adapter -> policy encoder).  On the **token route** the conditioning *is* the
+        # VLA's 64-d SONIC token and the adapter is never called (``imagine_with_tokens``), so a
+        # token-conditioned checkpoint legitimately reports ``goal_dim = token_dim``
+        # (trackerlab/Isaac HA ckpt: 64).  Raising here would block every token-route run.
+        token_route = int(getattr(bundle.policy, "token_dim", 0) or 0) > 0
+        if not token_route and self.bundle.goal_dim != self.adapter.goal_dim:
             raise ValueError(
                 f"adapter goal_dim {self.adapter.goal_dim} != policy goal_dim {self.bundle.goal_dim}"
             )
@@ -97,12 +131,66 @@ class JointTrainer:
             ],
             weight_decay=self.cfg.weight_decay,
         )
+        wd = self.cfg.weight_decay if self.cfg.wm_weight_decay is None else self.cfg.wm_weight_decay
         self.wm_optimizer = torch.optim.AdamW(
-            self.bundle.wm.parameters(), lr=self.cfg.wm_lr, weight_decay=self.cfg.weight_decay
+            self.bundle.wm.parameters(), lr=self.cfg.wm_lr, weight_decay=wd
         )
         # Freeze by default: policy improvement must not update the dynamics.
         freeze_world_model(self.bundle.wm)
         self.steps = 0
+
+    # ------------------------------------------------------------------ distributed
+
+    @staticmethod
+    def _sync_param_grads(group, max_chunk_bytes: int = 256 << 20) -> None:
+        """Average the gradients of one parameter group across ranks (no-op if single).
+
+        The action head alone is 1.62 B fp32 parameters (6.5 GB of gradients), so concatenating
+        the whole group into one flat buffer costs another 6.5 GB of *transient* device memory —
+        on a 48 GB card that is the difference between fitting and OOM.  Gradients are therefore
+        averaged in bounded chunks; the arithmetic is unchanged (plain average, same order of
+        parameters), only the peak allocation is.
+        """
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+            return
+        grads = [p.grad for p in group if p.grad is not None]
+        if not grads:
+            return
+        dtype = grads[0].dtype
+        chunk, used = [], 0
+
+        def flush(buf: list[torch.Tensor]) -> None:
+            flat = torch.cat([g.reshape(-1) for g in buf])
+            dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+            off = 0
+            for g in buf:
+                n = g.numel()
+                g.copy_(flat[off : off + n].view_as(g))
+                off += n
+            del flat
+
+        for g in grads:
+            if g.dtype != dtype:      # mixed dtypes cannot share one communication buffer
+                continue
+            nbytes = g.numel() * g.element_size()
+            if chunk and used + nbytes > max_chunk_bytes:
+                flush(chunk)
+                chunk, used = [], 0
+            chunk.append(g)
+            used += nbytes
+        if chunk:
+            flush(chunk)
+
+    def sync_grads(self) -> None:
+        """把 adapter / policy / VLA(head) 的梯度在 rank 间取平均。"""
+        for group in (
+            list(self.adapter.parameters()),
+            list(self.bundle.policy.parameters()),
+            list(self.fm_parameters),
+        ):
+            self._sync_param_grads(group)
 
     # ------------------------------------------------------------------ policy / FM
 
@@ -166,8 +254,48 @@ class JointTrainer:
                 gamma=self.cfg.gamma,
                 weights=self.cfg.weights,
             )
+        # ---- 手部辅助损失（支路，绝不经过 SuperMimic / 世界模型 / 奖励）----
+        if (
+            self.hand_weight > 0
+            and self.fm_full_sampler is not None
+            and getattr(batch, "hand_ref", None) is not None
+        ):
+            import torch.nn.functional as _F
+
+            with torch.enable_grad():
+                full = self.fm_full_sampler(batch.as_dict())   # (B, T, >=78)
+            if full.shape[-1] < 78:
+                raise RuntimeError(f"VLA chunk has {full.shape[-1]} dims; need >=78 (token64+hands14)")
+            hands = full[..., 64:78]
+            ref = batch.hand_ref.to(hands.dtype)
+            n = min(hands.shape[1], ref.shape[1])
+            grasp = (ref[:, :n].abs().mean(-1) > 0.10).to(hands.dtype)      # 抓握帧
+            # 无手样本（参考手全 0）不给梯度，否则 60% 的样本在教“手别动”
+            active = (ref[:, :n].abs().amax(-1) > self.hand_mask_threshold).to(hands.dtype)
+            w = (1.0 + self.hand_grasp_boost * grasp) * active
+            per = ((hands[:, :n] - ref[:, :n]) ** 2).mean(-1)               # (B, n)
+            hand_loss = (per * w).sum() / w.sum().clamp(min=1.0)
+            loss = loss + self.hand_weight * hand_loss
+            terms = dict(terms)
+            terms["hand_mse"] = hand_loss.detach()
+
+        # token 锚定（可选）：直接监督 action head 输出到端口 token，
+        # 防止 reward 饱和后 token 在平坦区里漂移。
+        if self.token_anchor is not None and self.token_anchor_weight > 0:
+            target = self.token_anchor(batch)
+            if target is not None:
+                n = min(tokens.shape[1], target.shape[1])
+                anchor_loss = torch.nn.functional.mse_loss(
+                    tokens[:, :n].float(), target[:, :n].to(tokens.device, tokens.dtype).float()
+                )
+                loss = loss + self.token_anchor_weight * anchor_loss
+                terms = dict(terms)
+                terms["token_anchor"] = anchor_loss.detach()
+
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if self.sync_gradients:
+            self.sync_grads()
         if self.fm_parameters:
             torch.nn.utils.clip_grad_norm_(self.fm_parameters, self.cfg.fm_clip)
         torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), self.cfg.adapter_clip)
@@ -184,8 +312,13 @@ class JointTrainer:
 
     # ------------------------------------------------------------------ world model
 
-    def train_world_model(self, windows: dict) -> dict[str, float]:
-        """Fit ``F_phi`` on real transition windows (no policy gradient)."""
+    def train_world_model(self, windows: dict, *, sync: bool = False) -> dict[str, float]:
+        """Fit ``F_phi`` on real transition windows (no policy gradient).
+
+        ``sync=True`` averages the world-model gradients across ranks before the
+        optimiser step; needed when this is called inside the distributed training loop
+        (the ``--wm-update-every`` ablation), otherwise the two ranks diverge.
+        """
         self.bundle.wm.train()
         unfreeze_world_model(self.bundle.wm)
         loss, metrics = self.bundle.wm.window_loss(
@@ -197,7 +330,9 @@ class JointTrainer:
         )
         self.wm_optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.bundle.wm.parameters(), self.cfg.wm_clip)
+        if sync:
+            self._sync_param_grads(list(self.bundle.wm.parameters()))
+        torch.nn.utils.clip_grad_norm_(self.bundle.wm.parameters(), self.cfg.wm_grad_clip)
         self.wm_optimizer.step()
         freeze_world_model(self.bundle.wm)
         out = {f"wm/{k}": float(v.detach()) for k, v in metrics.items()}
@@ -210,6 +345,9 @@ class JointTrainer:
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if hasattr(self.bundle, "save_checkpoint"):   # Isaac/trackerlab bridge: keep its layout
+            self.bundle.save_checkpoint(path, adapter=self.adapter.state_dict(), steps=self.steps)
+            return
         torch.save(
             {
                 "adapter": self.adapter.state_dict(),
@@ -224,12 +362,32 @@ class JointTrainer:
             path,
         )
 
-    def load(self, path: str | Path) -> None:
+    def load(self, path: str | Path) -> dict:
+        """Resume: restore adapter / policy / WM (+ step counter). Returns the raw ckpt.
+
+        Two key layouts exist: mjlab-style ``{policy, wm, adapter}`` and the Isaac bridge's
+        ``{pi, wm, adapter, wm_integration}`` (``IsaacBundle.save_checkpoint``). Both work;
+        the integration flag is honoured so a checkpoint trained with explicit integration
+        does not silently load into the residual structure.
+        """
         ck = torch.load(path, map_location=self.device, weights_only=False)
-        self.adapter.load_state_dict(ck["adapter"])
-        self.bundle.policy.load_state_dict(ck["policy"])
-        self.bundle.wm.load_state_dict(ck["wm"])
-        self.steps = int(ck.get("steps", 0))
+        if "adapter" in ck:
+            self.adapter.load_state_dict(ck["adapter"])
+        policy = ck.get("policy", ck.get("pi"))
+        if policy is not None:
+            self.bundle.policy.load_state_dict(policy)
+        if "wm" in ck:
+            self.bundle.wm.load_state_dict(ck["wm"])
+        integ = str(ck.get("wm_integration") or "").strip().lower()
+        if integ.startswith("explicit") and hasattr(self.bundle.wm, "explicit_integration"):
+            self.bundle.wm.explicit_integration = True
+            if "dt" in integ:
+                try:
+                    self.bundle.wm.dt = float(integ.split("dt", 1)[1])
+                except ValueError:
+                    pass
+        self.steps = int(ck.get("steps", ck.get("iteration", 0)) or 0)
+        return ck
 
     @staticmethod
     def load_bundle_from_checkpoint(path: str | Path, assets):

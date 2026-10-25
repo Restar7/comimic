@@ -67,12 +67,19 @@ def sample_fm_from_features(
     options: dict[str, Any] | None = None,
     return_features: bool = False,
     checkpoint_steps: bool = False,
+    grad_backend: str = "pathwise",
+    truncated_tail: int = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Differentiable equivalent of ``get_action_with_features``.
 
     ``backbone_features`` must already have been passed through
     ``action_head.process_backbone_output`` (that is what ``_encode_features``
     does).  Use :func:`sample_fm_with_grad` for the high-level entry point.
+
+    ``grad_backend`` selects how the gradient crosses the Euler ODE
+    (``pathwise`` / ``checkpointed`` / ``truncated`` / ``adjoint``, see
+    :mod:`diff_vla_wbc.fm_grad`).  ``checkpoint_steps=True`` is the old spelling
+    of ``grad_backend="checkpointed"`` and stays supported.
     """
     if not torch.is_grad_enabled():
         raise RuntimeError(
@@ -84,6 +91,26 @@ def sample_fm_from_features(
     horizon = _horizon(action_head)
     action_dim = _action_dim(action_head)
     steps = _num_steps(action_head, num_steps)
+
+    from .fm_grad import resolve_backend
+
+    backend = "checkpointed" if checkpoint_steps else resolve_backend(grad_backend)
+    if backend == "adjoint" and (vl_embeds.requires_grad or state_features.requires_grad):
+        # The backward replay re-runs every Euler step from the *detached* chain, so a
+        # condition tensor that still carries a graph (a trainable VLM backbone) would
+        # be backwarded through once per step.  Freeze it: the adjoint covers the ODE
+        # chain, not the backbone — use pathwise for --train-vlm.
+        import warnings
+
+        warnings.warn(
+            "adjoint backend: detaching backbone/state features, so gradients do not reach "
+            "the VLM backbone — use --fm-grad-backend pathwise for --train-vlm runs",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        vl_embeds = vl_embeds.detach()
+        state_features = state_features.detach()
+
     expected = (batch_size, horizon, action_dim)
     if initial_noise is None:
         actions = torch.randn(expected, dtype=vl_embeds.dtype, device=vl_embeds.device)
@@ -144,13 +171,16 @@ def sample_fm_from_features(
         predicted_velocity = predicted[:, -horizon:]
         return actions + dt * predicted_velocity * vel_strength
 
-    for index in range(steps):
-        if checkpoint_steps:
-            from torch.utils.checkpoint import checkpoint
+    from .fm_grad import sample_with_backend
 
-            actions = checkpoint(_euler_step, actions, index, use_reentrant=False)
-        else:
-            actions = _euler_step(actions, index)
+    actions = sample_with_backend(
+        _euler_step,
+        actions,
+        steps,
+        backend=backend,
+        params=[p for p in action_head.parameters() if p.requires_grad],
+        truncated_tail=truncated_tail,
+    )
 
     if return_features:
         return actions, vl_embeds, state_features
@@ -167,6 +197,8 @@ def sample_fm_with_grad(
     options: dict[str, Any] | None = None,
     return_features: bool = False,
     checkpoint_steps: bool = False,
+    grad_backend: str = "pathwise",
+    truncated_tail: int = 1,
 ):
     """Differentiable equivalent of ``Gr00tN1d7ActionHead.get_action``.
 
@@ -186,6 +218,8 @@ def sample_fm_with_grad(
         options=options,
         return_features=return_features,
         checkpoint_steps=checkpoint_steps,
+        grad_backend=grad_backend,
+        truncated_tail=truncated_tail,
     )
 
 
@@ -198,6 +232,8 @@ def sample_model_with_grad(
     options: dict[str, Any] | None = None,
     return_features: bool = False,
     checkpoint_steps: bool = False,
+    grad_backend: str = "pathwise",
+    truncated_tail: int = 1,
 ):
     """Full VLA path: preprocess -> VLM backbone -> differentiable FM sampling.
 
@@ -218,6 +254,8 @@ def sample_model_with_grad(
         options=options,
         return_features=return_features,
         checkpoint_steps=checkpoint_steps,
+        grad_backend=grad_backend,
+        truncated_tail=truncated_tail,
     )
 
 
@@ -235,10 +273,14 @@ class Gr00tTokenSource(nn.Module):
         *,
         num_steps: int | None = None,
         initial_noise: torch.Tensor | None = None,
+        grad_backend: str = "pathwise",
+        truncated_tail: int = 1,
     ):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
+        self.grad_backend = grad_backend
+        self.truncated_tail = truncated_tail
         self.register_buffer(
             "fixed_noise", initial_noise if initial_noise is not None else torch.empty(0), persistent=True
         )
@@ -250,6 +292,8 @@ class Gr00tTokenSource(nn.Module):
             model_inputs,
             initial_noise=noise,
             num_steps=self.num_steps,
+            grad_backend=self.grad_backend,
+            truncated_tail=self.truncated_tail,
         )
 
 

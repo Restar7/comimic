@@ -153,22 +153,34 @@ class EgoViewImages:
         return container
 
     def read(self, path: str | Path, index: int) -> np.ndarray:
+        """Decode one frame with a **fresh, single-threaded** container.
+
+        2026-10-25: 复用 LRU 里缓存的 container 时，libavcodec 的帧级多线程 + 反复 seek 会偶发
+        SIGSEGV（实测 A4 v5 第 0 步后崩在 avcodec_send_packet）。单个样本只解一帧，重新打开
+        容器的代价（~10 ms）相对每步 2 s 可以忽略，所以这里彻底不缓存、并把解码线程设为 1。
+        """
+        import av
+
         path = Path(path)
-        container = self._container(path)
-        stream = container.streams.video[0]
-        fps = float(stream.average_rate)
-        time_base = float(stream.time_base)
-        target = index / fps
-        container.seek(int(target / time_base), stream=stream, backward=True, any_frame=False)
-        frame = None
-        for candidate in container.decode(stream):
-            frame = candidate
-            pts = candidate.pts
-            if pts is not None and float(pts * time_base) + 1e-6 >= target - 0.5 / fps:
-                break
-        if frame is None:
-            raise ValueError(f"{path}: no frame decoded at index {index}")
-        return frame.to_ndarray(format="rgb24")
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            try:
+                stream.codec_context.thread_count = 1
+            except Exception:
+                pass
+            fps = float(stream.average_rate)
+            time_base = float(stream.time_base)
+            target = index / fps
+            container.seek(int(target / time_base), stream=stream, backward=True, any_frame=False)
+            frame = None
+            for candidate in container.decode(stream):
+                frame = candidate
+                pts = candidate.pts
+                if pts is not None and float(pts * time_base) + 1e-6 >= target - 0.5 / fps:
+                    break
+            if frame is None:
+                raise ValueError(f"{path}: no frame decoded at index {index}")
+            return frame.to_ndarray(format="rgb24")
 
     def close(self) -> None:
         for container in self._open.values():

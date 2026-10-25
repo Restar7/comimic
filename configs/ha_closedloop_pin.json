@@ -1,0 +1,406 @@
+{
+  "version": 1,
+  "purpose": "HA 闭环推理锁死契约：场景/资产/机器人初始位姿/仿真参数/编解码器",
+  "created_utc": "2026-10-25T06:07:21+00:00",
+  "ha_root": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1",
+  "robot_type": "unitree_g1_refpose_v3_1",
+  "protocol": {
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "repeats_per_seed": 1,
+    "max_steps": 300,
+    "video_fps": 30,
+    "headless": true,
+    "episode_seed": "seed 直通（seed i -> episode_seed i）"
+  },
+  "runtime": {
+    "script": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/script/eval_scripts/sonic/sim_eval_vla.py",
+    "script_sha256": "6550eef8df0280cfbadc1c054cf4e30af3ca1331326b5227a09cc0513dd076d2",
+    "episode_batch_mode": "--episode_batch_json（单进程持久仿真，多集复用同一场景）"
+  },
+  "weights": {
+    "sonic_encoder": {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/GR00T-WholeBodyControl/gear_sonic_deploy/policy/release/model_encoder.onnx",
+      "size": 50100513,
+      "sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
+    },
+    "sonic_decoder": {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/GR00T-WholeBodyControl/gear_sonic_deploy/policy/release/model_decoder.onnx",
+      "size": 40900688,
+      "sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
+    },
+    "vla_default": {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/runs/groot_sonic_vla_ha_b64_lr1e-5/checkpoint-8000"
+    },
+    "wbc_default": {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint.pt",
+      "size": 54997012,
+      "sha256": "49f351f003b36fcd773093a4d3040c3c77b3df89beaecc43eeea1ef68632184b"
+    }
+  },
+  "robot_usd": [
+    {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/robots/g1-29dof-dex3-base-fix-usd/configuration/g1_29dof_with_hand_rev_1_0.urdf_base.usd",
+      "size": 40557277,
+      "sha256": "983430fcf4b46909aeee02091203edff423298d08b6b5f56c85763e302eab098"
+    },
+    {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/robots/g1-29dof-dex3-base-fix-usd/configuration/g1_29dof_with_hand_rev_1_0.urdf_physics.usd",
+      "size": 15742,
+      "sha256": "33266c81f60ad409deb8d61f76e04dce2ec10919536d7e6115a553120540244e"
+    },
+    {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/robots/g1-29dof-dex3-base-fix-usd/configuration/g1_29dof_with_hand_rev_1_0.urdf_sensor.usd",
+      "size": 666,
+      "sha256": "0e862c49b1c84d142e99c76a6b45a910faef6eea8903bae0317086356458344e"
+    },
+    {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd",
+      "size": 40572536,
+      "sha256": "d23b9bbc8b59cf20fa1983f55874f855a76e038b9e22eae39542e62be5b4ba3d"
+    }
+  ],
+  "robot": {
+    "type": "unitree_g1_refpose_v3_1",
+    "usd_dir": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/robots/g1-29dof-dex3-base-fix-usd",
+    "cfg": {
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_config/robot_configs.py",
+      "size": 15293,
+      "sha256": "e6b3c7194d8066f9743cd325723bfa3e8dfadcdf03c60177b9ccab120ec52418"
+    },
+    "default_joint_source": "tasks/common_config/robot_configs.py::G1RobotJointTemplates（随 cfg 的 sha256 锁定）",
+    "pose_overrides_env": "ROBOT_USD_OVERRIDE 一旦设置就会换机器人 USD —— 契约里禁止使用"
+  },
+  "tasks": {
+    "DoubleDesk": {
+      "task_id": "Isaac-Move-PickPlace-DoubleDesk-G129-Dex3-Wholebody",
+      "yaml": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_test_config/base_test/doubledesk_sonic_test.yaml",
+        "size": 968,
+        "sha256": "2bee40ff2200b38b7ebd6bf2156faf27b7d7254f99b3fadab79c1fdc7be2290e"
+      },
+      "env_cfg": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/g1_tasks/move_pickplace_doubledesk_g1_29dof_dex3_wholebody/move_pickplace_doubledesk_g1_29dof_dex3_hw_env_cfg.py",
+        "size": 10191,
+        "sha256": "875b6900a3c2ef6e466169af0e1cdebd59728241119df65a13875959c27b69e2"
+      },
+      "scene_modules": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_scene/base_scene_pickplace_doubledesk.py",
+          "size": 4156,
+          "sha256": "385dd923d9c672017ce67aea709dfdc5298fe0f533a57750be918de47277d342"
+        }
+      ],
+      "init_pos": "(-3.7, -2.2, 0.8)",
+      "init_rot": "(1.0, 0.0, 0.0, 0.0)",
+      "sim": {
+        "dt": "0.005",
+        "decimation": "4",
+        "wait_for_textures": "false"
+      },
+      "object_resets": [
+        "hammer",
+        "basket"
+      ],
+      "assets": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/SM_Crate_A14_Gray_01/SM_Crate_A14_Gray_01_physics.usd",
+          "size": 1583968,
+          "sha256": "3abede861a60e88423324c8060235eec4a666b5ad9ee846fbfae64874c3c2473"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_doubledesk/interaction_obj/hammer/hammer.usd",
+          "size": 1333275,
+          "sha256": "31b9948529c78c6ad0bfd8b1cdbc9abc909fcab624c20913520c519cd527c22c"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_doubledesk/small_doubledesk.usd",
+          "size": 12044506,
+          "sha256": "b176fb14c589d0fe713816526a5b343e3839184f9730d3924229d645db204531"
+        }
+      ],
+      "missing_assets": []
+    },
+    "PPBox": {
+      "task_id": "Isaac-Move-PickPlace-Box-G129-Dex3-Wholedoby",
+      "yaml": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_test_config/base_test/pp_box_sonic_test.yaml",
+        "size": 942,
+        "sha256": "343576c2d62854b5e1faf7e6e27165bc1cdacc34b4cf5dc64d5b5fb678bfa4e2"
+      },
+      "env_cfg": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/g1_tasks/move_pickplace_box_g1_29dof_dex3_wholedoby/move_pickplace_box_g1_29dof_dex3_hw_env_cfg.py",
+        "size": 6707,
+        "sha256": "e7a7dbf467dbc0316b449c6d0edb634028a78eafa7d55554e92fcfe67a27d696"
+      },
+      "scene_modules": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_scene/base_scene_pickplace_box.py",
+          "size": 3570,
+          "sha256": "9833429f981d4d020d6dd6535d74e04a1919d3d7c737ece0eed1beb842a8dbd0"
+        }
+      ],
+      "init_pos": "(-1.6, -5.0, 0.8)",
+      "init_rot": "(1.0, 0.0, 0.0, 0.0)",
+      "sim": {
+        "dt": "0.005",
+        "decimation": "4",
+        "wait_for_textures": "false"
+      },
+      "object_resets": [
+        "box",
+        "shelf"
+      ],
+      "assets": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_box/intreaction_obj/CubeBox_A03_21cm_PR_NVD_01/CubeBox_A03_21cm_PR_NVD_01_physics_rigid.usd",
+          "size": 3962,
+          "sha256": "662445f94ccf21214e16c315c574ebeb6955ca18746c38ebd8c5a0e9257b34d0"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_box/intreaction_obj/HeavyDutySteelShelving_A06_PR_NVD_01_physics.usd",
+          "size": 12775583,
+          "sha256": "01e94f99f327ba8bd9fcf5022adffc7e8d8f521553e2e2cbd099c95002353516"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_box/small_warehouse_box.usd",
+          "size": 162977552,
+          "sha256": "0e9d02754a0d208a0742c00da14311a9a4b505e8c92a7b0032094e4e59fcdc85"
+        }
+      ],
+      "missing_assets": []
+    },
+    "Boxing": {
+      "task_id": "Isaac-Move-Boxing-Bag-G129-Dex3-Wholebody",
+      "yaml": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_test_config/base_test/boxing_sonic_test.yaml",
+        "size": 1234,
+        "sha256": "1d23221d295cf2641b7ec0bf54845ffa09de2acbc1c5cf6c434ee7670a1a48dd"
+      },
+      "env_cfg": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/g1_tasks/move_boxing_bag_g1_29dof_dex3_wholebody/move_boxing_bag_g1_29dof_dex3_hw_env_cfg.py",
+        "size": 16089,
+        "sha256": "9bf1e750beeeba7e34dc1e7db8d5797b39f1d86091e98b5802097fd6afe74aeb"
+      },
+      "scene_modules": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_scene/base_scene_boxing_bag.py",
+          "size": 1882,
+          "sha256": "8c1d836250b818179ed3c2570d62eb7ba16bbeb3a698fc816dd2b31851783830"
+        }
+      ],
+      "init_pos": "(-1.6, -2.0, 0.8)",
+      "init_rot": "(0.70711, 0.0, 0.0, -0.70711)",
+      "sim": {
+        "dt": "0.005",
+        "decimation": "4",
+        "wait_for_textures": "false"
+      },
+      "object_resets": [
+        "boxing_target"
+      ],
+      "assets": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_boxing/boxing_scene.usd",
+          "size": 16837675,
+          "sha256": "837cfd3eba3957789983dac431216b4b54c391d1e5e236c45ab5af757e0bf5ab"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_boxing/interaction_obj/boxing_target.usd",
+          "size": 5419,
+          "sha256": "f9af02b7cc7c03e45bd639294a1c2509785e62f4a63e6b3a5ca29225e4ddee06"
+        }
+      ],
+      "missing_assets": []
+    },
+    "OpenDoor": {
+      "task_id": "Isaac-Move-Open-Door-G129-Dex3-Wholebody",
+      "yaml": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_test_config/base_test/open_door_sonic_test.yaml",
+        "size": 723,
+        "sha256": "fb74a7d81a4567610d0dee5dc93fe96b8d9b88e83be8414cb9047dd77687ce1f"
+      },
+      "env_cfg": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/g1_tasks/move_open_door_g1_29dof_dex3_wholebody/move_open_door_g1_29dof_dex3_hw_env_cfg.py",
+        "size": 85489,
+        "sha256": "1061602ef3a35b998aaecb594e540f6acefd28fe13a07e64f8e701e549ec7a9f"
+      },
+      "scene_modules": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_scene/base_scene_open_door.py",
+          "size": 3418,
+          "sha256": "ae37e586071534238a6246d394365b8a8842934f6d67c6072fb10465d950c526"
+        }
+      ],
+      "init_pos": "(-1.6, 0.2, 0.8)",
+      "init_rot": "(0.70711, 0.0, 0.0, 0.70711)",
+      "sim": {
+        "dt": "0.005",
+        "decimation": "4",
+        "wait_for_textures": "false"
+      },
+      "object_resets": [
+        "door"
+      ],
+      "assets": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_opendoor/small_warehouse_digital_twin_opendoor.usd",
+          "size": 1911957,
+          "sha256": "612c5ee16fdb24220c40323fb542ac7534bf89966b3a963be7cbc0b00f639afa"
+        }
+      ],
+      "missing_assets": []
+    },
+    "SitSofa": {
+      "task_id": "Isaac-Move-Sit-Sofa-G129-Dex3-Wholebody",
+      "yaml": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_test_config/base_test/sit_sofa_sonic_test.yaml",
+        "size": 955,
+        "sha256": "5d46a1d2a9008a58bd27c6867edb9504cb132f6f46f97d93108110d04e4099ca"
+      },
+      "env_cfg": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/g1_tasks/move_sit_sofa_g1_29dof_dex3_wholebody/move_sit_sofa_g1_29dof_dex3_hw_env_cfg.py",
+        "size": 4778,
+        "sha256": "c1d83ad1eb7bcf27e8b7f00d31b26b170b0a37950e83222f529acaddd8747a0f"
+      },
+      "scene_modules": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_scene/base_scene_smalllivingroom_sitingsofa.py",
+          "size": 3624,
+          "sha256": "26136ebd4248064249f2a8bf477626d3b170be974c90fdeba2dfed9ee433f8c4"
+        }
+      ],
+      "init_pos": "(-1.6, 2.0, 0.8)",
+      "init_rot": "(0.70711, 0.0, 0.0, -0.70711)",
+      "sim": {
+        "dt": "0.005",
+        "decimation": "4",
+        "wait_for_textures": "false"
+      },
+      "object_resets": [
+        "carton_obstacle_01",
+        "carton_obstacle_02"
+      ],
+      "assets": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_sitsofa/intreaction_obj/CubeBox_A03_21cm_PR_NVD_01/CubeBox_A03_21cm_PR_NVD_01_physics.usd",
+          "size": 2060,
+          "sha256": "16c594fe59ee0c3dee0ddf1741504478c52f2dc51a643cb38d9a0c856a60b19b"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_sitsofa/small_warehouse_digital_twin_sitsofa.usd",
+          "size": 1955988,
+          "sha256": "7a9e665511937e1e4e6667c55577ec4a4b4bd00437d49c5010c0b2a2f1ea5206"
+        }
+      ],
+      "missing_assets": []
+    },
+    "VisionNavi": {
+      "task_id": "Isaac-Move-SmallWarehouse-VisionNavigation-G129-Dex3-Wholebody",
+      "yaml": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_test_config/base_test/vision_navi_sonic_test.yaml",
+        "size": 2806,
+        "sha256": "b54473f9d4a94a693a5b9e6392082d8568f7eee2393df2658ce0f6c1f1f8fdb8"
+      },
+      "env_cfg": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/g1_tasks/move_small_warehouse_vision_navigation_g1_29dof_dex3_wholebody/move_small_warehouse_vision_navigation_g1_29dof_dex3_hw_env_cfg.py",
+        "size": 30115,
+        "sha256": "725d8df1a7b37604cd2dfa1e1c5c56ba90d59be95a97921d050cb863c8bc8a5e"
+      },
+      "scene_modules": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_scene/base_scene_small_warehouse_vision_navigation.py",
+          "size": 6022,
+          "sha256": "74c1ffee3b2af9277ff287af8c9c51b81573eb25fdcc1d36c11d9979489c2a9d"
+        }
+      ],
+      "init_pos": "(-1.9, -5.2, 0.8)",
+      "init_rot": "(0.7071, 0.0, 0.0, 0.7071)",
+      "sim": {
+        "dt": "0.005",
+        "decimation": "4",
+        "wait_for_textures": "false"
+      },
+      "object_resets": [
+        "target_sign",
+        "obstacle_01_a",
+        "obstacle_01_b",
+        "obstacle_01_c",
+        "obstacle_02_a",
+        "obstacle_02_b",
+        "obstacle_02_c"
+      ],
+      "assets": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_vision_navigation/interaction_obj/obstacle_01.usd",
+          "size": 9847,
+          "sha256": "b363a8497c2837b0776f2a19c779ab3e350886a3e7a1a40f63d7732691aa1705"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_vision_navigation/interaction_obj/obstacle_02.usd",
+          "size": 9708,
+          "sha256": "e49ea9b5b277217f6ffcdd389af77900a5d6a2559b46a4f4c3ed4e3e5180550f"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/small_warehouse_vision_navigation/interaction_obj/wetfloorsign.usd",
+          "size": 821705,
+          "sha256": "e783eb47d2a9a5bcd547065054e0851a7eaf285c43d5e01558fb23119b1ad98c"
+        }
+      ],
+      "missing_assets": []
+    },
+    "FootballSingle": {
+      "task_id": "Isaac-Move-Football-Single-G129-Dex3-Wholebody",
+      "yaml": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_test_config/base_test/football_single_sonic_test.yaml",
+        "size": 667,
+        "sha256": "936fbc5d9b78fa49a3b89596a76ae192c7fd2917cbb10558079057e4b2335f15"
+      },
+      "env_cfg": {
+        "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/g1_tasks/move_football_single_g1_29dof_dex3_wholebody/move_football_single_g1_29dof_dex3_hw_env_cfg.py",
+        "size": 9794,
+        "sha256": "b024875373f221bd0aa416e4920304cde6f721a753977f764b89d64d94d0dc28"
+      },
+      "scene_modules": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/tasks/common_scene/base_scene_football_single_cfg_wholebody.py",
+          "size": 8601,
+          "sha256": "8729bc1d5a7efb071d0bb955962444c7f499c058179d0099d23df9e8f23dfd92"
+        }
+      ],
+      "init_pos": "(0.0, -2.0, 0.8)",
+      "init_rot": "(0.7071, 0.0, 0.0, 0.7071)",
+      "sim": {
+        "dt": "0.005",
+        "decimation": "4",
+        "wait_for_textures": "false"
+      },
+      "object_resets": [
+        "football"
+      ],
+      "assets": [
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/football_scene/interaction_obj/football_goal/football_goal_physics.usd",
+          "size": 1302448,
+          "sha256": "801860014257f91c8ac82635e5c8448bc9d5a5e6d43ea64bce0065cb5089d310"
+        },
+        {
+          "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/assets/objects/small_warehouse/football_scene/interaction_obj/soccer_ball/soccer_ball_physics.usd",
+          "size": 147080,
+          "sha256": "76e1d51d4018b7d9ae75a2cb85c426ae5776c4d574b6cec8b05deb0945833752"
+        }
+      ],
+      "missing_assets": []
+    }
+  }
+}

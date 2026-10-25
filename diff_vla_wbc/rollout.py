@@ -15,24 +15,22 @@ head; wrap only the separate world-model update.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import torch
 import torch.nn.functional as F
 
-from .supermimic_backend import (
-    ACTION_DIM,
-    GOAL_FEATURE_DIM,
-    GOAL_FRAMES,
-    HISTORY,
-    STATE_DIM,
-    SuperMimicBundle,
-)
+if TYPE_CHECKING:  # annotations only: the Isaac path must not import the mjlab stack
+    from .isaac_joint import FrameRef  # noqa: F401
 
-try:
-    from supermimic.world_model.heads import OBS_TERMS, ReferenceFrame, flatten_history_term_major
-except Exception as exc:  # pragma: no cover
-    raise ImportError("SuperMimic is not importable; run diff_vla_wbc.compat.ensure_supermimic_importable()") from exc
+# State/observation contract shared by every bundle (plain constants, no implementation import):
+#   state 71 = [p(3), quat(4), q(29), v_w(3), w_w(3), qd(29)]
+#   per-frame observation = 93 (paper) or 99 (relative_ori99)
+ACTION_DIM = 29
+HISTORY = 10
+STATE_DIM = 71
+GOAL_FRAMES = 10
+GOAL_FEATURE_DIM = 68
 
 
 @dataclass
@@ -43,26 +41,67 @@ class Rollout:
     reward_terms: dict[str, torch.Tensor]  # each (H, B)
     termination_probs: torch.Tensor      # (H+1, B)
     survival: torch.Tensor               # (H+1, B)
-    goals: torch.Tensor                  # (H+1, B, 680)
+    goals: torch.Tensor                  # (H+1, B, 680) — or the raw token window on the token route
     goal_sequence: torch.Tensor          # (B, 10, 680)
-    references: list[ReferenceFrame] = field(default_factory=list)
-    history: torch.Tensor | None = None  # final (H, B, 93)
+    references: list[Any] = field(default_factory=list)
+    history: torch.Tensor | None = None  # final (H, B, 93|99)
 
 
-def _obs_terms_from_flat(flat: torch.Tensor, hist: int = HISTORY) -> torch.Tensor:
-    """Inverse of ``flatten_history_term_major`` for a single (B, 930) batch."""
+def _obs_terms_from_flat(flat: torch.Tensor, hist: int = HISTORY,
+                         term_dims: tuple[int, ...] | None = None) -> torch.Tensor:
+    """Split a flat term-major observation history into ``(B, hist, W)``.
+
+    The default term split is the paper's 93-dim layout; a bundle that asks for a different
+    width (``relative_ori99`` → 99) passes its own ``term_dims``.
+    """
+    dims = tuple(term_dims) if term_dims is not None else (29, 29, 3, 3, 29)
     if flat.ndim != 2:
-        raise ValueError("obs_hist must be (B, 930)")
+        raise ValueError(f"obs_hist must be (B, hist*{sum(dims)}), got {tuple(flat.shape)}")
     b = flat.shape[0]
-    if flat.shape[1] != sum(d for _, d in OBS_TERMS) * hist:
-        raise ValueError(f"expected {sum(d for _, d in OBS_TERMS) * hist} obs dims, got {flat.shape[1]}")
+    if flat.shape[1] != sum(dims) * hist:
+        raise ValueError(f"expected {sum(dims) * hist} obs dims, got {flat.shape[1]}")
     terms = []
     offset = 0
-    for _, dim in OBS_TERMS:
+    for dim in dims:
         chunk = flat[:, offset : offset + dim * hist].reshape(b, hist, dim)
         terms.append(chunk)
         offset += dim * hist
-    return torch.cat(terms, dim=-1)  # (B,H,93), term order restored
+    return torch.cat(terms, dim=-1)  # (B,H,W), term order restored
+
+
+def _call_observation(bundle, next_state, action, xi, ref=None):
+    """``bundle.observation(...)`` with an optional ``ref`` (needed by 99-dim bundles)."""
+    try:
+        return bundle.observation(next_state, action, xi, ref=ref)
+    except TypeError:
+        return bundle.observation(next_state, action, xi)
+
+
+def _call_act(bundle, obs_flat, cond, ref=None):
+    """``bundle.act(...)`` with an optional ``ref`` (ignored by stock bundles)."""
+    try:
+        return bundle.act(obs_flat, cond, ref=ref)
+    except TypeError:
+        return bundle.act(obs_flat, cond)
+
+
+def _obs_width(bundle) -> int:
+    """Per-frame observation width the bundle wants (93 by default, 99 for ``relative_ori99``)."""
+    return int(getattr(bundle, "obs_width", 93 if bundle is not None else 93))
+
+
+def _call_robot_bodies(bundle, state):
+    """FK of the tracked bodies through the bundle (falls back to the raw analytic head).
+
+    The bundle-level hook matters when the learned layer and the analytic layer disagree about
+    the root-velocity convention: the trackerlab bridge (world-frame ω) converts to the body
+    frame the mjlab FK expects.  Calling ``bundle.assets.heads.robot_bodies`` here would bypass
+    that conversion and silently feed the reward world-frame angular velocity.
+    """
+    fn = getattr(bundle, "robot_bodies", None)
+    if fn is not None:
+        return fn(state)
+    return bundle.assets.heads.robot_bodies(state)
 
 
 def _ensure_history(
@@ -70,30 +109,32 @@ def _ensure_history(
     history: torch.Tensor | None,
     batch: int,
     device: torch.device,
+    width: int = 93,
+    term_dims: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     if history is not None:
-        if history.shape == (batch, HISTORY, 93):
+        if history.shape == (batch, HISTORY, width):
             return history.permute(1, 0, 2).contiguous()
-        if history.shape != (HISTORY, batch, 93):
+        if history.shape != (HISTORY, batch, width):
             raise ValueError(
-                f"history must be {(HISTORY, batch, 93)} or {(batch, HISTORY, 93)}, "
+                f"history must be {(HISTORY, batch, width)} or {(batch, HISTORY, width)}, "
                 f"got {tuple(history.shape)}"
             )
         return history
     if obs_hist is None:
-        return torch.zeros(HISTORY, batch, 93, device=device)
-    if obs_hist.shape != (batch, HISTORY * 93):
-        raise ValueError(f"obs_hist must be {(batch, HISTORY * 93)}, got {tuple(obs_hist.shape)}")
-    # (B,H,93) -> (H,B,93)
-    return _obs_terms_from_flat(obs_hist).permute(1, 0, 2).contiguous()
+        return torch.zeros(HISTORY, batch, width, device=device)
+    if obs_hist.shape != (batch, HISTORY * width):
+        raise ValueError(f"obs_hist must be {(batch, HISTORY * width)}, got {tuple(obs_hist.shape)}")
+    # (B,H,W) -> (H,B,W)
+    return _obs_terms_from_flat(obs_hist, term_dims=term_dims).permute(1, 0, 2).contiguous()
 
 
-def _flat_history(bundle: SuperMimicBundle, history: torch.Tensor) -> torch.Tensor:
+def _flat_history(bundle, history: torch.Tensor) -> torch.Tensor:
     return bundle.flatten_history(history)
 
 
 def imagine_with_goals(
-    bundle: SuperMimicBundle,
+    bundle,
     *,
     fm_tokens: torch.Tensor | None = None,
     adapter: torch.nn.Module | None = None,
@@ -102,7 +143,7 @@ def imagine_with_goals(
     obs_hist: torch.Tensor | None = None,
     history: torch.Tensor | None = None,
     xi: torch.Tensor | None = None,
-    references: Sequence[ReferenceFrame] | None = None,
+    references: Sequence[Any] | None = None,
     prev_action: torch.Tensor | None = None,
     horizon: int = 8,
     obs_noise: float = 0.0,
@@ -119,7 +160,9 @@ def imagine_with_goals(
     batch = state.shape[0]
     device = state.device
     xi = torch.zeros(batch, 33, device=device) if xi is None else xi
-    history = _ensure_history(obs_hist, history, batch, device)
+    width = _obs_width(bundle)
+    history = _ensure_history(obs_hist, history, batch, device, width,
+                              term_dims=getattr(bundle, "term_dims", None))
     if prev_action is None:
         prev_action = torch.zeros(batch, ACTION_DIM, device=device)
     if references is not None and len(references) < horizon:
@@ -166,14 +209,14 @@ def imagine_with_goals(
         ref = references[t]
         g = goal_window_at(t)
         obs_flat = _flat_history(bundle, history)
-        action = bundle.act(obs_flat, g)
+        action = _call_act(bundle, obs_flat, g, ref)
         next_state = bundle.step(current, action, xi)
-        bodies = bundle.assets.heads.robot_bodies(next_state)
+        bodies = _call_robot_bodies(bundle, next_state)
         terms = bundle.reward(next_state, action, a_prev, ref, bodies)
         logits = bundle.termination_logits(next_state, ref)
         prob = torch.sigmoid(logits)
         survival = survival * (1.0 - prob)
-        clean_obs = bundle.observation(next_state, action, xi)
+        clean_obs = _call_observation(bundle, next_state, action, xi, ref)
         if obs_noise > 0:
             clean_obs = clean_obs + (torch.rand_like(clean_obs) * 2 - 1) * obs_noise
         history = torch.cat((history[1:], clean_obs.unsqueeze(0)), dim=0)
@@ -215,9 +258,13 @@ class LossWeights:
     safety: float = 0.01
     fm: float = 1.0
     termination: float = 0.0
+    #: 速度通道（``v/w/qd``）在 ``state`` 项里的额外权重。实测：Isaac WM 想象出来的速度与参考
+    #: 速度相关只有 0.077（位置/关节是 1e-4 / 0.03 的精度），速度通道占了 state 项 96% 的能量
+    #: 且不可学习 —— 训练侧用 ``--state-vel-weight 0.05`` 降权，默认 1.0 保持旧行为。
+    state_vel: float = 1.0
 
 
-def _state_error(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _state_error(pred: torch.Tensor, target: torch.Tensor, vel_weight: float = 1.0) -> torch.Tensor:
     """Position / orientation / velocity error with a geodesic quaternion term."""
     from .compat import quat_error_magnitude
 
@@ -225,7 +272,7 @@ def _state_error(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     ori = quat_error_magnitude(pred[..., 3:7], target[..., 3:7]).square().mean()
     q = F.mse_loss(pred[..., 7:36], target[..., 7:36])
     vel = F.mse_loss(pred[..., 36:], target[..., 36:])
-    return pos + ori + q + vel
+    return pos + ori + q + float(vel_weight) * vel
 
 
 def discounted_return(
@@ -243,14 +290,14 @@ def discounted_return(
 
 
 def imagine_with_tokens(
-    bundle: SuperMimicBundle,
+    bundle,
     *,
     tokens: torch.Tensor,
     state: torch.Tensor,
     obs_hist: torch.Tensor | None = None,
     history: torch.Tensor | None = None,
     xi: torch.Tensor | None = None,
-    references: Sequence[ReferenceFrame] | None = None,
+    references: Sequence[Any] | None = None,
     prev_action: torch.Tensor | None = None,
     horizon: int = 8,
     obs_noise: float = 0.0,
@@ -276,7 +323,9 @@ def imagine_with_tokens(
         raise ValueError(f"token dim {token_dim} != policy token_dim {bundle.policy.token_dim}")
 
     xi = torch.zeros(batch, 33, device=device) if xi is None else xi
-    history = _ensure_history(obs_hist, history, batch, device)
+    width = _obs_width(bundle)
+    history = _ensure_history(obs_hist, history, batch, device, width,
+                              term_dims=getattr(bundle, "term_dims", None))
     if prev_action is None:
         prev_action = torch.zeros(batch, ACTION_DIM, device=device)
     if references is not None and len(references) < horizon:
@@ -301,14 +350,14 @@ def imagine_with_tokens(
         ref = references[t]
         cond = token_at(t)
         obs_flat = _flat_history(bundle, history)
-        action = bundle.act(obs_flat, cond)
+        action = _call_act(bundle, obs_flat, cond, ref)
         next_state = bundle.step(current, action, xi)
-        bodies = bundle.assets.heads.robot_bodies(next_state)
+        bodies = _call_robot_bodies(bundle, next_state)
         terms = bundle.reward(next_state, action, a_prev, ref, bodies)
         logits = bundle.termination_logits(next_state, ref)
         prob = torch.sigmoid(logits)
         survival = survival * (1.0 - prob)
-        clean_obs = bundle.observation(next_state, action, xi)
+        clean_obs = _call_observation(bundle, next_state, action, xi, ref)
         if obs_noise > 0:
             clean_obs = clean_obs + (torch.rand_like(clean_obs) * 2 - 1) * obs_noise
         history = torch.cat((history[1:], clean_obs.unsqueeze(0)), dim=0)
@@ -371,7 +420,8 @@ def compute_joint_loss(
     if teacher_states is not None:
         steps = min(rollout.states.shape[0] - 1, teacher_states.shape[1])
         target_states = teacher_states[:, :steps].permute(1, 0, 2)  # (H,B,71)
-        terms["state"] = _state_error(rollout.states[1 : steps + 1], target_states)
+        terms["state"] = _state_error(rollout.states[1 : steps + 1], target_states,
+                                      vel_weight=weights.state_vel)
     if rollout.actions.shape[0] > 1:
         terms["smooth"] = (rollout.actions[1:] - rollout.actions[:-1]).square().mean()
     if task_loss_fn is not None:
