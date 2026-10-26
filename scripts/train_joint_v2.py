@@ -179,6 +179,31 @@ def main() -> int:
                     help="显式放行 bc!=wbc 的 token 空间不匹配（只用于诊断；这种臂的数字不能进表）")
     ap.add_argument("--lambda-s", type=float, default=0.0, help="可选 state 项权重（小权重）")
     ap.add_argument("--lambda-a", type=float, default=0.0, help="可选动作蒸馏权重（WBC 冻结）")
+    # ---------------- v3：端到端（token 不做任何标签监督）----------------
+    ap.add_argument("--v3", action="store_true",
+                    help="启用 v3 训练步：token 只由奖励(+critic)监督，手部单独 FM 监督")
+    ap.add_argument("--lambda-hand", type=float, default=0.2,
+                    help="v3: 手部 hand-only FM 损失权重（token 那 64 维不监督）")
+    ap.add_argument("--critic", dest="critic", action="store_true", default=True)
+    ap.add_argument("--no-critic", dest="critic", action="store_false")
+    ap.add_argument("--critic-lr", type=float, default=3e-4)
+    ap.add_argument("--lam", type=float, default=0.95, help="GAE lambda")
+    ap.add_argument("--push-std", type=float, default=0.0,
+                    help="rollout 内过程扰动：每步给 root 线/角速度加 U(-std,std)")
+    ap.add_argument("--start-source", choices=("reference", "recorded"), default="reference",
+                    help="burn-in 起点：recorded = 真录制机器人状态（v3 推荐）")
+    ap.add_argument("--real-transitions", type=Path,
+                    default=ROOT / "runs/wm_real/ha_transitions.pt",
+                    help="真转移数据集（scripts/build_real_transitions.py 生成）")
+    ap.add_argument("--wm-refresh-every", type=int, default=0,
+                    help="每 N 步用真转移刷新 WM（0 = 不刷新）")
+    ap.add_argument("--wm-refresh-steps", type=int, default=200)
+    ap.add_argument("--wm-refresh-lr", type=float, default=1e-4)
+    ap.add_argument("--wm-kl-anchor", type=float, default=1e-3)
+    ap.add_argument("--grad-log-every", type=int, default=0,
+                    help="每 N 步打印分项梯度范数（奖励 vs 手部）")
+    ap.add_argument("--clip-head", type=float, default=0.5,
+                    help="VLA head 的梯度范数裁剪阈值。1.0 只适合小 MLP；1.6B head 要先测 p99 再定")
     ap.add_argument("--state-vel-weight", type=float, default=0.05)
     ap.add_argument("--fm-lr", type=float, default=1e-5)
     ap.add_argument("--fm-clip", type=float, default=0.5)
@@ -301,6 +326,15 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 端口 token 两个源
     lib = bundle.library
+    # ---------------------------------------------------------------- v3：真转移 + 真录制起点
+    _real = None
+    if (args.start_source == "recorded" or args.wm_refresh_every > 0) and Path(args.real_transitions).exists():
+        _real = torch.load(str(args.real_transitions), map_location="cpu", weights_only=False)
+        print(f"[v3] real transitions: {tuple(_real['states'].shape)} from {args.real_transitions}", flush=True)
+    elif args.start_source == "recorded" or args.wm_refresh_every > 0:
+        raise SystemExit(f"[fail] 需要 {args.real_transitions}；先跑 scripts/build_real_transitions.py")
+    _recorded_states = _real["states"].to(device) if _real is not None else None
+
     # ---------------------------------------------------------------- token 前端（交接文档 §5.1/§5.3）
     # hold 窗口 + 仿真机器人 anchor（B 模式）。BC 标签仍是 npz 的 g1_motion_token_64。
     from diff_vla_wbc.sonic_frontend import LibraryTokenBuilder, library_kind  # noqa: PLC0415
@@ -391,6 +425,7 @@ def main() -> int:
     provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
         wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
+        recorded_states=_recorded_states,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=int(args.seed), hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -401,6 +436,7 @@ def main() -> int:
     eval_provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
         wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
+        recorded_states=_recorded_states,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=20261026, hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -429,7 +465,19 @@ def main() -> int:
         head_eval_mode=not args.head_train_mode,
         grad_accum=args.grad_accum, grad_ratio_every=args.grad_ratio_every,
     )
-    trainer = JointTrainerV2(bundle, vlm, codec, cfg=cfg, device=device)
+    if args.v3:
+        from diff_vla_wbc.v3_step import JointTrainerV3, V3Config  # noqa: PLC0415
+
+        v3cfg = V3Config(
+            lambda_r=args.lambda_r, lambda_hand=args.lambda_hand, use_critic=args.critic,
+            critic_lr=args.critic_lr, gamma=args.gamma, lam=args.lam,
+            push_std=args.push_std, grad_log_every=args.grad_log_every,
+            clip_head=args.clip_head,
+        )
+        trainer = JointTrainerV3(bundle, vlm, codec, cfg=cfg, v3=v3cfg, device=device)
+        (out / "v3_config.json").write_text(json.dumps(v3cfg.__dict__, indent=1))
+    else:
+        trainer = JointTrainerV2(bundle, vlm, codec, cfg=cfg, device=device)
     (out / "v2_config.json").write_text(json.dumps(cfg.__dict__, indent=1))
 
     # 起点就做一次冻结门禁（S3.2）：之后每次保存都会再比一次
@@ -442,6 +490,7 @@ def main() -> int:
         ref_provider = BurnInBatchProvider(
             bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
             wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
+            recorded_states=_recorded_states,
             batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
             seed=int(args.seed), hand_dir=args.motion[0],
             burnin=False,                    # 对照组：起点 = 参考帧（旧口径）
@@ -505,6 +554,16 @@ def main() -> int:
         if step % max(1, args.log_every) == 0 or step == 1:
             print(f"[v2 {step}/{args.steps}] "
                   + json.dumps({k: round(v, 6) for k, v in metrics.items()}), flush=True)
+        if args.v3 and args.wm_refresh_every and step % args.wm_refresh_every == 0:
+            try:
+                rm = trainer.refresh_wm(
+                    _real, steps=args.wm_refresh_steps, lr=args.wm_refresh_lr,
+                    kl_anchor=args.wm_kl_anchor, log=print,
+                )
+                print(f"[wm-refresh {step}] " + json.dumps(
+                    {k: v for k, v in rm.items() if k in ("steps", "loss_first", "loss_last")}), flush=True)
+            except Exception as exc:  # 刷新失败不能挡住训练
+                print(f"[wm-refresh][warn] {exc}", flush=True)
         if eval_batches and args.eval_every and step % args.eval_every == 0:
             run_eval(step)
         if args.save_every and step % args.save_every == 0:
@@ -537,6 +596,9 @@ def main() -> int:
         "bc_token_space": args.bc_token_space,
         "wbc_token_space": args.wbc_token_space,
         "token_space_mismatch": bool(_space_mismatch),
+        "v3": bool(args.v3), "lambda_hand": float(args.lambda_hand),
+        "push_std": float(args.push_std), "start_source": str(args.start_source),
+        "wm_refresh_every": int(args.wm_refresh_every),
         "wbc_token_window": str(args.wbc_token_window),
         "wbc_token_source": str(args.wbc_token_source),
         "motion_packed": str(args.motion_packed),
