@@ -65,10 +65,13 @@ from diff_vla_wbc.train_v2 import (  # noqa: E402
 
 HA_MOTION_DIR = ROOT / "data/npz/ha_tokens"
 HA_PORT_DIR = ROOT / "data/port_tokens/ha_tokens"
-PACKED_MOTION = ROOT / "runs/isaac_motion/ha_tokens/packed.pt"
+PACKED_MOTION = ROOT / "runs/isaac_motion/ha_tokens/packed.pt"      # 旧：执行轨迹（端口/future 时代）
+PACKED_CMD_MOTION = ROOT / "runs/isaac_motion/ha_cmd/packed.pt"    # 新：命令流（hold/label 时代）
 FORBIDDEN_DATA_TOKENS = ("mixed", "ft318")
 #: S3 的默认执行器：WBC v2（obs93 + 混合库共训，见 docs/S1_WBC_NEXT_PLAN_20261026.md）
-WBC_V2_CKPT = ROOT / "trackerlab-supermimic/logs/wbc_mix2_obs93/ckpt_016000_spec.pt"
+WBC_V2_CKPT = ROOT / "trackerlab-supermimic/logs/wbc_mix2_obs93/ckpt_016000_spec.pt"  # 端口/future（作废）
+#: hold/label 空间的 WBC（S1 正在训；`logs/wbc_hold_x20/`）。存在就用它。
+WBC_HOLD_GLOB = "trackerlab-supermimic/logs/wbc_hold*/ckpt_*.pt"
 WBC_V1_CKPT = ROOT / "trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint_spec.pt"
 
 
@@ -85,6 +88,42 @@ def _sha256_head(path: Path, nbytes: int = 1 << 20) -> str:
     with open(path, "rb") as f:
         h.update(f.read(nbytes))
     return h.hexdigest()[:16]
+
+
+def _discover_hold_wbc(root: Path) -> Path | None:
+    """找最新的 hold 空间 WBC（`logs/wbc_hold*/ckpt_*.pt`，优先带 robot_spec 的）。"""
+    cands = []
+    for pat in ("trackerlab-supermimic/logs/wbc_hold*/ckpt_*.pt",):
+        cands.extend(root.glob(pat))
+    if not cands:
+        return None
+
+    def key(path: Path):
+        stem = path.stem
+        it = 0
+        for tok in stem.split("_"):
+            if tok.isdigit():
+                it = max(it, int(tok))
+        return (path.name.endswith("_spec.pt"), it, path.stat().st_mtime)
+
+    return sorted(cands, key=key)[-1]
+
+
+def _wbc_window_of(ckpt: Path) -> tuple[str, str]:
+    """读 WBC ckpt 的 token 窗口口径 → (window, library)。没有显式字段时按库名推断。"""
+    ck = torch.load(str(ckpt), map_location="cpu", weights_only=False)
+    prov = ck.get("provenance") or {}
+    a = ck.get("args") or {}
+    lib = str(prov.get("library") or a.get("motion_packed") or "")
+    win = str(prov.get("token_window") or a.get("token_window") or "").lower()
+    if win in ("hold", "future"):
+        return win, lib
+    low = lib.lower()
+    if "ha_cmd" in low:
+        return "hold", lib          # 命令流库 = hold 前端建的
+    if "ha_tokens" in low or "bones_seed" in low:
+        return "unknown", lib
+    return "unknown", lib
 
 
 def collect_npz(paths: list[Path]) -> list[Path]:
@@ -114,8 +153,10 @@ def main() -> int:
     ap.add_argument("--wbc-token-space", choices=("label", "port"), default="port",
                     help="冻结 WBC 的训练空间（burn-in 的 conditioning 必须用它）。当前 "
                          "WBC_v2 是端口空间；S1 用标签空间重训后改成 label")
-    ap.add_argument("--motion-packed", type=Path, default=PACKED_MOTION)
-    ap.add_argument("--wbc-ckpt", type=Path, default=WBC_V2_CKPT,
+    ap.add_argument("--motion-packed", type=Path, default=PACKED_CMD_MOTION,
+                    help="WBC 的参考库。S3 必须用**命令流**库（ha_cmd）：npz 的 joint_pos 是执行轨迹，"
+                         "与命令流 mean|Δ|=0.41、lag +8 帧（交接文档 §4）。旧库只用于复现旧口径")
+    ap.add_argument("--wbc-ckpt", type=Path, default=None,
                     help="冻结的 WBC（必须带 robot_spec；默认 WBC_v2 = ckpt_016000_spec.pt）")
     ap.add_argument("--vlm-ckpt", type=Path, required=True,
                     help="起始 VLA ckpt（官方 checkpoint-8000，或 S2 的 base_aligned）")
@@ -170,9 +211,29 @@ def main() -> int:
     ap.add_argument("--gate-only", action="store_true",
                     help="只跑 codec / 冻结 / burn-in / FM-BC 四道门禁（写 gates.json 后退出）")
     ap.add_argument("--gate-out", type=Path, default=None)
+    ap.add_argument("--wbc-token-window", choices=("hold", "future"), default="hold",
+                    help="WBC 的 token 窗口口径。hold = HA 录制/部署口径（交接文档 §2）；"
+                         "future = 旧端口空间，只用于复现旧结果")
+    ap.add_argument("--wbc-token-source", choices=("online", "sidecar"), default="online",
+                    help="burn-in/GT 臂的 token 来源：online = hold builder + 当时仿真机器人 anchor"
+                         "（B 模式，交接文档 §5.3）；sidecar = 预计算侧车（旧端口空间）")
+    ap.add_argument("--allow-window-mismatch", action="store_true",
+                    help="放行 WBC ckpt 的 token 窗口口径与 --wbc-token-window 不一致（仅诊断）")
+    ap.add_argument("--allow-library-mismatch", action="store_true",
+                    help="放行参考库不是命令流库（仅复现旧口径）")
     ap.add_argument("--gate-batches", type=int, default=8,
                     help="burn-in / token 对比度门禁的批次数（× batch = 窗口数；对比度要 ≥16 才有统计意义）")
     args = ap.parse_args()
+
+    if args.wbc_ckpt is None:
+        _h = _discover_hold_wbc(ROOT)
+        if _h is None:
+            print("[warn] 没找到 logs/wbc_hold*/ckpt_*.pt，退回旧端口 WBC（结果只能当冒烟）", flush=True)
+            args.wbc_ckpt = WBC_V2_CKPT
+        else:
+            args.wbc_ckpt = _h
+            print(f"[info] 自动选中 hold 空间 WBC: {_h}", flush=True)
+    args.wbc_ckpt = Path(args.wbc_ckpt)
 
     _forbid_legacy_dataset(args.motion, "--motion")
     for p in (args.wbc_ckpt, args.vlm_ckpt, args.vlm_path):
@@ -240,6 +301,41 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 端口 token 两个源
     lib = bundle.library
+    # ---------------------------------------------------------------- token 前端（交接文档 §5.1/§5.3）
+    # hold 窗口 + 仿真机器人 anchor（B 模式）。BC 标签仍是 npz 的 g1_motion_token_64。
+    from diff_vla_wbc.sonic_frontend import LibraryTokenBuilder, library_kind  # noqa: PLC0415
+
+    _lib_kind = library_kind(args.motion_packed)
+    if args.wbc_token_window == "hold" and _lib_kind != "command" and not args.allow_library_mismatch:
+        raise SystemExit(
+            f"[fail] 参考库 {args.motion_packed} 不是命令流库（kind={_lib_kind}）。hold 口径必须配 "
+            f"{PACKED_CMD_MOTION}（npz 的 joint_pos 是执行轨迹，与命令流 lag +8 帧）；"
+            "只想复现旧口径请显式 --allow-library-mismatch"
+        )
+    _wbc_win, _wbc_lib = _wbc_window_of(args.wbc_ckpt)
+    print(
+        f"[AUDIT][token-frontend] wbc_ckpt_window={_wbc_win} wbc_lib={_wbc_lib or '?'} "
+        f"requested_window={args.wbc_token_window} lib_kind={_lib_kind} "
+        f"source={args.wbc_token_source} bc_token_space={args.bc_token_space}",
+        flush=True,
+    )
+    if _wbc_win not in ("hold", "future"):
+        print(f"[warn] WBC ckpt 没有 token_window 标记（provenance/args 都没有），按库名推断失败；"
+              f"库={_wbc_lib or '?'}", flush=True)
+    elif _wbc_win != args.wbc_token_window and not args.allow_window_mismatch:
+        raise SystemExit(
+            f"[fail] WBC ckpt 的 token 窗口是 {_wbc_win!r}，但 --wbc-token-window={args.wbc_token_window}："
+            "burn-in 与奖励都会在另一个空间里算（交接文档 §5.1）。修法：换 hold 版 WBC"
+            "（logs/wbc_hold_*/ckpt_*.pt），或显式 --allow-window-mismatch 只做冒烟"
+        )
+    online_tokens = None
+    if args.wbc_token_source == "online":
+        online_tokens = LibraryTokenBuilder(
+            bundle.motion, device=device, window=args.wbc_token_window,
+            library_path=args.motion_packed,
+        )
+        print(online_tokens.audit(), flush=True)
+
     _tdir = args.motion[0] if args.motion[0].is_dir() else args.motion[0].parent
     port_chunk_src = RecordedTokenSource(
         _tdir, lib, token_horizon=40, token_dim=64, device=device,
@@ -291,7 +387,7 @@ def main() -> int:
     # ---------------------------------------------------------------- 训练 / 评测 provider
     provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
-        wbc_chunk_source=wbc_chunk,
+        wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=int(args.seed), hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -301,7 +397,7 @@ def main() -> int:
     )
     eval_provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
-        wbc_chunk_source=wbc_chunk,
+        wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=20261026, hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -342,7 +438,7 @@ def main() -> int:
 
         ref_provider = BurnInBatchProvider(
             bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
-            wbc_chunk_source=wbc_chunk,
+            wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
             batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
             seed=int(args.seed), hand_dir=args.motion[0],
             burnin=False,                    # 对照组：起点 = 参考帧（旧口径）
@@ -438,6 +534,10 @@ def main() -> int:
         "bc_token_space": args.bc_token_space,
         "wbc_token_space": args.wbc_token_space,
         "token_space_mismatch": bool(_space_mismatch),
+        "wbc_token_window": str(args.wbc_token_window),
+        "wbc_token_source": str(args.wbc_token_source),
+        "motion_packed": str(args.motion_packed),
+        "library_kind": str(_lib_kind),
         "reward_branch_valid": bool((not _space_mismatch) and float(args.lambda_r) > 0),
         "lambda_r": float(args.lambda_r),
         "lambda_bc": float(args.lambda_bc),

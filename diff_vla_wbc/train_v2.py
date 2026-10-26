@@ -388,6 +388,7 @@ class BurnInBatchProvider:
         port_source: Callable[[torch.Tensor], torch.Tensor],
         port_frame_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
         wbc_chunk_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        online_tokens=None,
         batch_size: int = 4,
         horizon: int = 16,
         token_horizon: int = 40,
@@ -408,6 +409,9 @@ class BurnInBatchProvider:
         # **WBC 空间**的整段 GT token（门禁要区分"奖励通道在 WBC 空间里的信号"和
         # "部署时 VLA 空间的 token 喂给 WBC"两件事）；缺省时与 BC 源相同。
         self.wbc_chunk_source = wbc_chunk_source or port_source
+        # 环内 token（hold builder + 仿真 anchor）：非 None 时 burn-in 与 GT 臂都用它，
+        # 侧车源只作回退（交接文档 §5.3）。
+        self.online_tokens = online_tokens
         self.batch_size = int(batch_size)
         self.horizon = int(horizon)
         self.token_horizon = int(token_horizon)
@@ -439,6 +443,7 @@ class BurnInBatchProvider:
             bi = sample_burnin(
                 self.bundle, self.library, frames,
                 port_tokens=self.port_frame_source,
+                token_fn=(self.online_tokens if self.online_tokens is not None else None),
                 horizon=self.horizon, k=self.burnin_steps,
                 generator=self.rng,
                 perturb=self.perturb, **self.p,
@@ -453,7 +458,12 @@ class BurnInBatchProvider:
         base.xi = bi.xi
         base.teacher_states = bi.teacher_states
         base.port_tokens = port_chunk
-        base.wbc_tokens = self.wbc_chunk_source(frames)
+        if self.online_tokens is not None:
+            # GT 臂：整段用 burn-in 结束时的机器人 root 算 token（= 部署时一次查询出整段）
+            _idx = frames[:, None] + torch.arange(self.token_horizon, device=frames.device)[None, :]
+            base.wbc_tokens = self.online_tokens.chunk(_idx, robot_quat=bi.state[:, 3:7])
+        else:
+            base.wbc_tokens = self.wbc_chunk_source(frames)
         base.burnin = bi
         return base
 
