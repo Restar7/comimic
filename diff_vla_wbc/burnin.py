@@ -50,10 +50,18 @@ class BurnInResult:
 
 
 def _rand(batch: int, device, generator, scale: float) -> torch.Tensor:
-    """U(-scale, scale) ``(B,)``；``generator=None`` 时用全局 RNG。"""
+    """U(-scale, scale) ``(B,)``；``generator=None`` 时用全局 RNG。
+
+    生成器与目标张量可能不同设备（provider 的种子生成器在 CPU 上，为了让同一 seed 在
+    任意设备上给出同一组扰动），所以先按生成器设备采样再搬到目标设备。
+    """
     if scale <= 0:
         return torch.zeros(batch, device=device)
-    u = torch.rand(batch, device=device, generator=generator)
+    dev = torch.device(device)
+    if generator is not None and torch.device(generator.device).type != dev.type:
+        u = torch.rand(batch, device=generator.device, generator=generator).to(dev)
+    else:
+        u = torch.rand(batch, device=dev, generator=generator)
     return (u * 2.0 - 1.0) * float(scale)
 
 

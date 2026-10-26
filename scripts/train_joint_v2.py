@@ -106,7 +106,14 @@ def main() -> int:
     # ---------------- 数据 / 权重 ----------------
     ap.add_argument("--motion", nargs="+", type=Path, default=[HA_MOTION_DIR])
     ap.add_argument("--port-tokens", type=Path, default=HA_PORT_DIR,
-                    help="端口 GT token 侧车目录（RecordedTokenSource 的 port_dir）")
+                    help="端口 GT token 侧车目录（仅 wbc-token-space=port 时用到）")
+    ap.add_argument("--bc-token-space", choices=("label", "port"), default="label",
+                    help="BC 目标的 token 空间。S0.4：npz 的 g1_motion_token_64 与录制 "
+                         "encoder_latent 逐位相等，是 VLA 的原生空间 -> 默认 label；"
+                         "port 只用于复现旧行为")
+    ap.add_argument("--wbc-token-space", choices=("label", "port"), default="port",
+                    help="冻结 WBC 的训练空间（burn-in 的 conditioning 必须用它）。当前 "
+                         "WBC_v2 是端口空间；S1 用标签空间重训后改成 label")
     ap.add_argument("--motion-packed", type=Path, default=PACKED_MOTION)
     ap.add_argument("--wbc-ckpt", type=Path, default=WBC_V2_CKPT,
                     help="冻结的 WBC（必须带 robot_spec；默认 WBC_v2 = ckpt_016000_spec.pt）")
@@ -229,15 +236,28 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 端口 token 两个源
     lib = bundle.library
+    _tdir = args.motion[0] if args.motion[0].is_dir() else args.motion[0].parent
     port_chunk_src = RecordedTokenSource(
-        args.motion[0], lib, token_horizon=40, token_dim=64, device=device,
-        port_dir=args.port_tokens,
+        _tdir, lib, token_horizon=40, token_dim=64, device=device,
+        port_dir=args.port_tokens, token_space=args.bc_token_space,
     )
     port_frame_src = RecordedTokenSource(
-        args.motion[0], lib, token_horizon=1, token_dim=64, device=device,
-        port_dir=args.port_tokens,
+        _tdir, lib, token_horizon=1, token_dim=64, device=device,
+        port_dir=args.port_tokens, token_space=args.wbc_token_space,
     )
-    print(f"[info] port token 目录 = {port_chunk_src.port_dir}", flush=True)
+    _space_mismatch = args.bc_token_space != args.wbc_token_space
+    print(
+        f"[AUDIT][token-space] bc={args.bc_token_space} wbc={args.wbc_token_space} "
+        f"mismatch={_space_mismatch} port_dir={args.port_tokens} "
+        f"(S0.4: 标签==录制 encoder_latent；端口装配 corr=0.057 已退役)",
+        flush=True,
+    )
+    if _space_mismatch:
+        print(
+            "[warn] BC 空间 != WBC 训练空间：奖励分支的梯度跨了两套 token 空间，物理意义不成立"
+            "（W5）。本轮必须 lambda_r=0（纯 BC 对照臂），等 S1 用标签空间重训 WBC 后再开 lambda_r。",
+            flush=True,
+        )
 
     def port_chunk(frames):  # noqa: ANN001  (B,) -> (B,40,64)
         return port_chunk_src({"frames": frames})
@@ -387,6 +407,10 @@ def main() -> int:
         "freeze_gate": bool(frozen_ok),
         "fm_steps": int(args.fm_steps),
         "decode": "codec",
+        "bc_token_space": args.bc_token_space,
+        "wbc_token_space": args.wbc_token_space,
+        "token_space_mismatch": bool(_space_mismatch),
+        "reward_branch_valid": bool((not _space_mismatch) and float(args.lambda_r) > 0),
         "lambda_r": float(args.lambda_r),
         "lambda_bc": float(args.lambda_bc),
         "horizon": int(args.horizon),

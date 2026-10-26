@@ -57,10 +57,33 @@ def gate_freeze(bundle, source_ckpt, trainer, batch, *, log: Callable = print) -
     wbc_train = bool(bundle.policy.training)
     wm_train = bool(bundle.wm.training)
 
-    trainer.train_step(batch)
+    # 注意：train_step 末尾会 zero_grad，所以这里自己做一次前向/反传，在 step 之前检查。
+    from .fm_bc import bc_target, fm_bc_loss, sample_once_with_grad  # noqa: PLC0415
+
+    cfg = trainer.cfg
+    trainer.head_mode()
+    act_in, bb_out = trainer._backbone_output(batch.model_inputs)
+    head = trainer.vlm.action_head
+    x_norm = sample_once_with_grad(
+        head, bb_out, act_in,
+        initial_noise=torch.randn(
+            int(act_in["state"].shape[0]), int(head.action_horizon), int(head.action_dim),
+            device=trainer.device, dtype=head.dtype),
+        num_steps=cfg.fm_steps, grad_backend=cfg.grad_backend,
+        truncated_tail=cfg.fm_truncated_tail,
+    )
+    tokens = trainer.codec.decode(x_norm)[..., :64]
+    ro = trainer._rollout(batch, tokens)
+    loss_r = -discounted_return(ro, cfg.gamma).mean()
+    tgt, mask = bc_target(
+        trainer.codec, batch.port_tokens, batch.hand_ref,
+        head_dim=int(head.action_dim), dtype=head.dtype, device=trainer.device)
+    loss_bc = fm_bc_loss(head, bb_out, act_in, tgt, mask)
+    (cfg.lambda_bc * loss_bc + cfg.lambda_r * loss_r).backward()
     wbc_grads = [n for n, p in bundle.policy.named_parameters() if p.grad is not None]
     wm_grads = [n for n, p in bundle.wm.named_parameters() if p.grad is not None]
     head_grads = sum(1 for p in trainer.fm_parameters if p.grad is not None)
+    trainer.optimizer.zero_grad(set_to_none=True)
     ok = pi_ok and wbc_req == 0 and wm_req == 0 and not wbc_grads and not wm_grads and head_grads > 0
     print(f"[GATE][freeze] {'PASS' if ok else 'FAIL'} pi_identical={pi_ok} "
           f"wbc_requires_grad={wbc_req} wm_requires_grad={wm_req} "
@@ -87,7 +110,8 @@ def gate_burnin(trainer, provider, ref_provider, *, n_batches: int = 4) -> dict:
     frames_match = True
     for _ in range(n_batches):
         b_burn = provider.sample()
-        b_ref = ref_provider.sample()
+        # 同一批帧上重建"参考起点"（否则两边的帧不同，比较没有意义）
+        b_ref = ref_provider.sample(b_burn.frames)
         frames_match = frames_match and torch.equal(b_burn.frames, b_ref.frames)
         for tag, b in (("ref", b_ref), ("burn", b_burn)):
             ro = trainer._rollout(b, b.port_tokens)
@@ -125,7 +149,12 @@ def gate_burnin(trainer, provider, ref_provider, *, n_batches: int = 4) -> dict:
 
 def gate_fm_bc(trainer, batch, *, log: Callable = print) -> dict:
     """D：FM-BC 损失与梯度比（真实 batch，一次前向+反向）。"""
-    m = trainer.train_step(batch)
+    old_every = trainer.cfg.grad_ratio_every
+    trainer.cfg.grad_ratio_every = 1          # 门禁必须真的看到梯度比
+    try:
+        m = trainer.train_step(batch)
+    finally:
+        trainer.cfg.grad_ratio_every = old_every
     loss_bc = m.get("loss/fm_bc", float("nan"))
     loss_r = m.get("loss/reward_norm", float("nan"))
     ratio = m.get("grad_ratio", float("nan"))

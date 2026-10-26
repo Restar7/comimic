@@ -209,6 +209,35 @@ class JointTrainerV2:
         out_of_range = self.codec.out_of_range_frac(x_norm)
 
         # ---------- (1) 奖励项（§3.5 归一化回报）----------
+        # λ_r = λ_s = λ_a = 0 时（纯 BC 对照臂）不需要想象 rollout：省一半时间，
+        # 也避免把"两套 token 空间"的回报当读数（S0.4 之后 port≠label）。
+        _needs_rollout = (cfg.lambda_r > 0 or cfg.lambda_s > 0 or cfg.lambda_a > 0)
+        if not _needs_rollout:
+            loss_bc_only = fm_bc_loss(
+                self.vlm.action_head, bb_out, act_in,
+                *bc_target(
+                    self.codec, batch.port_tokens, batch.hand_ref,
+                    head_dim=int(self.vlm.action_head.action_dim),
+                    dtype=self.vlm.action_head.dtype, device=self.device,
+                ),
+            )
+            accum0 = max(1, int(cfg.grad_accum))
+            self._accum_count += 1
+            if self._accum_count == 1:
+                self.optimizer.zero_grad(set_to_none=True)
+            (cfg.lambda_bc * loss_bc_only / accum0).backward()
+            if self._accum_count >= accum0:
+                torch.nn.utils.clip_grad_norm_(self.fm_parameters, cfg.fm_clip)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self._accum_count = 0
+            self.steps += 1
+            return {
+                "loss": float((cfg.lambda_bc * loss_bc_only).detach()),
+                "loss/fm_bc": float(loss_bc_only.detach()),
+                "codec/out_of_range": float(out_of_range),
+                "rollout/skipped": 1.0,
+            }
         rollout = self._rollout(batch, tokens)
         ret = discounted_return(rollout, cfg.gamma)
         ret_norm = ret / (cfg.horizon * float(_MAX_STEP_REWARD))
@@ -397,8 +426,9 @@ class BurnInBatchProvider:
         """帧级端口 GT token ``(B,64)``（burn-in 的 conditioning）。"""
         return self.port_frame_source(frames)
 
-    def sample(self) -> MotionBatch:
-        base = self.inner.sample()
+    def sample(self, frames: torch.Tensor | None = None) -> MotionBatch:
+        """采一个 batch；``frames`` 给定时在**同一批帧**上重建起点（门禁对拍用）。"""
+        base = self.inner.sample(frames)
         frames = base.frames
         port_chunk = self.port_source(frames)
         if self.burnin and self.burnin_steps > 0:

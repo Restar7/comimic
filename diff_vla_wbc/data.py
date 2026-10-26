@@ -237,6 +237,7 @@ class RecordedTokenSource:
         token_dim: int = 64,
         device: str | torch.device = "cuda",
         port_dir: str | Path | None = None,
+        token_space: str = "auto",
     ) -> None:
         import bisect
 
@@ -245,7 +246,17 @@ class RecordedTokenSource:
         self.horizon = int(token_horizon)
         self.token_dim = int(token_dim)
         self.device = torch.device(device)
-        # ---- token 空间口径（2026-10-25）----------------------------------------
+        # ---- token 空间口径（2026-10-26 S0.4 修订）--------------------------------
+        # S0.4 实测：npz 的 ``g1_motion_token_64`` 与录制 ``encoder_latent`` **逐位相等**
+        # （MSE=0），而我们的端口装配与它 MSE=0.085 / corr=0.057 —— 也就是说
+        # **标签空间才是 VLA 的原生空间**，端口侧车是错的。
+        #   token_space="label"：强制读 npz 标签（S3 的 BC 目标必须用这个）
+        #   token_space="port" ：强制读端口侧车（WBC 的训练空间；burn-in 用）
+        #   token_space="auto" ：旧行为（有侧车就优先侧车）
+        self.token_space = str(token_space).lower()
+        if self.token_space not in ("auto", "label", "port"):
+            raise ValueError(f"token_space must be auto/label/port, got {token_space}")
+        # ---- 端口 token 的历史口径（保留，仅供 WBC 空间的 burn-in / A/B）-----------
         # HA npz 里的 ``g1_motion_token_64`` 来自部署侧 ``encoder_input (1762)`` 前端，而
         # trackerlab WBC 的条件空间是 640 维端口装配（未来 10 帧参考 + anchor）。实测（
         # ``scripts/probe_port_tokens.py``，动作尺度修好之后）端口 token 明显更好：
@@ -269,7 +280,11 @@ class RecordedTokenSource:
 
     def _load_token(self, name: str) -> torch.Tensor:
         port = self.port_dir / f"{name}.npy"
-        if port.is_file():
+        if self.token_space == "label":
+            port = None            # 强制走 npz 标签
+        if port is not None and not port.is_file() and self.token_space == "port":
+            raise FileNotFoundError(f"{port}: token_space=port 但端口侧车缺失")
+        if port is not None and port.is_file():
             tok = torch.as_tensor(np.load(port), dtype=torch.float32)
             self.port_used += 1
             return tok
@@ -338,13 +353,17 @@ class MotionBatchProvider:
         if seed is not None:
             self.rng.manual_seed(seed)
 
-    def sample(self) -> MotionBatch:
+    def sample(self, frames: torch.Tensor | None = None) -> MotionBatch:
+        """采样一个 batch；``frames`` 给定时用给定帧（burn-in 门禁要对比"同一批帧"）。"""
         max_start = self.library.num_frames - self.horizon - 2
         if max_start <= HISTORY:
             raise ValueError("motion library is shorter than the observation/rollout horizon")
-        frames = torch.randint(
-            HISTORY, max_start, (self.batch_size,), generator=self.rng, dtype=torch.long
-        ).to(self.bundle.device)
+        if frames is None:
+            frames = torch.randint(
+                HISTORY, max_start, (self.batch_size,), generator=self.rng, dtype=torch.long
+            )
+        frames = torch.as_tensor(frames, dtype=torch.long).to(self.bundle.device)
+        bs = int(frames.shape[0])
         start = self.bundle.reference_start(self.library, frames)
         refs = self.bundle.teacher_references(self.library, frames, self.horizon)
         # Token route (the VLA's own 64-d token IS the conditioning): there is no 680-d motion
@@ -378,18 +397,18 @@ class MotionBatchProvider:
             tokens = self.token_source(meta)
         else:
             tokens = torch.randn(
-                self.batch_size,
+                bs,
                 self.token_horizon,
                 self.token_dim,
                 device=self.bundle.device,
             )
-        if tokens.ndim != 3 or tokens.shape[0] != self.batch_size:
+        if tokens.ndim != 3 or tokens.shape[0] != bs:
             raise ValueError(f"token source returned {tuple(tokens.shape)}")
         hand_ref = None
         if self.hand_dir is not None:
             import bisect
 
-            hz = torch.zeros(self.batch_size, self.token_horizon, 14)
+            hz = torch.zeros(bs, self.token_horizon, 14)
             for i, f in enumerate(frames.detach().cpu().tolist()):
                 ci = max(bisect.bisect_right(self._hand_starts, int(f)) - 1, 0)
                 name = self._hand_names[ci]
