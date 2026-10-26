@@ -352,3 +352,21 @@ VLA=runs/s3_v2_bc/vla_final.pt WITH_BASE=1 bash scripts/mini_closedloop_v2.sh
 - B3（λ_r=0.3）证明了**跨口径开奖励**会发生什么（回报 +38%、token 偏离 14 倍、手塌成 0）——
   这个现象本身就是交接文档 §2 那条"两套 token corr 0.05"的行为学证据。
 
+### 10.6 hold WBC **定版权重**（it 18500）上的 S3 门禁：5/5 PASS
+
+`logs/wbc_hold_x20/ckpt_018500.pt`（obs93 / explicit_dt0.02 / robot_spec ✓ / 库 `bones_seed_plus_ha_cmd_x20.pt`），
+`runs/s3_gates_hold18500/gates.json`（32 窗口，λ_r=0.3）：
+
+```
+[GATE][codec]     PASS 1.19e-07
+[GATE][freeze]    PASS pi 逐张量相等；wbc/wm 反传后 0 梯度；head 537
+[GATE][burnin]    PASS ref 0.08982 → burn 0.08865  survival 0.9999  start_xy 5.3cm
+[GATE][contrast]  PASS gt_wbc=1.34439 gt_bc=1.32656 zeros=0.95434 randn=-1.06047
+                        wbc-space +0.39006 (+29.0%) t=19.63 win=100%
+                        bc-space  +0.37223        t=18.76 win=100%
+[GATE][fm-bc]     PASS rollout_reward=0.08176 survival=0.9995 grad_ratio=0.2735
+```
+
+⇒ **S3 侧已就绪**，只待 S1 对同一 ckpt 出三格门禁（HA-699 / BONES-500 / WM 速度）与闭环环境。
+注意该 ckpt `freeze_wm=False`（WM 共训过）⇒ 速度门禁必须重测；`eval_wm_velocity.py` 记得
+`--tokens label`，且 `--packed` 要指 `ha_cmd` 才是同口径。
