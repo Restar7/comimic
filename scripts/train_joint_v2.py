@@ -356,7 +356,30 @@ def main() -> int:
         print(f"[v3] real transitions: {tuple(_real['states'].shape)} from {args.real_transitions}", flush=True)
     elif args.start_source == "recorded" or args.wm_refresh_every > 0:
         raise SystemExit(f"[fail] 需要 {args.real_transitions}；先跑 scripts/build_real_transitions.py")
-    _recorded_states = _real["states"].to(device) if _real is not None else None
+    _recorded_states = None
+    if _real is not None:
+        # ★ 帧号对齐（2026-10-26 修）：transitions 里一行 = 一个**转移**，每个 clip 的最后一帧
+        # 没有后继转移，所以 634016 帧只有 633317 行。直接拿帧号去索引 → 越界
+        # （CUDA device-side assert，A0/A1 在 step 140 就是这么崩的），而且不崩时也会读到
+        # 别的 clip 的状态（起点是错的）。这里用 transitions 自带的 `frames` 建一张
+        # 帧 → 行 的表，把缺失的那 699 帧（每 clip 末帧）用**同 clip 的上一帧**顶上。
+        _n_frames = int(lib.num_frames)
+        _fr = _real["frames"].long()
+        if int(_fr.max()) >= _n_frames:
+            raise SystemExit(f"[fail] transitions 的 frames 最大 {int(_fr.max())} ≥ 库帧数 {_n_frames}")
+        _map = torch.full((_n_frames,), -1, dtype=torch.long)
+        _map[_fr] = torch.arange(_fr.numel())
+        _miss = (_map < 0).nonzero(as_tuple=False).flatten()
+        if _miss.numel():
+            _map[_miss] = _map[(_miss - 1).clamp(min=0)]
+        if int((_map < 0).sum()):
+            raise SystemExit(f"[fail] real transitions 有 {int((_map < 0).sum())} 帧无法对齐（frames 缺失）")
+        _recorded_states = _real["states"][_map].to(device)
+        print(
+            f"[v3] recorded_states 按帧对齐: {tuple(_recorded_states.shape)} "
+            f"（原始转移 {tuple(_real['states'].shape)}，补 {int(_miss.numel())} 帧 = 每 clip 末帧）",
+            flush=True,
+        )
 
     from diff_vla_wbc.dr import DRConfig, estimate_ranges  # noqa: PLC0415
 
@@ -546,6 +569,20 @@ def main() -> int:
         )
         trainer = JointTrainerV3(bundle, vlm, codec, cfg=cfg, v3=v3cfg, device=device)
         (out / "v3_config.json").write_text(json.dumps(v3cfg.__dict__, indent=1, default=str))
+        # 口径的一行真相：token 监督 / 手部 / 锚定 / DR 分桶 / critic 自举 / WM 保鲜
+        _pn, _pm = float(args.dr_p_nominal), float(args.dr_p_mid)
+        print(
+            f"[AUDIT][v3] token_BC=OFF hand_mask=64:78 lam_hand={args.lambda_hand} "
+            f"lam_r={args.lambda_r} anchor={args.anchor_weight} "
+            f"dr={bool(args.dr)} buckets={_pn:.2f}/{_pm:.2f}/{max(0.0, 1-_pn-_pm):.2f} "
+            f"dr_max(xy,yaw,dq,dqd)=({args.dr_xy_max},{args.dr_yaw_max},{args.dr_dq_max},{args.dr_dqd_max}) "
+            f"start={args.start_source} burnin={0 if args.no_burnin else args.burnin_steps} "
+            f"push=({args.push_std},{args.push_ang}) "
+            f"critic={args.critic} lam={args.lam} gamma^H={args.gamma ** args.horizon:.4f} "
+            f"wm_refresh_every={args.wm_refresh_every} clip_head={args.clip_head} "
+            f"H={args.horizon} K={args.fm_steps} batch={args.batch_size} accum={args.grad_accum}",
+            flush=True,
+        )
     else:
         trainer = JointTrainerV2(bundle, vlm, codec, cfg=cfg, device=device)
     (out / "v2_config.json").write_text(json.dumps(cfg.__dict__, indent=1))

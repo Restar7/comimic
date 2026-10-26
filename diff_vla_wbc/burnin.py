@@ -172,6 +172,14 @@ def sample_burnin(
 
     # 2) 参考状态 + 参考历史（在 f0 处），然后加扰动
     if recorded_states is not None:
+        # fail-fast：必须是**按帧**索引（num_frames 行）。按转移行传来会静默读错行，
+        # 并在尾帧越界成 CUDA device-side assert（2026-10-26 A0/A1 崩因）。
+        _n = int(getattr(motion, "num_frames", -1))
+        if _n > 0 and int(recorded_states.shape[0]) != _n:
+            raise ValueError(
+                f"recorded_states 有 {int(recorded_states.shape[0])} 行，但 motion library 有 {_n} 帧；"
+                "它必须按**帧**索引。用 transitions 的 `frames` 字段建 帧→行 映射后再传"
+            )
         # ★ v3：起点用**真录制机器人状态**（部署口径），历史也用真状态 + 命令推出的 a_prev 重建
         clip_first64 = motion.clip_start[motion.clip_id[f0]].to(f0.device)
         hrows = torch.clamp(
