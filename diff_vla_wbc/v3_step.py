@@ -144,8 +144,10 @@ class JointTrainerV3(JointTrainerV2):
         loss_anchor = None
         if v3.anchor_weight > 0:
             with torch.no_grad():
-                prior = batch.port_tokens[:, :H].to(tokens.dtype)     # 底模先验代理（≈标签）
-            loss_anchor = torch.nn.functional.mse_loss(tokens.float(), prior.float())
+                prior = batch.port_tokens.to(tokens.dtype)            # 底模先验代理（≈标签）
+            n_anchor = min(int(tokens.shape[1]), int(prior.shape[1]))
+            loss_anchor = torch.nn.functional.mse_loss(
+                tokens[:, :n_anchor].float(), prior[:, :n_anchor].float())
             loss = loss + v3.anchor_weight * loss_anchor
         if loss_hand is not None:
             loss = loss + v3.lambda_hand * loss_hand
