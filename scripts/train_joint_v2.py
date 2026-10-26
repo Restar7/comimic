@@ -219,6 +219,9 @@ def main() -> int:
     ap.add_argument("--ensemble", dest="ensemble", action="store_true", default=False,
                     help="用已有的多个 WM 做集成分歧（--lambda-u>0 时生效）")
     ap.add_argument("--ensemble-ckpts", nargs="*", type=Path, default=None)
+    ap.add_argument("--obs-noise", type=float, default=0.0,
+                    help="观测层 DR：给 VLA 输入的**本体感觉**通道（腿/腰/臂的 q）加 ±noise rad 均匀噪声；"
+                         "不动 hand / projected_gravity 通道。0 = 关")
     ap.add_argument("--clip-head", type=float, default=10.0,
                     help="VLA head 的梯度范数裁剪阈值（只做防尖峰；Adam/AdamW 下全局缩放近似无效果，"
                          "实测 pre-clip 范数 4–9，所以默认 10）")
@@ -478,10 +481,41 @@ def main() -> int:
     )
 
     # ---------------------------------------------------------------- CPU 预处理（缓存 + 预取）
+    class _NoisyBuilder:
+        """观测层 DR：只给本体感觉通道加噪（rad），不动 hand / gravity。"""
+
+        GROUPS = ("left_leg", "right_leg", "waist", "left_arm", "right_arm")
+
+        def __init__(self, inner, std: float, seed: int = 0):
+            self.inner = inner
+            self.std = float(std)
+            self.g = torch.Generator(device="cpu")
+            self.g.manual_seed(int(seed))
+
+        def build(self, frames):  # noqa: ANN001
+            obs = self.inner.build(frames)
+            if self.std > 0:
+                for k in self.GROUPS:
+                    key = f"state.{k}"
+                    if key in obs:
+                        arr = obs[key]
+                        n = torch.rand(arr.shape, generator=self.g) * 2.0 - 1.0
+                        obs[key] = (arr + (n.numpy() * self.std)).astype(arr.dtype)
+            return obs
+
+    _obs_builder = _NoisyBuilder(builder, args.obs_noise, seed=int(args.seed)) if args.obs_noise > 0 else builder
+    if args.obs_noise > 0:
+        print(f"[AUDIT][dr][obs] += U(±{args.obs_noise}) rad on {list(_NoisyBuilder.GROUPS)} (裸 46 维状态)", flush=True)
+
     def _processed(frames):  # noqa: ANN001
+        return processed_batch(processor, _obs_builder, frames)
+
+    def _processed_clean(frames):  # noqa: ANN001
+        """评测用干净观测（跨步可比；观测 DR 只作用于训练）。"""
         return processed_batch(processor, builder, frames)
 
     memo = StepMemo(_processed)
+    memo_eval = StepMemo(_processed_clean)
     prefetch = BatchPrefetcher(_processed, enabled=bool(args.prefetch_vla))
     print(f"[prefetch] enabled={prefetch.enabled}", flush=True)
 
@@ -563,7 +597,7 @@ def main() -> int:
 
     def run_eval(step: int) -> dict:
         for b in eval_batches:
-            b.model_inputs = memo.get(b.frames)
+            b.model_inputs = memo_eval.get(b.frames)
         _live_wm = bundle.wm
         try:
             bundle.wm = _eval_wm
@@ -648,7 +682,7 @@ def main() -> int:
         "token_space_mismatch": bool(_space_mismatch),
         "v3": bool(args.v3), "lambda_hand": float(args.lambda_hand),
         "push_std": float(args.push_std), "push_ang": float(args.push_ang),
-        "clip_head": float(args.clip_head), "start_source": str(args.start_source),
+        "clip_head": float(args.clip_head), "obs_noise": float(args.obs_noise), "start_source": str(args.start_source),
         "wm_refresh_every": int(args.wm_refresh_every),
         "wbc_token_window": str(args.wbc_token_window),
         "wbc_token_source": str(args.wbc_token_source),
