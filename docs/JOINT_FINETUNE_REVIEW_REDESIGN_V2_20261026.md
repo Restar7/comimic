@@ -401,3 +401,229 @@ L_fm = vlm.action_head(BatchFeature(dict(bb_out)), act_bc)["loss"]
 [S2]   stats 覆盖=yes/no  held-out MSE(官方→aligned)=?→?  B 臂闭环: ...
 [S3.x] λ_r=?  grad_ratio=?  L_fm(val)=?  mini 闭环: ...
 ```
+
+---
+
+# 附录 A：执行反馈（2026-10-26，S0 已完成）
+
+> 本附录是**执行侧的回填**：S0 审计的实测结果、对 S1/S2/S3 的具体影响、以及各阶段当前状态。
+> 详细探针记录见 `docs/S0_AUDIT_REPORT_20261026.md`。
+
+## A.1 S0 五项的实测回报（按 §6 模板）
+
+```
+[S0.1] HA_ALIGN 训练真值=1（launcher 日志）  default_q(knee/ankle/elbow)=0.420/−0.230/0.870
+       action_scale mean/max=0.3789/0.7500
+       joint 进程实测: HA_ALIGN=1（已锁） 是否一致=是 → [AUDIT][spec] robot_spec 对齐 PASS
+       ⏳ probe(HA spec vs ones) 尚未重跑（要 GPU）
+[S0.2] use_percentiles=True  clip_outliers=True
+       motion_token 原始范围=[−0.6875, 0.6250]（逐维）｜hand 原始范围=±1.740
+       codec 单测=PASS（decode vs processor.decode_action: max|Δ|=1.19e-07）
+       官方 ckpt 手指 max(decode 前/后)=待对照｜>1.70 比例(前/后/标签)=0 / 0 / 0.020
+       实跑 tok_absmean=0.132（录制 latent 0.127）→ decode 生效
+[S0.4] encoder_index(cols1:4)=0,0,0（录制帧）｜判定：**标签空间 = encoder latent（逐位相等）**
+       端口 token vs 标签: MSE=0.0854, corr=0.0568 → **端口装配错**
+       字段布局：encoder_input[4:584]=10×58 参考 qdq；[595:655]=anchor 窗口（与 encoder_anchor_window Δ=0）
+[S1.x] 未开始（等 builder 修好）
+[S2]   未开始；**依据 S0.4 降级为可选**
+[S3.x] 未开始
+```
+
+## A.2 对 S1/S2/S3 的影响（相对 §3/§4 的增量）
+
+### A.2.1 新增依赖链（顺序不可乱）
+```
+S0 ✅
+ └─> 0. 修 pin（否则闭环数字不可用）
+       └─> 1. 修 builder：SonicTokenBuilder 在 HA 上复现 encoder_latent（逐位）
+             ├─ 失败 → 走路线 II（重标端口 + VLA 微调）→ S2 恢复原样
+             └─ 成功 → 2. S1：WBC 用"修好的 builder + HA 标签 token"混合库重训
+                       └─> 3. O1 门禁（GT 标签 token 回放）
+                             ├─ 不过 → 回 S1 加码
+                             └─ 过 → 4. S3 v2（FM-BC + decode + K=4 + H=16 + 冻结）
+```
+
+### A.2.2 S1（WBC 训练线）
+| 项 | 变化 |
+|---|---|
+| spec | ✅ 每个 ckpt 必须写 `robot_spec`（工具：`scripts/stamp_robot_spec.py`）+ `wm_integration` |
+| **token 源** | ❗新增硬前置：**builder 必须先修**；修好前只做"HA-only 标签 token"版（699 条），BONES-SEED 暂不参与 |
+| 数据 | 混合库不变；HA 部分**必须用标签 token**（npz 的 `g1_motion_token_64`） |
+| 门禁 | O1 改成 **GT 标签 token 回放**（不是端口 token） |
+
+### A.2.3 S2（base_aligned）—— 降级为可选
+| 原计划 | 现在 |
+|---|---|
+| 重标 `action.motion_token` → 端口 token，重算 stats，官方 GR00T 4–8k 步微调 | ❌ **不需要**：标签本来就是 encoder latent，VLA 已在该空间 |
+| base_aligned 作为 A1 对照臂 | ✅ **官方 checkpoint-8000 + decode + 修好的 WBC** 即合法 base 臂 |
+| 收益 | 省掉重标脚本 + stats + 1–2 天微调 |
+| 代价 | ft 臂必须建立在"修好的 builder"上，否则两臂仍不同空间 |
+
+> builder 修不出来 → 退回复核路线 II（S2 恢复原样，VLA 需重标重训）。
+
+### A.2.4 S3（联合微调 v2）
+沿用 §3.5，但明确八项：
+1. 采样后 **`codec.decode()` 再喂 WBC**；
+2. 监督改 **FM-BC**（`codec.encode(标签 token ⊕ 手部标签)`，归一化目标），删掉 sample-MSE 的 anchor/hand 主项；
+3. K=4（训练=部署）；
+4. burn-in 起点（扰动 + WBC 自走 K 步）；
+5. H=16；
+6. WBC 与 WM **完全冻结**；
+7. 锚定目标改 **标签 token**（npz），不是端口侧车；
+8. `--action-scale` 在 **HA spec** 下重测 {ones, spec}；奖励核不改，归一化回报 + 梯度比 0.1–0.5；按闭环选 ckpt。
+
+## A.3 各阶段当前状态
+
+| 阶段 | 状态 | 已完成 | 待做 |
+|---|---|---|---|
+| **S0 审计** | ✅ 完成 5/5 | spec / codec / fm_steps / token 根因 / 多卡 seed | `--decode none` 对照（被 pin 阻塞）、spec 下重跑 `probe_action_decomp`、2 卡 seed smoke |
+| **0. 修 pin** | 🔴 阻塞 | 已定位：`sim_eval_vla.py` 08:01 被外部改动（仓库未纳入 git，无法审查） | 确认改动意图；有意则 `pin_ha_closedloop.py --write`，否则回滚 |
+| **1. 修 builder** | ⬜ 未开始 | S0.4 已给出布局证据（anchor 段 Δ=0；qdq 段 Δ=0.167） | 对齐帧步长/顺序 → HA 上逐位复现 `encoder_latent` |
+| **S1 WBC 重训** | ⬜ 未开始（等 builder） | spec 工具、混合库配方（`PLAN §8`） | 混合库 + HA×20/40 + 显式积分 + `MAX_EPISODE_STEPS=0` + spec 落盘 |
+| **S2 base_aligned** | 🟡 降级为可选 | — | 仅当 builder 修不出来才执行 |
+| **S3 联合 v2** | ⬜ 未开始 | 代码骨架（`train_joint.py` 可复制为 v2） | 按 A.2.4 八项改；先跑 λ_r=0 的 BC 对照臂 |
+| **A1 正式表** | ⬜ 未开始 | 五臂设计（O1/O2/R/B/F） | 等 S1/S3 |
+
+## A.4 已落地的 S0 代码/产物（可直接复用）
+
+| 产物 | 路径 | 作用 |
+|---|---|---|
+| spec 戳 + 断言 | `scripts/stamp_robot_spec.py`、`diff_vla_wbc/isaac_joint.py`、`scripts/train_joint.py` 顶部 env 锁 | J1 |
+| 可微归一化 codec | `diff_vla_wbc/action_codec.py`（`python -m diff_vla_wbc.action_codec` 自测） | J2 |
+| 服务端 decode 开关 | `scripts/ha_vla_latent64_server.py --decode {codec,none}` + 审计行 | J2 |
+| FM 步数一致性 | `vla_*.pt` 的 `fm_steps`、`export_vla_ckpt` 的 `vla_meta.json`、服务端校验 | J3 |
+| 带 spec 的 WBC | `trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint_spec.pt`（+`.spec.json`） | S1/S3 直接可用 |
+| 多卡 seed | `train_joint.py` 的 `seed + 1000*rank` | J6 |
+
+## A.5 旧数字的处理（重要）
+
+- 旧 ft ckpt（`anchor4000`、`vla2000`）是在**未 decode** 的 token 上评测的 → **作废**；
+- 按复核 §5.7：这些 ckpt 只能用 `--decode none` 复现旧结果，**不得与新口径混表**；
+- pin 修好前的闭环数字同样不得与 07:4x 之前混表。
+
+## A.6 S2 判定：**退役**（不是"可选"）—— 标签 token 已在环逐位复现
+
+> 执行反馈。判据：`docs/S2_BASE_ALIGNED_PLAN_20261026.md` v2 +
+> `runs/S2_gates/g0b_token_reproduction.json`（探针 `scripts/probe_token_reproduction.py`）。
+
+A.2.3 把 S2 降级成"仅当 builder 修不出来才执行"。**这个触发条件已经有答案：builder 修得出来，
+只差三处口径。** 用 `G1MotionEncoder`（权重取自部署 ONNX，另有 pytest 与 onnxruntime 逐位对拍）
+实测 4 条 clip：
+
+| 实验 | 做法 | 结果 |
+|---|---|---|
+| **A** | 录制 `encoder_input` 的 `[4:584]`+`[601:661]` → encoder | 与 `encoder_latent` **exact_frac = 1.0000**（个别帧差 1 个 FSQ 格 6.2e-2） |
+| **B** | 拆 command 的 580 维 | 布局 = **字段主序** `[pos×10, vel×10]`；10 份 pos 全 = `human_joint_pos[t]`（**当前**参考帧）、10 份 vel 全 = 当前参考速度；anchor 60 维 = 10 份同一个**在环相对朝向**，且**就是 `consumed_anchor_rot6d`**（mean|Δ| ≤1e-4；用它重建 token 的 exact 0.9996–0.9999） |
+| **C** | 只用"当前参考帧×10 + anchor×10"重建 | 与 `encoder_latent` **exact_frac = 1.0000** ⇒ **训练环里可复现** |
+| **D** | 端口口径（未来 10 帧升序 + `PERM_MJCF_TO_ISAACLAB` + 恒等 anchor） | exact ≈ 0.09–0.12；与端口侧车的 corr(侧车, label) = 0.057–0.192 完全对应 |
+
+⇒ **判定**：
+1. **S2 退役**（重标端口 + VLA 微调没有收益）。标签空间才是 VLA 的原生空间，WBC 侧复现它只要
+   "当前帧复制 10 份 + 不置换关节 + 用仿真机器人朝向算 anchor"；
+2. 端口侧车（`data/port_tokens` / `build_port_tokens.py` / `SonicTokenBuilder` 的窗口·置换·anchor 三处）
+   **退役**；`scripts/relabel_sessions_port.py`、`data/ha_sessions_port/`、`scripts/launch_ha_port_6000.sh`
+   **保留为唯一 fallback**（触发条件见 S2 v2 §3），**不跑**；
+3. **给 S1/S3 的两条硬约束**：
+   - 在环 token = **当前帧复制**（不是未来窗口）；HA 数据**不做** `PERM_MJCF_TO_ISAACLAB`（BONES 需另测，
+     按数据源分开）；
+   - `diff_vla_wbc/sonic_encoder.py:build_motion_windows` 的 580 维布局是 **per-frame 交错**，与 encoder 的
+     字段主序不符 —— 任何用它产 token 的地方（S3 锚定/探针）必须按字段主序修；
+4. **新发现（landmine）**：`data/ha_sessions` 的 `observation.state` 实际是 **HA_V31（Isaac）序**，而
+   `info.json` 声明的名字是 STANDARD_29 序（会话建于 10-24 05:32；`to_standard(jp_ha, src="ha_v31")` 是
+   10-26 00:15 的 `4adbce1` 才加的）⇒ 现有 VLA 的 state 口径是 HA_V31（与服务端一致，闭环没问题），
+   但**重跑 `prepare_ha_sessions.py` 会静默换成 STANDARD 序**，重跑前必须先定口径。
+
+---
+
+# 附录 B：修 pin + 修 builder 的执行结果（2026-10-26）
+
+## B.1 pin ✅ 已修复
+- `sim_eval_vla.py` 在 08:01 的外部改动是**有意的**：新增 `--sm_obs_mode auto`（跟随 ckpt 的
+  `args.obs_mode`）+ 显式 A/B 才放行的越界保护；
+- 已 `pin_ha_closedloop.py --write` 重新固化，`--check` **通过**（7 任务 / 16 资产 / init pose / decoder=release）；
+- 闭环恢复可用；**此前的 pin 阻断解除**。
+
+## B.2 builder：输入布局已破译（100% 可复现），锚点公式仍缺
+
+| 项 | 旧 builder | 实测真值 |
+|---|---|---|
+| q/qd | 未来 10 帧 | **当前参考帧重复 10 次** |
+| anchor | 未来 10 帧各算一个 | **当前锚点 6 维，10 帧恒定** |
+| perm | 对 q/qd 做 MJCF→IsaacLab | **不做** |
+
+- 重建 `[4:584] + [601:661]`（其余置 0）→ ONNX token 与 `encoder_latent` **逐位相等**
+  （`scripts/verify_sonic_encoder_layout.py`，0.9995–1.0 PASS）；
+- 直接把录制 1762 喂 ONNX → Δ=0；
+- **端口 token 与标签 corr 0.057 的根因找到了**：不是"两个前端"，是喂给 encoder 的量错了。
+
+**唯一未解**：`anchor_rot6d` 的计算公式（现有四元数组合最好 Δ=0.34）。HA 录制数据里有现成的
+`consumed_anchor_rot6d`；BONES-SEED 没有 → **混库前必须解出**。
+
+## B.3 对依赖链的更新（替换附录 A 的 A.2.1）
+
+```
+S0 ✅ → pin ✅
+  └─> builder：布局 ✅ / 锚点公式 ⬜
+        ├─ 现在就能做：S1-α = **HA-only 标签 token** 重训（699 条，npz 的 g1_motion_token_64，不需要 builder）
+        └─ 混库（BONES-SEED + HA）需等锚点公式解出 → S1-β
+  └─> S3 v2 依赖 S1-α 的产物；S2 仍为可选
+```
+
+## B.4 新增产物
+| 产物 | 路径 |
+|---|---|
+| encoder 布局文档（含验证方法） | `docs/SONIC_ENCODER_INPUT_LAYOUT.md` |
+| 布局验证脚本 | `scripts/verify_sonic_encoder_layout.py` |
+| 重新固化的 pin | `configs/ha_closedloop_pin.json` |
+
+
+---
+
+# 附录 C：S3 按 S0 结论的修订与执行结果（2026-10-26）
+
+> 执行报告（含全部数字与复现命令）：`docs/S3_JOINT_V2_REPORT_20261026.md`
+> 产物：`runs/s3_gates/gates_label_bc.json`、`runs/s3_v2_bc/`、`runs/s3_v2_lamr03/`、`runs/S3_gates/contrast_*_64.json`
+
+## C.1 对 §3.5 / §4 S3 的修订（只列被 S0 结论改掉的部分）
+
+| 项 | §3.5/§4 原写法 | 修订后 | 依据 |
+|---|---|---|---|
+| BC 目标空间 | 端点 token（§3.3 重标后） | **标签 token = npz `g1_motion_token_64`（=`encoder_latent`）** | S0.4 |
+| burn-in 的 GT conditioning | 端口 GT token | **跟随冻结 WBC 的训练空间**（当前=端口；S1 换标签 WBC 后 `--wbc-token-space label`） | WBC 只在自己训练过的空间里可被条件化 |
+| 两套空间不一致时的 λ_r | 直接扫 {0,0.1,0.3,1.0} | **硬门禁**：`bc != wbc` 且 `λ_r>0` 直接退出（`--allow-token-space-mismatch` 仅诊断） | 本轮实测代价（C.2） |
+| S2 base_aligned | 阶段 A（主要收益来源） | **降级为可选**；官方 ckpt + decode 就是合法 base 臂 | 附录 A.2.3 |
+| 门禁 C2（新增） | 原 §4 没有 | **想象回报对 token 的区分度**，用**配对统计**（t ≥ 3、胜率 ≥ 0.8）；必须分 WBC 空间 / VLA 空间两次报 | 8 窗口版本会给假阴性 |
+
+## C.2 实测（64 窗口，配对检验，冻结 WBC v2 = `wbc_mix2_obs93/ckpt_016000_spec`）
+
+```
+ret  gt_wbc=1.1132  mean=0.9477  shuffled=0.9288  gt_bc=0.7572  zeros=0.7428  randn=-1.0403
+wbc-space contrast = +0.3704 (+33.3%)  paired t=21.4  win=64/64   → 奖励通道有信号
+bc-space  contrast = +0.0144 (+1.9%)   paired t=1.53  win=53%     → 跨空间后信号消失
+```
+⇒ 复核 §0 里"奖励返传救不回行为"的判断要细化成两半：
+**通道本身是好的**（t=21），坏的是**两套 token 空间**（W5/W6）。
+只要 S1 把 WBC 换成标签空间，λ_r 就可以按 §3.5 开；在那之前，λ_r>0 的臂只能当诊断。
+
+## C.3 两条 λ_r 臂（H=16、K=4、batch 4×accum 4、1000 步、固定 64 窗口评测）
+
+| 臂 | λ_r | `L_fm(val)` | decode 后 token MSE | 手闭合率 pred/label | 想象回报 |
+|---|---|---|---|---|---|
+| B0（交付物） | 0 | 0.1365 → 0.0265 | 0.0042 → 0.0051 | 0.102 / 0.114 | 0.732 |
+| B3（诊断，空间冲突） | 0.3 | 0.1365 → 0.0303 | 0.0042 → **0.0598（+14×）** | **0.000** / 0.114 | **1.006（+38%）** |
+
+B3 把"空间不一致时开 λ_r"的代价量化了：想象回报涨 38%，但 token 偏离标签 14 倍、**手部闭合直接塌到 0**
+（奖励只依赖 64 维 token，手部没有任何奖励梯度）。所以 §3.5 的 F 臂**必须**在空间统一之后才做。
+
+## C.4 S3 执行状态（对照 §4 的 S3.1–S3.8）
+
+| 项 | 状态 |
+|---|---|
+| S3.1 新入口 | ✅ `scripts/train_joint_v2.py`（旧 `train_joint.py` 未改） |
+| S3.2 冻结执行器 | ✅ 门禁 `pi` 逐张量相等 + `wbc/wm` 反传后零梯度 |
+| S3.3 单次采样 + FM-BC | ✅ 删除 token_anchor / hand-MSE；L_bc = GR00T 原生 FM |
+| S3.4 burn-in 起点 | ✅ 起点 xy 误差 5.9 cm、survival 0.9997；对比度 +11%（burn-in vs 参考起点） |
+| S3.5 H=16 + 归一化回报 | ✅ |
+| S3.6 batch/accum/梯度比 | ✅ `grad_ratio(λ_r=0.3)=0.133`（落在 0.1–0.5） |
+| S3.7 64 窗口评测 | ✅；mini 闭环脚本就绪但本容器 Isaac 不可用（见报告 §5.1） |
+| S3.8 F vs B 闭环 | ⛔ 前置未满足：等 S1 的标签空间 WBC |
