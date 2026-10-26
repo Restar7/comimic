@@ -627,3 +627,20 @@ B3 把"空间不一致时开 λ_r"的代价量化了：想象回报涨 38%，但
 | S3.6 batch/accum/梯度比 | ✅ `grad_ratio(λ_r=0.3)=0.133`（落在 0.1–0.5） |
 | S3.7 64 窗口评测 | ✅；mini 闭环脚本就绪但本容器 Isaac 不可用（见报告 §5.1） |
 | S3.8 F vs B 闭环 | ⛔ 前置未满足：等 S1 的标签空间 WBC |
+
+## C.5 追加修订（token 前端交接，2026-10-26 晚）：hold 口径把 §C.2 的结论翻过来了
+
+交接文档：`docs/TOKEN_FRONTEND_HANDOVER_FOR_S3_20261026.md`（174–177 行给了 S3 的逐条清单）。
+
+| 项 | C.1–C.4 的写法 | 交接后 |
+|---|---|---|
+| 参考库 | `runs/isaac_motion/ha_tokens/packed.pt` | **`runs/isaac_motion/ha_cmd/packed.pt`**（命令流；旧库的 `joint_pos` 是执行轨迹，lag +8 帧） |
+| WBC | `wbc_mix2_obs93/ckpt_016000_spec.pt` | **`logs/wbc_hold_*/ckpt_*.pt`**（hold 前端训的；旧 ckpt 是 future 窗口） |
+| burn-in 的 token | 预计算侧车 | **环内 hold builder + 当时仿真机器人 anchor**（`--wbc-token-source online`，交接 §5.3） |
+| `--wbc-token-space` | 手填 label/port | `auto`：hold ⇒ label（并加"窗口口径必须一致"硬门禁） |
+| C.2 的"bc-space 只有 1.9%" | 结论：跨空间无信号 | 在 hold 口径下 **bc-space 与 wbc-space 等价**（1.318 vs 1.336；配对 t=18.6 / 19.5），1.9% 那个数字是**future 窗口的错配**造成的 |
+| C.3 的 λ_r 结论 | 只能等 S1 | hold 中间 ckpt（it 17250）上 `grad_ratio=0.2866`（落在 0.1–0.5），奖励项可以开了；正式表仍要等 `wbc_hold_*` 过三格门禁 |
+
+新门禁产物：`runs/s3_gates_hold/gates_hold_label.json`（codec/freeze/burn-in/contrast/FM-BC 全 PASS）。
+代码：`diff_vla_wbc/sonic_frontend.py` + `burnin.py(token_fn)` + `train_joint_v2.py`(库/窗口/自动发现)
++ `data.py(resolve_clip_files)`。

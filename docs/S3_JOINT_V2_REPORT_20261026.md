@@ -277,3 +277,65 @@ VLA=runs/s3_v2_bc/vla_final.pt WITH_BASE=1 bash scripts/mini_closedloop_v2.sh
 [闭环] 未取得（Isaac 环境，§5.1）；链路（合并/服务/fm_steps 校验）已验证
 ```
 
+---
+
+## 10（追加·2026-10-26 晚）：token 前端交接后的 **hold 路线**重跑
+
+> 输入：`docs/TOKEN_FRONTEND_HANDOVER_FOR_S3_20261026.md`。结论：**设计不用改，改的是"口径"**，
+> 而口径一改，§3.4/§4 的悲观结论**翻过来了**。
+
+### 10.1 交接说了什么（三条，每条都落在 S3 的代码上）
+
+1. 64 维 token = 冻结 encoder(1762)：其中 580 维是「10 帧命令窗口」。HA 录制/部署填 **hold**
+   （当前帧重复 10 次），我们旧实现填 **未来 10 帧** → 两套 token corr 只有 0.05（= S0.4 的根因）。
+2. HA 的 npz 库 `joint_pos` 是**执行轨迹**，不是 encoder 吃的命令流（mean|Δ|=0.41、lag **+8 帧**）
+   → 标签必须配**命令流库** `runs/isaac_motion/ha_cmd/packed.pt`。
+3. hold 下用 identity anchor 复现不了标签（anchor 是实质成分）→ **训练必须用环内机器人 anchor（B 模式）**。
+
+### 10.2 S3 按交接改的代码（3 处，已提交）
+
+| 文件 | 改动 |
+|---|---|
+| `diff_vla_wbc/sonic_frontend.py`（新） | `LibraryTokenBuilder`：把 `CompactMotionLib` 包成 `SonicTokenBuilder` 的 `q/qd/root_quat` 视图；`chunk(frames, robot_quat)` 一次出整段 token |
+| `diff_vla_wbc/burnin.py` | `token_fn(frames, state=...)`：burn-in 每一步用**当时仿真机器人的 root** 算 hold token（B 模式），不再读预计算侧车 |
+| `scripts/train_joint_v2.py` | `--motion-packed` 默认 `ha_cmd/packed.pt`；自动发现 `logs/wbc_hold*/ckpt_*.pt`；`--wbc-token-space auto`（hold⇒label）；**两道硬门禁**：库必须是命令流库、WBC ckpt 的窗口口径必须与 `--wbc-token-window` 一致（`--allow-*-mismatch` 仅诊断） |
+| `diff_vla_wbc/data.py` | `resolve_clip_files`：`ha_cmd` 库的 clip 名是 raw 的 `ep<ts>`、npz 是 `ep000000`，按**同序号**回退（两库 clip 数/每段长度逐位相同：699 / 634016） |
+
+### 10.3 新口径下的门禁（`runs/s3_gates_hold/gates_hold_label.json`，32 窗口，λ_r=0.3）
+
+```
+[GATE][codec]     PASS 1.19e-07
+[GATE][freeze]    PASS pi 13 张量相等；wbc/wm 0 梯度；head 537 梯度张量
+[GATE][burnin]    PASS ref 0.08931 → burn 0.08789（drop_sign_ok=True）survival 0.9999 start_xy 5.4cm
+[GATE][contrast]  PASS n=32  gt_wbc=1.33587 gt_bc=1.31759 mean=1.08617 shuffled=1.03171
+                        zeros=0.94728 randn=-1.15487
+                        wbc-space +0.38858 (+29.1%) t=19.49 win=100%
+                        bc-space  +0.37030 (+39%)  t=18.59 win=100%     ← 不再是 1.9%/1.5 了
+                        r0 gt_wbc=0.08985 zeros=0.05431
+[GATE][fm-bc]     PASS rollout_skipped=False loss_fm_bc=0.13683 loss_reward_norm=0.70949
+                        rollout_reward=0.07646 survival=0.9995 grad_ratio=0.2866
+```
+
+**§3.4 的结论就此修正**：不是"奖励通道没信号"，是**两套口径**（hold vs future）让信号对不上。
+换成 hold + 环内 anchor 后：label 空间（`gt_bc`）与 WBC 空间（`gt_wbc`）**几乎等价**（1.318 vs 1.336），
+两者对 zeros 的配对 t 都 ≈19，`grad_ratio=0.29` 正好落在复核要求的 0.1–0.5 中间。
+
+### 10.4 hold 路线两臂（WBC = `logs/wbc_hold_x20/ckpt_017250.pt`，**训练中的中间 ckpt，数字§临时**）
+
+| 臂 | λ_r | 步数 | `L_fm(val)` | decode 后 token MSE | 手闭合率 pred/label | `imag_return_vla` / `_gt` |
+|---|---|---|---|---|---|---|
+| H0 | 0 | 600 | TBD | TBD | TBD | TBD |
+| H3 | 0.3 | 600 | TBD | TBD | TBD | TBD |
+
+> ⚠️ 这两个臂用的是 **it 17250 的中间 ckpt**（hold 版 WBC 目标 18500，S1 还在训）。
+> 按交接文档 §6，正式读数要等 `wbc_hold_*` 过完三格门禁（HA-699 / BONES-500 / WM 速度）；
+> 这里的数字只用于**验证 S3 的管道与口径**，不进 A1 正式表。
+
+### 10.5 §4 的两臂该怎么看（订正）
+
+§4.1/§4.2 是在 **port/future 口径**下跑的：BC 已经是标签（hold）而 WBC 是端口（future），
+所以那两臂的正确身份是 **"跨口径冒烟"**，不是 S3 的结论：
+- B0（λ_r=0）证明"冻结 + 单次采样 + FM-BC + 64 窗口评测"这条机器是通的；
+- B3（λ_r=0.3）证明了**跨口径开奖励**会发生什么（回报 +38%、token 偏离 14 倍、手塌成 0）——
+  这个现象本身就是交接文档 §2 那条"两套 token corr 0.05"的行为学证据。
+
