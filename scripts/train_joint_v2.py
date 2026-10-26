@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""S3 阶段 C：联合微调 **v2** 入口（旧入口 ``scripts/train_joint.py`` 保持不动，便于对照复现）。
+
+对应 ``docs/JOINT_FINETUNE_REVIEW_REDESIGN_V2_20261026.md`` §4 的 S3.1–S3.7：
+
+    S3.1  新入口就是本文件（旧脚本不删、不改）
+    S3.2  WBC / WM 完全冻结（``diff_vla_wbc.train_v2.JointTrainerV2``）；保存时逐张量比对门禁
+    S3.3  每步单次采样 + GR00T 原生 FM-BC（``diff_vla_wbc.fm_bc``）；无 token_anchor、无 hand-MSE
+    S3.4  起点 = 扰动 + 冻结 WBC 的 burn-in（``diff_vla_wbc.burnin``）
+    S3.5  H=16，回报按 ``H·MAX_STEP_REWARD`` 归一化
+    S3.6  ``--batch-size 4 --grad-accum 4``，每 ``--grad-ratio-every`` 步打印梯度比
+    S3.7  固定 64 窗口评测（L_fm(val) / 想象回报 / decode 后 MSE），闭环挑 ckpt 见
+          ``scripts/mini_closedloop_v2.sh``
+
+用法见 ``scripts/launch_joint_ha_v2.sh``。最小 smoke：
+
+    python3 scripts/train_joint_v2.py --steps 3 --batch-size 2 --grad-accum 1 \
+        --eval-every 0 --save-every 0 --out runs/s3_smoke
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------------------------
+# S0.1 / J1：执行器 spec 必须在**任何** diff_vla_wbc / trackerLab import 之前锁定。
+# WBC v2 是 HA_ALIGN=1 训的（knee 0.420 / ankle −0.230 / elbow 0.870，scale 0.3789/0.75）；
+# 不设这两个环境变量会退回 BeyondMimic，WM 想象里的 (q−default_q) 与 a_prev 全错。
+# ---------------------------------------------------------------------------------------------
+import os as _os  # noqa: E402
+
+_os.environ.setdefault("SUPERMIMIC_HA_ALIGN", "1")
+_os.environ.setdefault(
+    "SUPERMIMIC_ROBOT_USD",
+    str(Path(__file__).resolve().parents[1]
+        / "trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd"),
+)
+
+import torch  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from diff_vla_wbc.action_codec import ActionCodec  # noqa: E402
+from diff_vla_wbc.data import RecordedTokenSource  # noqa: E402
+from diff_vla_wbc.g1_tasks import (  # noqa: E402
+    TaskFrameIndex,
+    TaskObservationBuilder,
+    load_gr00t_processor,
+    processed_batch,
+)
+from diff_vla_wbc.prefetch import BatchPrefetcher, StepMemo  # noqa: E402
+from diff_vla_wbc.train_v2 import (  # noqa: E402
+    BurnInBatchProvider,
+    JointTrainerV2,
+    JointV2Config,
+    assert_wbc_frozen,
+    fixed_eval,
+)
+
+HA_MOTION_DIR = ROOT / "data/npz/ha_tokens"
+HA_PORT_DIR = ROOT / "data/port_tokens/ha_tokens"
+PACKED_MOTION = ROOT / "runs/isaac_motion/ha_tokens/packed.pt"
+FORBIDDEN_DATA_TOKENS = ("mixed", "ft318")
+#: S3 的默认执行器：WBC v2（obs93 + 混合库共训，见 docs/S1_WBC_NEXT_PLAN_20261026.md）
+WBC_V2_CKPT = ROOT / "trackerlab-supermimic/logs/wbc_mix2_obs93/ckpt_016000_spec.pt"
+WBC_V1_CKPT = ROOT / "trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint_spec.pt"
+
+
+def _forbid_legacy_dataset(paths, flag: str) -> None:
+    for p in paths:
+        text = str(p).lower()
+        bad = [t for t in FORBIDDEN_DATA_TOKENS if t in text]
+        if bad:
+            raise SystemExit(f"{flag} {p}: 含禁用数据集标记 {bad}；本工程永久只走纯 HA 数据。")
+
+
+def _sha256_head(path: Path, nbytes: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(nbytes))
+    return h.hexdigest()[:16]
+
+
+def collect_npz(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    for p in paths:
+        if p.is_dir():
+            out.extend(sorted(p.glob("*.npz")))
+        elif p.suffix == ".npz":
+            out.append(p)
+        else:
+            raise SystemExit(f"not an npz file or directory: {p}")
+    if not out:
+        raise SystemExit("no .npz motion clips found")
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="联合微调 v2（S3）")
+    # ---------------- 数据 / 权重 ----------------
+    ap.add_argument("--motion", nargs="+", type=Path, default=[HA_MOTION_DIR])
+    ap.add_argument("--port-tokens", type=Path, default=HA_PORT_DIR,
+                    help="端口 GT token 侧车目录（RecordedTokenSource 的 port_dir）")
+    ap.add_argument("--motion-packed", type=Path, default=PACKED_MOTION)
+    ap.add_argument("--wbc-ckpt", type=Path, default=WBC_V2_CKPT,
+                    help="冻结的 WBC（必须带 robot_spec；默认 WBC_v2 = ckpt_016000_spec.pt）")
+    ap.add_argument("--vlm-ckpt", type=Path, required=True,
+                    help="起始 VLA ckpt（官方 checkpoint-8000，或 S2 的 base_aligned）")
+    ap.add_argument("--vlm-path", type=Path, default=ROOT / "groot_repro/nvidia/Cosmos-Reason2-2B-weights")
+    ap.add_argument("--vlm-select-layer", type=int, default=16)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--out", type=Path, default=Path("runs/joint_v2_smoke"))
+    # ---------------- 训练规模 ----------------
+    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument("--grad-accum", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--log-every", type=int, default=10)
+    # ---------------- 损失 ----------------
+    ap.add_argument("--horizon", type=int, default=16, help="想象 rollout 步数（S3.5：H=16）")
+    ap.add_argument("--gamma", type=float, default=0.99)
+    ap.add_argument("--lambda-bc", type=float, default=1.0, help="FM-BC 主项权重（恒定，不退火）")
+    ap.add_argument("--lambda-r", type=float, default=0.3, help="奖励项权重（扫 0 / 0.1 / 0.3 / 1.0）")
+    ap.add_argument("--lambda-s", type=float, default=0.0, help="可选 state 项权重（小权重）")
+    ap.add_argument("--lambda-a", type=float, default=0.0, help="可选动作蒸馏权重（WBC 冻结）")
+    ap.add_argument("--state-vel-weight", type=float, default=0.05)
+    ap.add_argument("--fm-lr", type=float, default=1e-5)
+    ap.add_argument("--fm-clip", type=float, default=0.5)
+    ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument("--fm-steps", type=int, default=4, help="采样 Euler 步数 K（= 服务端 --fm-steps）")
+    ap.add_argument("--fm-grad-backend", default="pathwise",
+                    choices=["pathwise", "checkpointed", "truncated", "adjoint"])
+    ap.add_argument("--fm-truncated-tail", type=int, default=1)
+    ap.add_argument("--head-train-mode", action="store_true",
+                    help="让 action head 处于 train()（含 state dropout 0.2）；默认 eval（部署口径一致）")
+    ap.add_argument("--grad-ratio-every", type=int, default=50)
+    # ---------------- burn-in 起点（S3.4）----------------
+    ap.add_argument("--burnin-steps", type=int, default=10)
+    ap.add_argument("--no-burnin", action="store_true", help="对照臂：起点 = 参考帧（旧口径）")
+    ap.add_argument("--no-perturb", action="store_true", help="burn-in 不加扰动（诊断用）")
+    ap.add_argument("--perturb-xy", type=float, default=0.05)
+    ap.add_argument("--perturb-yaw", type=float, default=0.10)
+    ap.add_argument("--perturb-dq", type=float, default=0.05)
+    ap.add_argument("--perturb-dqd", type=float, default=0.30)
+    # ---------------- 评测 / 存档 ----------------
+    ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument("--eval-batches", type=int, default=16, help="固定评测批次（×batch = 窗口数，S3.7 要 64）")
+    ap.add_argument("--eval-out", type=Path, default=None, help="评测曲线 JSONL")
+    ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--save-vla-every", type=int, default=500)
+    ap.add_argument("--prefetch-vla", dest="prefetch_vla", action="store_true", default=True)
+    ap.add_argument("--no-prefetch-vla", dest="prefetch_vla", action="store_false")
+    ap.add_argument("--time-budget-minutes", type=float, default=0.0)
+    args = ap.parse_args()
+
+    _forbid_legacy_dataset(args.motion, "--motion")
+    for p in (args.wbc_ckpt, args.vlm_ckpt, args.vlm_path):
+        if not Path(p).exists():
+            raise SystemExit(f"[fail] 缺 {p}")
+    if args.wbc_ckpt == WBC_V1_CKPT:
+        print("[warn] 用的是 WBC v1（obs99）；S3 的正式读数应当用 WBC_v2（ckpt_016000_spec.pt）",
+              flush=True)
+
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(int(args.seed))
+    device = torch.device(args.device)
+    files = collect_npz(args.motion)
+
+    fingerprint = {
+        k: (str(v) if isinstance(v, Path) else (list(map(str, v)) if isinstance(v, list) else v))
+        for k, v in vars(args).items()
+    }
+    fingerprint["_wbc_sha256_1m"] = _sha256_head(args.wbc_ckpt)
+    fingerprint["_n_clips"] = len(files)
+    (out / "args.json").write_text(json.dumps(fingerprint, indent=1, default=str))
+    print(f"[audit] 参数指纹 -> {out / 'args.json'}", flush=True)
+
+    # ---------------------------------------------------------------- bundle（冻结执行器 + WM）
+    from diff_vla_wbc.isaac_joint import is_isaac_checkpoint, load_isaac_bundle
+
+    if not is_isaac_checkpoint(args.wbc_ckpt):
+        raise SystemExit(f"{args.wbc_ckpt}: 只接受 Isaac/trackerlab WBC ckpt（含 pi/wm）")
+    bundle = load_isaac_bundle(
+        args.wbc_ckpt, device=device, npz=files,
+        packed_motion=args.motion_packed, obs_mode=None, hist=None, token_dim=64,
+    )
+    bundle.reward_mode = "saturating"     # §5 第 8 条：不改奖励核
+    bundle.posture_weight = 0.0
+    print(f"[info] library = {bundle.library.summary() if hasattr(bundle.library, 'summary') else '?'}",
+          flush=True)
+
+    # ---------------------------------------------------------------- processor + codec（J2）
+    processor = load_gr00t_processor(args.vlm_ckpt, vlm_path=args.vlm_path)
+    codec = ActionCodec(processor, device=device)
+    print(codec.audit(), flush=True)
+    frame_index = TaskFrameIndex(files)
+    if frame_index.num_frames != bundle.library.num_frames:
+        raise SystemExit(
+            f"npz 索引 {frame_index.num_frames} 帧 ≠ motion library {bundle.library.num_frames} 帧"
+        )
+    builder = TaskObservationBuilder(frame_index)
+
+    # ---------------------------------------------------------------- VLA（backbone 冻结 + head 可训）
+    from diff_vla_wbc.gr00t_vlm import Gr00tVLM
+
+    vlm = Gr00tVLM.from_pretrained(
+        args.vlm_path, checkpoint=args.vlm_ckpt, select_layer=args.vlm_select_layer,
+        device=device, action_horizon=40, max_state_dim=132,
+        freeze_vlm=True, attn_implementation="sdpa",
+    )
+    head_dim = int(vlm.action_head.action_dim)
+    if int(vlm.action_head.action_horizon) < int(args.horizon):
+        raise SystemExit(f"action_horizon {vlm.action_head.action_horizon} < H {args.horizon}")
+    print(f"[info] VLA head dim={head_dim} horizon={vlm.action_head.action_horizon} "
+          f"dtype={next(vlm.action_head.parameters()).dtype} "
+          f"trainable={sum(p.numel() for p in vlm.action_head.parameters() if p.requires_grad):,}",
+          flush=True)
+
+    # ---------------------------------------------------------------- 端口 token 两个源
+    lib = bundle.library
+    port_chunk_src = RecordedTokenSource(
+        args.motion[0], lib, token_horizon=40, token_dim=64, device=device,
+        port_dir=args.port_tokens,
+    )
+    port_frame_src = RecordedTokenSource(
+        args.motion[0], lib, token_horizon=1, token_dim=64, device=device,
+        port_dir=args.port_tokens,
+    )
+    print(f"[info] port token 目录 = {port_chunk_src.port_dir}", flush=True)
+
+    def port_chunk(frames):  # noqa: ANN001  (B,) -> (B,40,64)
+        return port_chunk_src({"frames": frames})
+
+    def port_frame(frames):  # noqa: ANN001  (B,) -> (B,64)
+        return port_frame_src({"frames": frames})[:, 0]
+
+    # ---------------------------------------------------------------- 训练 / 评测 provider
+    provider = BurnInBatchProvider(
+        bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
+        batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
+        seed=int(args.seed), hand_dir=args.motion[0],
+        burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
+        perturb=not args.no_perturb,
+        perturb_xy=args.perturb_xy, perturb_yaw=args.perturb_yaw,
+        perturb_dq=args.perturb_dq, perturb_dqd=args.perturb_dqd,
+    )
+    eval_provider = BurnInBatchProvider(
+        bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
+        batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
+        seed=20261026, hand_dir=args.motion[0],
+        burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
+        perturb=not args.no_perturb,
+        perturb_xy=args.perturb_xy, perturb_yaw=args.perturb_yaw,
+        perturb_dq=args.perturb_dq, perturb_dqd=args.perturb_dqd,
+    )
+
+    # ---------------------------------------------------------------- CPU 预处理（缓存 + 预取）
+    def _processed(frames):  # noqa: ANN001
+        return processed_batch(processor, builder, frames)
+
+    memo = StepMemo(_processed)
+    prefetch = BatchPrefetcher(_processed, enabled=bool(args.prefetch_vla))
+    print(f"[prefetch] enabled={prefetch.enabled}", flush=True)
+
+    # ---------------------------------------------------------------- trainer
+    cfg = JointV2Config(
+        horizon=args.horizon, gamma=args.gamma,
+        lambda_bc=args.lambda_bc, lambda_r=args.lambda_r,
+        lambda_s=args.lambda_s, lambda_a=args.lambda_a,
+        state_vel=args.state_vel_weight,
+        fm_steps=args.fm_steps, fm_lr=args.fm_lr, fm_clip=args.fm_clip,
+        weight_decay=args.weight_decay, grad_backend=args.fm_grad_backend,
+        fm_truncated_tail=args.fm_truncated_tail,
+        head_eval_mode=not args.head_train_mode,
+        grad_accum=args.grad_accum, grad_ratio_every=args.grad_ratio_every,
+    )
+    trainer = JointTrainerV2(bundle, vlm, codec, cfg=cfg, device=device)
+    (out / "v2_config.json").write_text(json.dumps(cfg.__dict__, indent=1))
+
+    # 起点就做一次冻结门禁（S3.2）：之后每次保存都会再比一次
+    assert_wbc_frozen(bundle, args.wbc_ckpt)
+
+    # ---------------------------------------------------------------- 固定评测窗口（S3.7）
+    eval_batches = []
+    if args.eval_every and args.eval_batches:
+        t0 = time.time()
+        eval_batches = [eval_provider.sample() for _ in range(args.eval_batches)]
+        print(f"[eval] fixed {len(eval_batches)} x batch {args.batch_size} = "
+              f"{len(eval_batches) * args.batch_size} 窗口（burn-in 起点），采样 {time.time() - t0:.1f}s",
+              flush=True)
+    eval_out = args.eval_out or (out / "eval_curve.jsonl")
+
+    def run_eval(step: int) -> dict:
+        for b in eval_batches:
+            b.model_inputs = memo.get(b.frames)
+        m = fixed_eval(trainer, eval_batches)
+        m["h"] = int(args.horizon)
+        m["lambda_r"] = float(args.lambda_r)
+        m["fm_steps"] = int(args.fm_steps)
+        with open(eval_out, "a") as f:
+            f.write(json.dumps(m) + "\n")
+        return m
+
+    if eval_batches:
+        run_eval(0)
+
+    # ---------------------------------------------------------------- 训练循环
+    def next_batch():
+        b = provider.sample()
+        if prefetch.enabled:
+            prefetch.submit(b.frames)
+        return b
+
+    deadline = time.time() + args.time_budget_minutes * 60.0 if args.time_budget_minutes > 0 else None
+    metrics_path = out / "train_metrics.jsonl"
+    _t0 = time.time()
+    batch = next_batch()
+    step = 0
+    for step in range(1, int(args.steps) + 1):
+        nxt = next_batch()
+        batch.model_inputs = prefetch.get(batch.frames, lambda: memo.get(batch.frames))
+        metrics = trainer.train_step(batch)
+        if step % max(1, args.log_every) == 0 or step == 1:
+            metrics["step"] = step
+            metrics["s_per_step"] = (time.time() - _t0) / step
+            print(f"[v2 {step}/{args.steps}] "
+                  + json.dumps({k: round(v, 6) for k, v in metrics.items()}), flush=True)
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps(metrics) + "\n")
+        if eval_batches and args.eval_every and step % args.eval_every == 0:
+            run_eval(step)
+        if args.save_every and step % args.save_every == 0:
+            trainer.save_joint(out / f"joint_{step:06d}.pt")
+            assert_wbc_frozen(bundle, args.wbc_ckpt)
+            if args.save_vla_every and step % args.save_vla_every == 0:
+                p = trainer.save_vla(out / f"vla_{step:06d}.pt")
+                print(f"[saved] {p}", flush=True)
+        batch = nxt
+        memo.clear()
+        if deadline is not None and time.time() >= deadline:
+            print(f"[budget] {args.time_budget_minutes:g} min 到达（step {step}）", flush=True)
+            break
+
+    # ---------------------------------------------------------------- 收尾
+    trainer.save_joint(out / "joint_final.pt")
+    frozen_ok = assert_wbc_frozen(bundle, args.wbc_ckpt)
+    vla_final = trainer.save_vla(out / "vla_final.pt")
+    print(f"[saved] {vla_final}", flush=True)
+    final_eval = run_eval(int(step)) if eval_batches and step else {}
+    summary = {
+        "steps": int(step),
+        "out": str(out),
+        "wbc_ckpt": str(args.wbc_ckpt),
+        "wbc_sha256_1m": fingerprint["_wbc_sha256_1m"],
+        "vlm_ckpt": str(args.vlm_ckpt),
+        "freeze_gate": bool(frozen_ok),
+        "fm_steps": int(args.fm_steps),
+        "decode": "codec",
+        "lambda_r": float(args.lambda_r),
+        "lambda_bc": float(args.lambda_bc),
+        "horizon": int(args.horizon),
+        "grad_accum": int(args.grad_accum),
+        "final_eval": final_eval,
+        "wall_s": time.time() - _t0,
+    }
+    (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    print("[AUDIT][v2-summary] " + json.dumps(summary, default=str), flush=True)
+    prefetch.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
