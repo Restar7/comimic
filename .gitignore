@@ -74,3 +74,6 @@ third_party/unitree_sdk2_python/
 
 # 中间 npz 数据集（2.6 GB，由 scripts/prepare_*.py 重建）
 data/npz/
+
+# S2 fallback（端口 token 重标注树，5.7 GB，备而不发）
+data/ha_sessions_port/
