@@ -114,6 +114,13 @@ TASKS="PPBox DoubleDesk" SEEDS="0 1 2" REPEATS=1 MAX_STEPS=300 \
 
 ---
 
+> **口径更正（2026-10-26，实测）**：这里原来写"provider 每 12 步重取 chunk"是**错的**。
+> 代码事实（`action_provider_supermimic.py:_next_latent`）：只有 chunk 队列**空了**才重新 `infer`，
+> 队列长度 = 服务端返回的 40 行 ⇒ **重取间隔 = 40 个控制步**（不是 12，也不是 20）。
+> 实测印证：300 步的 episode 在 `logs/ft2000_server2.log` 里正好 **8 次 infer**（300/40 = 7.5 → 8）。
+> ⇒ 回放服务的 `--consume` 应设为 **40**（旧 GT server 的 `cursor += horizon` 本来就是对的），
+> 与 provider 消费速度一致。若你们那边有"20 步"的来源（某个 yaml/参数），需要单独核对。
+
 ## 4. 判读（**这就是"能不能提高成功率"的答案**）
 
 汇总 `summary.json` 的 per_variant 表，只看这四个：

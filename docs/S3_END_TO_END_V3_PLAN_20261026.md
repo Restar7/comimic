@@ -333,3 +333,15 @@ runs/s3_v4_noBC   batch 8 × accum 4 · H=32 · K=4 · λ_r=0.3 · λ_hand=0.2 �
 - **前验软锚定**（`‖token − base_prior‖²`）没有默认开启：它的唯一"无标签"实例化在数值上≈标签
   （base ckpt 的 token_mse vs 标签只有 0.004），所以先用**不确定性门控**代替，等有明确需求再开；
 - 闭环验收仍需能跑 Isaac 的容器（本机不可用）。
+---
+
+## 12. 口径更正：闭环 chunk **每 40 步**重取（不是 12，也不是 20）
+
+代码事实（`third_party/HumanoidArena/.../action_provider_supermimic.py:_next_latent`）：
+只有 chunk 队列**空了**才重新 `infer`，队列长度 = 服务端返回的 40 行。
+
+* 实测：300 步 episode → `logs/ft2000_server2.log` 里 **8 次 infer**（300/40 = 7.5 → 8）✔
+* 复核文档 J8 说"每 12 步重取"（源自旧 run 的 300/25）**不成立**；
+* ⇒ **一次 chunk 的 40 帧会全部被执行**，所以想象步数应当 **H=40**（而不是 16/32）；
+  H=32 只覆盖前 80%，最后 8 帧只受先验锚定、不受奖励。
+* ⇒ 回放服务的 `--consume` 也应是 **40**。
