@@ -75,6 +75,7 @@ def refresh_wm(
     params = list(wm.parameters())
     opt = torch.optim.Adam(params, lr=lr)
     g = generator or torch.Generator(device="cpu")
+    scales = data.get("scales") if isinstance(data, dict) else None
     was_training = wm.training
     wm.train()
     before = eval_wm_real(data, wm, vel_weight=vel_weight, device=dev) if steps > 0 else {}
@@ -93,9 +94,9 @@ def refresh_wm(
         ori = ((3.0 - (R * S1[1]).sum(-1).sum(-1)) * 0.5).mean()
         qj = (q - S1[4]).square().mean()
         # 速度通道按数据 std 归一（否则 rad/s 的量纲会把它独自变成主项）
-        sv = S1[2].std(0).mean().clamp_min(1e-6)
-        sw = S1[3].std(0).mean().clamp_min(1e-6)
-        sq = S1[5].std(0).mean().clamp_min(1e-6)
+        sv = (scales["v"].to(dev).mean() if scales is not None else S1[2].std(0).mean().clamp_min(1e-2))
+        sw = (scales["w"].to(dev).mean() if scales is not None else S1[3].std(0).mean().clamp_min(1e-2))
+        sq = (scales["qd"].to(dev).mean() if scales is not None else S1[5].std(0).mean().clamp_min(1e-2))
         vel = (((v - S1[2]).square().mean() / sv ** 2)
                + ((w - S1[3]).square().mean() / sw ** 2)
                + ((qd - S1[5]).square().mean() / sq ** 2))
