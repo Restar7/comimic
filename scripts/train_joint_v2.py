@@ -168,6 +168,8 @@ def main() -> int:
     ap.add_argument("--gate-only", action="store_true",
                     help="只跑 codec / 冻结 / burn-in / FM-BC 四道门禁（写 gates.json 后退出）")
     ap.add_argument("--gate-out", type=Path, default=None)
+    ap.add_argument("--gate-batches", type=int, default=8,
+                    help="burn-in / token 对比度门禁的批次数（× batch = 窗口数；对比度要 ≥16 才有统计意义）")
     args = ap.parse_args()
 
     _forbid_legacy_dataset(args.motion, "--motion")
@@ -325,6 +327,7 @@ def main() -> int:
         gates = run_gates(
             args, bundle, vlm, codec, trainer, provider, ref_provider, processor,
             args.gate_out or (out / "gates.json"),
+            n_batches=int(args.gate_batches),
         )
         prefetch.close()
         return 0 if all(
@@ -371,13 +374,14 @@ def main() -> int:
         nxt = next_batch()
         batch.model_inputs = prefetch.get(batch.frames, lambda: memo.get(batch.frames))
         metrics = trainer.train_step(batch)
+        metrics["step"] = step
+        metrics["s_per_step"] = (time.time() - _t0) / step
+        # 每一步都落盘：grad_ratio 只在打印步产生，只写在打印分支里会丢
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
         if step % max(1, args.log_every) == 0 or step == 1:
-            metrics["step"] = step
-            metrics["s_per_step"] = (time.time() - _t0) / step
             print(f"[v2 {step}/{args.steps}] "
                   + json.dumps({k: round(v, 6) for k, v in metrics.items()}), flush=True)
-            with open(metrics_path, "a") as f:
-                f.write(json.dumps(metrics) + "\n")
         if eval_batches and args.eval_every and step % args.eval_every == 0:
             run_eval(step)
         if args.save_every and step % args.save_every == 0:
