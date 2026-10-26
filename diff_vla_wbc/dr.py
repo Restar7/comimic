@@ -71,12 +71,16 @@ def estimate_ranges(data: dict, npz_path=None) -> dict:
     try:
         st = data["states"]
         act = data["actions"]
-        dq = st[:, 36:39]                                  # 只做量级参考
-        out["root_lin_std"] = float(dq.std())
+        n = int(st.shape[0])
+        idx = torch.arange(0, n, max(1, n // 200000))       # 子采样：601k 帧上 quantile 会炸
+        st, act = st[idx], act[idx]
+        out["root_lin_std"] = float(st[:, 36:39].std())
         out["action_abs_mean"] = float(act.abs().mean())
         qd = st[:, 42:71]
-        out["qd_abs_p95"] = float(qd.abs().quantile(0.95))
-        out["q_range_p95"] = float((st[:, 7:36].max(0).values - st[:, 7:36].min(0).values).quantile(0.95))
+        out["qd_abs_p95"] = float(qd.abs().reshape(-1).quantile(0.95))
+        row = st[:, 7:36]
+        out["q_range_p95"] = float((row.max(0).values - row.min(0).values).quantile(0.95))
+        out["samples"] = int(idx.numel())
     except Exception as exc:  # 报告失败不能挡训练
         out["error"] = str(exc)
     return out

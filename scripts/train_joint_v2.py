@@ -514,7 +514,7 @@ def main() -> int:
             clip_head=args.clip_head,
         )
         trainer = JointTrainerV3(bundle, vlm, codec, cfg=cfg, v3=v3cfg, device=device)
-        (out / "v3_config.json").write_text(json.dumps(v3cfg.__dict__, indent=1))
+        (out / "v3_config.json").write_text(json.dumps(v3cfg.__dict__, indent=1, default=str))
     else:
         trainer = JointTrainerV2(bundle, vlm, codec, cfg=cfg, device=device)
     (out / "v2_config.json").write_text(json.dumps(cfg.__dict__, indent=1))
