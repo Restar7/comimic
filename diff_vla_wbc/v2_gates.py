@@ -155,28 +155,29 @@ def gate_burnin(trainer, provider, ref_provider, *, n_batches: int = 4) -> dict:
 def gate_token_contrast(trainer, provider, *, n_batches: int = 4) -> dict:
     """C2：**同一个起点**下，想象回报对 conditioning 的区分度（奖励通道有没有信号）。
 
-    这是 J7/D1 的直接检验：如果 GT token 与零/随机 token 的回报一样，那 λ_r>0 只是在给噪声
-    求导（复核 §0.5 的担心），必须先回去改起点或 WM，而不是加权重。
+    必须同时报**两个** GT，否则会得出互相矛盾的结论（2026-10-26 实测过这个坑）：
 
-    对照（全部受同样的起点/参考/观测，只换 conditioning）：
-    ``gt`` / ``mean``（整批 GT 的均值 token，即"条件均值"）/ ``shuffled``（batch 内打乱）
-    / ``zeros`` / ``randn``（分布外）。
+    * ``gt_wbc``：WBC 训练空间的录制 token —— "奖励通道本身有没有信号"；
+    * ``gt_bc`` ：BC 目标空间（= VLA 输出空间）的录制 token 直接喂 WBC —— "部署现实"。
 
-    ⚠️ **必须用配对统计**：2026-10-26 实测，8 个窗口时 GT−zeros 只有 +0.0004（被噪声淹没），
-    换成 64 个窗口的配对检验就是 **+0.372（+33.8%），配对 t=30.2，GT 在 64/64 窗口胜出**。
-    所以判据用 ``paired_t`` 与胜率，不用均值差（窗口间差异本身就有 20% 的 sd）。
+    对照 ``mean``（条件均值）/ ``shuffled``（batch 内打乱）/ ``zeros`` / ``randn``（分布外）
+    都基于 ``gt_wbc``。
+
+    ⚠️ **必须配对统计**：8 个窗口时 GT−zeros 只有 +0.0004（假阴性）；64 窗口配对检验是
+    +0.372（t=30.2，64/64 窗口胜出）。判据用 ``paired_t`` 与胜率。
     """
     cfg = trainer.cfg
-    keys = ("gt", "mean", "shuffled", "zeros", "randn")
+    keys = ("gt_wbc", "gt_bc", "mean", "shuffled", "zeros", "randn")
     per_window: dict[str, list[float]] = {k: [] for k in keys}
     r0: dict[str, list[float]] = {k: [] for k in keys}
     surv: dict[str, list[float]] = {k: [] for k in keys}
     for _ in range(n_batches):
         b = provider.sample()
-        gt = b.port_tokens
+        gt = getattr(b, "wbc_tokens", b.port_tokens)
         perm = torch.randperm(gt.shape[0], device=gt.device)
         variants = {
-            "gt": gt,
+            "gt_wbc": gt,
+            "gt_bc": b.port_tokens,
             "mean": gt.mean(0, keepdim=True).expand_as(gt).contiguous(),
             "shuffled": gt[perm],
             "zeros": torch.zeros_like(gt),
@@ -190,34 +191,41 @@ def gate_token_contrast(trainer, provider, *, n_batches: int = 4) -> dict:
 
     m = {k: float(np.mean(v)) for k, v in per_window.items()}
     se = {k: float(np.std(v, ddof=1) / np.sqrt(len(v))) for k, v in per_window.items()}
-    paired = np.asarray(per_window["gt"]) - np.asarray(per_window["zeros"])
-    p_se = float(paired.std(ddof=1) / np.sqrt(len(paired))) if len(paired) > 1 else float("nan")
-    p_t = float(paired.mean() / p_se) if p_se and p_se > 0 else float("nan")
-    wins = float((paired > 0).mean())
-    contrast = m["gt"] - m["zeros"]
-    rel = contrast / max(abs(m["gt"]), 1e-9)
-    ok = bool(contrast > 0 and p_t >= 3.0 and wins >= 0.8)
+
+    def _paired(a: str, b: str):
+        d = np.asarray(per_window[a]) - np.asarray(per_window[b])
+        sd = float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else float("nan")
+        t = float(d.mean() / sd) if sd and sd > 0 else float("nan")
+        return float(d.mean()), t, float((d > 0).mean())
+
+    c_wbc, t_wbc, w_wbc = _paired("gt_wbc", "zeros")
+    c_bc, t_bc, w_bc = _paired("gt_bc", "zeros")
+    rel = c_wbc / max(abs(m["gt_wbc"]), 1e-9)
+    ok = bool(c_wbc > 0 and t_wbc >= 3.0 and w_wbc >= 0.8)
     print(
-        f"[GATE][contrast] {'PASS' if ok else 'FAIL'} n={len(per_window['gt'])} "
-        f"ret gt={m['gt']:.5f} mean={m['mean']:.5f} shuffled={m['shuffled']:.5f} "
-        f"zeros={m['zeros']:.5f} randn={m['randn']:.5f} | "
-        f"contrast(gt-zeros)={contrast:+.5f} rel={rel:+.2%} paired_t={p_t:.2f} "
-        f"gt_win_frac={wins:.2f} | r0 gt={np.mean(r0['gt']):.5f} zeros={np.mean(r0['zeros']):.5f} "
-        f"| surv gt={np.mean(surv['gt']):.4f} zeros={np.mean(surv['zeros']):.4f}",
+        f"[GATE][contrast] {'PASS' if ok else 'FAIL'} n={len(per_window['gt_wbc'])} "
+        f"ret gt_wbc={m['gt_wbc']:.5f} gt_bc={m['gt_bc']:.5f} mean={m['mean']:.5f} "
+        f"shuffled={m['shuffled']:.5f} zeros={m['zeros']:.5f} randn={m['randn']:.5f} | "
+        f"wbc-space contrast={c_wbc:+.5f} rel={rel:+.2%} t={t_wbc:.2f} win={w_wbc:.2f} | "
+        f"bc-space contrast={c_bc:+.5f} t={t_bc:.2f} win={w_bc:.2f} | "
+        f"r0 gt_wbc={np.mean(r0['gt_wbc']):.5f} zeros={np.mean(r0['zeros']):.5f} | "
+        f"surv gt_wbc={np.mean(surv['gt_wbc']):.4f} zeros={np.mean(surv['zeros']):.4f}",
         flush=True,
     )
     return {
         "pass": ok,
-        "n_windows": len(per_window["gt"]),
+        "n_windows": len(per_window["gt_wbc"]),
         **{f"ret_{k}": round(m[k], 6) for k in keys},
         **{f"se_{k}": round(se[k], 6) for k in keys},
         **{f"r0_{k}": round(float(np.mean(r0[k])), 6) for k in keys},
         **{f"surv_{k}": round(float(np.mean(surv[k])), 6) for k in keys},
-        "contrast_gt_minus_zeros": round(float(contrast), 6),
-        "contrast_rel": round(float(rel), 6),
-        "paired_se": round(p_se, 6),
-        "paired_t": round(p_t, 3),
-        "gt_win_frac": round(wins, 4),
+        "wbc_space_contrast": round(c_wbc, 6),
+        "wbc_space_rel": round(float(rel), 6),
+        "wbc_space_t": round(t_wbc, 3),
+        "wbc_space_win_frac": round(w_wbc, 4),
+        "bc_space_contrast": round(c_bc, 6),
+        "bc_space_t": round(t_bc, 3),
+        "bc_space_win_frac": round(w_bc, 4),
     }
 
 

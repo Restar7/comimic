@@ -387,6 +387,7 @@ class BurnInBatchProvider:
         *,
         port_source: Callable[[torch.Tensor], torch.Tensor],
         port_frame_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        wbc_chunk_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
         batch_size: int = 4,
         horizon: int = 16,
         token_horizon: int = 40,
@@ -404,6 +405,9 @@ class BurnInBatchProvider:
         self.library = library
         self.port_source = port_source
         self.port_frame_source = port_frame_source or (lambda f: port_source(f)[:, 0])
+        # **WBC 空间**的整段 GT token（门禁要区分"奖励通道在 WBC 空间里的信号"和
+        # "部署时 VLA 空间的 token 喂给 WBC"两件事）；缺省时与 BC 源相同。
+        self.wbc_chunk_source = wbc_chunk_source or port_source
         self.batch_size = int(batch_size)
         self.horizon = int(horizon)
         self.token_horizon = int(token_horizon)
@@ -449,6 +453,7 @@ class BurnInBatchProvider:
         base.xi = bi.xi
         base.teacher_states = bi.teacher_states
         base.port_tokens = port_chunk
+        base.wbc_tokens = self.wbc_chunk_source(frames)
         base.burnin = bi
         return base
 

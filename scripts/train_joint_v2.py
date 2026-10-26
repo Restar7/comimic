@@ -245,6 +245,11 @@ def main() -> int:
         _tdir, lib, token_horizon=40, token_dim=64, device=device,
         port_dir=args.port_tokens, token_space=args.bc_token_space,
     )
+    # WBC 空间的整段 GT（门禁要区分"奖励通道在 WBC 空间的信号"和"部署现实"）
+    wbc_chunk_src = RecordedTokenSource(
+        _tdir, lib, token_horizon=40, token_dim=64, device=device,
+        port_dir=args.port_tokens, token_space=args.wbc_token_space,
+    )
     port_frame_src = RecordedTokenSource(
         _tdir, lib, token_horizon=1, token_dim=64, device=device,
         port_dir=args.port_tokens, token_space=args.wbc_token_space,
@@ -280,9 +285,13 @@ def main() -> int:
     def port_frame(frames):  # noqa: ANN001  (B,) -> (B,64)
         return port_frame_src({"frames": frames})[:, 0]
 
+    def wbc_chunk(frames):  # noqa: ANN001  (B,) -> (B,40,64)  WBC 空间
+        return wbc_chunk_src({"frames": frames})
+
     # ---------------------------------------------------------------- 训练 / 评测 provider
     provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
+        wbc_chunk_source=wbc_chunk,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=int(args.seed), hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -292,6 +301,7 @@ def main() -> int:
     )
     eval_provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
+        wbc_chunk_source=wbc_chunk,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=20261026, hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -332,6 +342,7 @@ def main() -> int:
 
         ref_provider = BurnInBatchProvider(
             bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
+            wbc_chunk_source=wbc_chunk,
             batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
             seed=int(args.seed), hand_dir=args.motion[0],
             burnin=False,                    # 对照组：起点 = 参考帧（旧口径）
