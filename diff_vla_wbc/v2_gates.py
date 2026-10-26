@@ -240,13 +240,20 @@ def gate_fm_bc(trainer, batch, *, log: Callable = print) -> dict:
     loss_bc = m.get("loss/fm_bc", float("nan"))
     loss_r = m.get("loss/reward_norm", float("nan"))
     ratio = m.get("grad_ratio", float("nan"))
-    ok = np.isfinite(loss_bc) and np.isfinite(loss_r) and (not np.isfinite(ratio) or ratio >= 0)
-    print(f"[GATE][fm-bc] {'PASS' if ok else 'FAIL'} loss_fm_bc={loss_bc:.5f} "
+    # λ_r=0 的纯 BC 臂会**跳过** rollout，此时 loss_r / 想象回报都是 NaN —— 这不是失败。
+    skipped = bool(m.get("rollout/skipped", 0.0))
+    ok = (
+        np.isfinite(loss_bc)
+        and (skipped or np.isfinite(loss_r))
+        and (not np.isfinite(ratio) or ratio >= 0)
+    )
+    print(f"[GATE][fm-bc] {'PASS' if ok else 'FAIL'} rollout_skipped={skipped} loss_fm_bc={loss_bc:.5f} "
           f"loss_reward_norm={loss_r:.5f} rollout_reward={m.get('rollout/reward', float('nan')):.5f} "
           f"survival={m.get('rollout/survival', float('nan')):.4f} "
           f"grad_ratio={ratio} out_of_range={m.get('codec/out_of_range', float('nan')):.3f}",
           flush=True)
-    return {"pass": bool(ok), "loss_fm_bc": float(loss_bc), "loss_reward_norm": float(loss_r),
+    return {"pass": bool(ok), "rollout_skipped": skipped,
+            "loss_fm_bc": float(loss_bc), "loss_reward_norm": float(loss_r),
             "rollout_reward": float(m.get("rollout/reward", float("nan"))),
             "rollout_survival": float(m.get("rollout/survival", float("nan"))),
             "grad_ratio": float(ratio)}
