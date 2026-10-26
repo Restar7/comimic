@@ -45,10 +45,11 @@ class V3Config:
     critic_value_clip: float = 0.1    # SuperMimic: clip_grad_value_(critic, 0.1)
     push_std: float = 0.0             # rollout 内过程扰动：root **线速度**（m/s）
     push_ang: float = 0.0             # 同上，root 角速度（rad/s）；太大会直接触发软终止
-    # ---- 模型可信度（纯想象里的"约束"）----
-    lambda_u: float = 0.0             # 不确定度惩罚：r_t ← r_t·exp(−λ_u·u_t)
-    ensemble: bool = False            # 用已有的多个 WM 做集成分歧
-    ensemble_ckpts: tuple = ()        # [(path, ...)]
+    # ---- 先验锚定（A 方案）：λ_a·‖token − 底模先验‖² ----
+    # 说明：底模（checkpoint-8000）的输出与录制标签数值上几乎一致（token MSE 0.004），
+    # 所以这里用 batch 里已有的标签 chunk 当**先验代理**，零额外成本；
+    # 语义上是"别离开底模自己会说的地方"，不是"学标签"（λ_a=0 时完全不参与）。
+    anchor_weight: float = 0.0
     grad_log_every: int = 0           # 打印分项梯度范数
     clip_head: float = 0.5            # VLA head 的梯度范数裁剪（先测再定，见文档 §2.6）
 
@@ -70,12 +71,6 @@ class JointTrainerV3(JointTrainerV2):
     ) -> None:
         super().__init__(bundle, vlm, codec, cfg=cfg, device=device, adapter=adapter, log=log)
         self.v3 = v3 or V3Config()
-        self.ensemble = None
-        if self.v3.ensemble and self.v3.ensemble_ckpts and self.v3.lambda_u > 0:
-            from .wm_ensemble import WMEnsemble  # noqa: PLC0415
-
-            self.ensemble = WMEnsemble(self.v3.ensemble_ckpts, device=self.device)
-            log(self.ensemble.audit())
         self.critic: TokenCritic | None = None
         self.critic_opt: torch.optim.Optimizer | None = None
         if self.v3.use_critic:
@@ -120,20 +115,7 @@ class JointTrainerV3(JointTrainerV2):
             obs_noise=cfg.obs_noise, push_std=v3.push_std, push_ang=v3.push_ang,
         )
         H = cfg.horizon
-        # ---- 不确定度门控（纯想象里的"模型可信约束"）----
-        unc_mean = 0.0
-        if self.ensemble is not None and v3.lambda_u > 0:
-            with torch.no_grad():
-                u_steps = torch.stack(
-                    [self.ensemble.disagreement(rollout.states[t], rollout.actions[t], batch.xi)
-                     for t in range(H)], dim=0)                       # (H,B)
-                w_steps = torch.exp(-v3.lambda_u * u_steps)
-            rew = rollout.rewards * w_steps                              # 低可信度处不采信奖励
-            disc = v3.gamma ** torch.arange(H, device=rew.device, dtype=rew.dtype)[:, None]
-            ret = (disc * rollout.survival[:H] * rew).sum(0)
-            unc_mean = float(u_steps.mean())
-        else:
-            ret = discounted_return(rollout, v3.gamma)               # (B,)
+        ret = discounted_return(rollout, v3.gamma)               # (B,)
         ref_states = self._ref_states(batch)                     # (H+1,B,71)
         xi = batch.xi
 
@@ -158,6 +140,13 @@ class JointTrainerV3(JointTrainerV2):
             loss_hand = fm_bc_loss(self.vlm.action_head, bb_out, act_in, tgt, hand_mask)
 
         loss = v3.lambda_r * loss_r
+        # ---- 先验锚定（A 方案）：把 token 按在一根弹簧上，堵掉"跑出流形骗 WM"的路 ----
+        loss_anchor = None
+        if v3.anchor_weight > 0:
+            with torch.no_grad():
+                prior = batch.port_tokens[:, :H].to(tokens.dtype)     # 底模先验代理（≈标签）
+            loss_anchor = torch.nn.functional.mse_loss(tokens.float(), prior.float())
+            loss = loss + v3.anchor_weight * loss_anchor
         if loss_hand is not None:
             loss = loss + v3.lambda_hand * loss_hand
 
@@ -173,8 +162,8 @@ class JointTrainerV3(JointTrainerV2):
         if loss_hand is not None:
             metrics["loss/hand_fm"] = float(loss_hand.detach())
 
-        if unc_mean:
-            metrics["unc/mean"] = unc_mean
+        if loss_anchor is not None:
+            metrics["loss/anchor"] = float(loss_anchor.detach())
         bucket = getattr(batch, "bucket", None)
         if bucket is not None:
             with torch.no_grad():

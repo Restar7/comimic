@@ -214,11 +214,9 @@ def main() -> int:
     ap.add_argument("--dr-dqd-max", type=float, default=0.30)
     ap.add_argument("--dr-p-nominal", type=float, default=0.25)
     ap.add_argument("--dr-p-mid", type=float, default=0.45)
-    ap.add_argument("--lambda-u", type=float, default=0.0,
-                    help="WM 集成分歧惩罚：r_t ← r_t·exp(−λ_u·u_t)。建议 1.0 起")
-    ap.add_argument("--ensemble", dest="ensemble", action="store_true", default=False,
-                    help="用已有的多个 WM 做集成分歧（--lambda-u>0 时生效）")
-    ap.add_argument("--ensemble-ckpts", nargs="*", type=Path, default=None)
+    ap.add_argument("--anchor-weight", type=float, default=0.0,
+                    help="先验锚定 λ_a：λ_a·‖token − 底模先验‖²（先验代理 = 标签 chunk；"
+                         "底模输出与标签 MSE 只有 0.004，所以数值等价）。0 = 关。建议 0.05")
     ap.add_argument("--obs-noise", type=float, default=0.0,
                     help="观测层 DR：给 VLA 输入的**本体感觉**通道（腿/腰/臂的 q）加 ±noise rad 均匀噪声；"
                          "不动 hand / projected_gravity 通道。0 = 关")
@@ -534,16 +532,11 @@ def main() -> int:
     if args.v3:
         from diff_vla_wbc.v3_step import JointTrainerV3, V3Config  # noqa: PLC0415
 
-        _ens = args.ensemble_ckpts
-        if _ens is None:
-            _ens = [ROOT / "runs/S1_handover/WBC_A20000_obs93.pt",
-                    ROOT / "trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint_spec.pt"]
         v3cfg = V3Config(
             lambda_r=args.lambda_r, lambda_hand=args.lambda_hand, use_critic=args.critic,
             critic_lr=args.critic_lr, gamma=args.gamma, lam=args.lam,
             push_std=args.push_std, push_ang=args.push_ang,
-            lambda_u=args.lambda_u, ensemble=bool(args.ensemble),
-            ensemble_ckpts=tuple(_ens),
+            anchor_weight=args.anchor_weight,
             grad_log_every=args.grad_log_every,
             clip_head=args.clip_head,
         )
@@ -682,7 +675,8 @@ def main() -> int:
         "token_space_mismatch": bool(_space_mismatch),
         "v3": bool(args.v3), "lambda_hand": float(args.lambda_hand),
         "push_std": float(args.push_std), "push_ang": float(args.push_ang),
-        "clip_head": float(args.clip_head), "obs_noise": float(args.obs_noise), "start_source": str(args.start_source),
+        "clip_head": float(args.clip_head), "obs_noise": float(args.obs_noise),
+        "anchor_weight": float(args.anchor_weight), "start_source": str(args.start_source),
         "wm_refresh_every": int(args.wm_refresh_every),
         "wbc_token_window": str(args.wbc_token_window),
         "wbc_token_source": str(args.wbc_token_source),
