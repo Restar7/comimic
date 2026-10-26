@@ -10,12 +10,21 @@ Acceptance: policy rollout (port token) state_term must drop well below the 2.87
 the WM's qd correlation with the reference must be > 0.9 (was 0.155).
 """
 from __future__ import annotations
-import argparse, json, sys
+import argparse, json, os, sys
 from pathlib import Path
 import torch
 ROOT = Path(__file__).resolve().parents[1]
 for p in (ROOT, ROOT / "trackerlab-supermimic/source/trackerLab"):
     sys.path.insert(0, str(p))
+
+# LOCKED 2026-10-26 (S1.1)：与 evaluate.py / eval_wm_velocity.py 同一把口径锁。
+if os.environ.get("SM_ALLOW_SCALE_MISMATCH") != "1":
+    os.environ.setdefault("SUPERMIMIC_HA_ALIGN", "1")
+    os.environ.setdefault(
+        "SUPERMIMIC_ROBOT_USD",
+        str(ROOT / "trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd"))
+print(f"[wmvel][LOCKED] SUPERMIMIC_HA_ALIGN={os.environ.get('SUPERMIMIC_HA_ALIGN')}", flush=True)
+
 from diff_vla_wbc.isaac_joint import load_isaac_bundle, flat_state_tuple  # noqa: E402
 from diff_vla_wbc.data import MotionBatchProvider, RecordedTokenSource  # noqa: E402
 from diff_vla_wbc.rollout import _flat_history, compute_joint_loss, imagine_with_tokens, LossWeights  # noqa: E402
@@ -33,14 +42,20 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--vel-lambda", type=float, default=5.0)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--packed", type=Path, default=ROOT / "runs/isaac_motion/ha_tokens/packed.pt",
+                    help="参考库。hold/命令流路线要指 runs/isaac_motion/ha_cmd/packed.pt，否则"
+                         "标定出来的 WM 只对执行轨迹口径成立（S3 contrast 会掉到 0）")
+    ap.add_argument("--npz-dir", type=Path, default=ROOT / "data/npz/ha_tokens")
+    ap.add_argument("--port-dir", type=Path, default=None)
+    ap.add_argument("--token-space", choices=("auto", "label", "port"), default="auto")
     ap.add_argument("--no-explicit-integration", action="store_true",
                     help="保持旧结构（整步增量）；默认启用 mjlab 的半隐式显式积分")
     a = ap.parse_args()
     torch.manual_seed(0)
     dev = torch.device(a.device)
     bundle = load_isaac_bundle(a.ckpt, device=dev,
-                               npz=sorted((ROOT / "data/npz/ha_tokens").glob("*.npz")),
-                               packed_motion=ROOT / "runs/isaac_motion/ha_tokens/packed.pt",
+                               npz=sorted(Path(a.npz_dir).glob("*.npz")),
+                               packed_motion=Path(a.packed),
                                packed_dir=None, obs_mode=None, hist=10, token_dim=64)
     # 结构：显式物理积分（mjlab parity）。必须在加载后、训练前设定，并写进 ckpt。
     bundle.wm.explicit_integration = not a.no_explicit_integration
@@ -48,7 +63,8 @@ def main() -> int:
     wm_integration = ("explicit_dt%g" % bundle.wm.dt) if bundle.wm.explicit_integration else "residual"
     print(f"[structure] ws_integration={wm_integration}", flush=True)
     lib = bundle.library
-    rec = RecordedTokenSource(ROOT / "data/npz/ha_tokens", lib, token_horizon=40, token_dim=64, device=dev)
+    rec = RecordedTokenSource(Path(a.npz_dir), lib, token_horizon=40, token_dim=64, device=dev,
+                              port_dir=a.port_dir, token_space=a.token_space)
     prov = MotionBatchProvider(bundle, lib, batch_size=a.batch, horizon=40, token_source=None,
                                token_dim=64, token_horizon=40, seed=12345, hand_dir=None)
     wm = bundle.wm

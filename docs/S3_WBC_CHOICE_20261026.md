@@ -91,3 +91,49 @@ python3 scripts/eval_wm_velocity.py --ckpt runs/S1_handover/WBC_A20000_wmvel.pt 
 | 4 | mini 闭环挑 ckpt | `scripts/mini_closedloop_v2.sh`（需要能跑 Isaac 的容器） | F 臂 vs B 臂成功率不降 + 一项显著改善 |
 
 **B 臂（对照）** = 官方 `checkpoint-8000` + 同一个 C2 执行器；**F 臂** = S3 训练产物 + 同一个 C2（逐字节相同）。
+
+---
+
+## 4. 追加（同日）：C6（`A20000_wmvel`）不合适，但"按我们口径重标"的版本合适
+
+### 4.1 在 hold/命令流口径上实测三个候选
+
+| ckpt | 五道门禁 | 奖励通道 contrast（wbc-space） | burn-in | `grad_ratio` | WM `qd_corr/ratio`（ha_cmd） | 结论 |
+|---|---|---|---|---|---|---|
+| C2 `WBC_A20000_obs93.pt` | 5/5 PASS | **+0.394（+29.3%），t=19.1，win 100%** | 0.0901→0.0889（−1.3%）surv 0.9999 | 0.286 | −0.069 / 11.2 | 信号最强，但 **WM 速度通道坏** |
+| C1 `WBC_A20000_pi_WM10500.pt` | contrast FAIL | −0.013（−2.0%），t=−0.42 | 0.0678→0.0524（−23%）surv 0.996 | 0.204 | 0.119 / 4.24 | ❌ |
+| **C6 `WBC_A20000_wmvel.pt`**（dossier 新首选） | contrast **FAIL** | **−0.003（−0.6%），t=−0.10，win 62%** | 0.0663→0.0514（−22%）surv 0.963 | 0.205 | 0.746（旧域标的） | ❌ 在我们口径上奖励通道已死 |
+| **C6h `WBC_A20000_wmvel_cmd.pt`**（我按 ha_cmd 域重标） | **5/5 PASS** | **+0.117（+9.4%），t=7.82，win 91%** | 0.0913→0.0835（**−8.5%**）surv 0.9999 | 0.149 | **0.972 / 0.986** | ✅ **推荐** |
+
+### 4.2 为什么 C6 不行、C6h 行
+
+S1 的 `finetune_wm_velocity_policy.py` 原来**写死旧口径**（`data/npz/ha_tokens` + `runs/isaac_motion/ha_tokens/packed.pt`），
+所以 C6 的 WM 是"为执行轨迹参考标的"：**qd_corr 0.746 但动作敏感性归零** ——
+换到我们的命令流参考后，GT token 与零 token 的想象回报一模一样（contrast −0.6%，t=−0.10），
+绝对想象回报从 1.35 掉到 0.55。**这是"指标被刷高、能力没跟上"的典型。**
+
+我给该脚本加了 `--packed/--npz-dir/--port-dir/--token-space`（默认行为不变），在 **ha_cmd 域**上重标：
+
+| | 标定前（C2） | 标定后（C6h，800 步） |
+|---|---|---|
+| `qd_corr` / `qd_ratio` | −0.002 / 4.07 | **0.972 / 0.986**（dossier 旧域版只有 0.746） |
+| `joint_mse` | 1.3e-3 | **1e-4** |
+| policy rollout `state_term` | 0.733 | **0.076**（8.5×） |
+| reward | +0.0885 | **+0.0927** |
+
+### 4.3 裁决：**用 C6h（`runs/S1_handover/WBC_A20000_wmvel_cmd.pt`）**
+
+理由（按重要性）：
+1. **只有它的 WM 和我们口径一致**（qd_corr 0.97 / ratio 0.99 / joint_mse 1e-4 / state_term 0.076）。
+   C2 的 WM 速度通道差 11 倍 → 奖励里的 linvel/angvel 两项是**错的**，梯度大但有偏；
+   复核 §0.5 的定位是"奖励只做可执行性精修"，用有偏的大梯度不如用干净的小梯度。
+2. **奖励通道仍然成立**：+9.4%、t=7.82、91% 窗口胜出（不是噪声）；`grad_ratio=0.149` 在 0.1–0.5 带内，
+   想要更靠近 0.3 就把 λ_r 从 0.3 提到约 0.6。
+3. **策略与 C2 完全相同**（只换了 wm）→ 执行器指标不变：新表 NR 0.8673 / 0 摔 / BONES-500 9/500 / joint RMSE 0.084。
+4. `provenance.token_window="hold"`、`robot_spec`、`bones_seed_plus_ha_cmd_x20` 库齐全 → 我的门禁零 override。
+
+保留 C2 作为**A/B 对照臂**：如果 λ_r 扫描在 C6h 上没有闭环增益，可以回到 C2 验证
+"更大但更有偏的奖励梯度是否反而有效"。两臂只差 `--wbc-ckpt`，其余逐字相同。
+
+> ⚠️ 给 S1 的提醒：`qd_corr` 是**可被标定刷高而动作敏感性归零**的指标（C6 就是证据）。
+> WM 门禁必须配 S3 的 contrast 测试；标定时务必用**目标部署口径**的参考库（现在是 `ha_cmd`）。
