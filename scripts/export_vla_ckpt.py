@@ -72,7 +72,7 @@ def load_update(vla_path: Path) -> tuple[int | None, dict[str, torch.Tensor]]:
     fm = ck["fm"]
     if not fm:
         raise SystemExit(f"{vla_path}: 'fm' is empty")
-    return ck.get("step"), {k: v for k, v in fm.items()}
+    return ck.get("step"), {k: v for k, v in fm.items()}, ck
 
 
 def read_index(base: Path) -> dict:
@@ -146,14 +146,14 @@ def main() -> None:
     if args.verify_only:
         if not args.out or not args.vla:
             raise SystemExit("--verify-only needs --out and --vla")
-        _, overrides = load_update(args.vla)
+        _, overrides, _meta0 = load_update(args.vla)
         verify(args.out, overrides)
         return
 
     if not (args.base and args.vla and args.out):
         raise SystemExit("--base, --vla and --out are required (or use --verify-only)")
 
-    step, overrides = load_update(args.vla)
+    step, overrides, _ck = load_update(args.vla)
     index = read_index(args.base)
     weight_map: dict[str, str] = index["weight_map"]
 
@@ -214,6 +214,14 @@ def main() -> None:
         "digests": {k: _tensor_digest(t) for k, t in list(overrides.items())[:16]},
     }
     (args.out / "vla_merge_report.json").write_text(json.dumps(report, indent=2))
+    # S0.3：把训练时的 FM 步数带进合并目录，服务端据此校验（不一致就报错）
+    # 注意：``load_update`` 返回的原始 ckpt 字典在这里叫 ``_ck``（2026-10-26 修过
+    # 一次 ``meta`` 未定义的 NameError —— 少了这一行，``vla_meta.json`` 永远不写，
+    # 服务端的 fm_steps 校验就形同虚设，J3 会静默复发）。
+    _meta = {"fm_steps": int(_ck.get("fm_steps", -1))} if isinstance(_ck, dict) and _ck.get("fm_steps") else {}
+    if _meta:
+        (args.out / "vla_meta.json").write_text(json.dumps(_meta, indent=2))
+        _log(f"[meta] fm_steps={_meta['fm_steps']} -> {args.out / 'vla_meta.json'}")
     _log(f"[done] wrote {args.out / 'vla_merge_report.json'}")
 
     verify(args.out, overrides)

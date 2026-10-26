@@ -54,6 +54,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import os
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,11 +139,40 @@ class Engine:
         if not args.dry_run:
             self._load()
 
+    # ---- S0.3/J3：训练与服务端的 FM 步数必须一致（vla_meta.json 由 export_vla_ckpt 写入）
+    def _check_fm_steps(self) -> int | None:
+        """在读 6 GB 权重**之前**校验 FM 步数，不一致直接退出（fail fast）。
+
+        原来的检查放在模型加载之后，一旦不一致要白等 ~1 min 才报错；而且旧产物
+        （``vla_meta.json`` 缺失）会静默放过，J3 会悄悄复发 —— 这里只保留
+        ``ALLOW_FM_STEPS_MISMATCH=1`` 这一个人为放行开关。
+        """
+        meta_path = Path(self.args.ckpt) / "vla_meta.json"
+        train_steps = None
+        if meta_path.exists():
+            try:
+                train_steps = int(json.loads(meta_path.read_text()).get("fm_steps", -1))
+            except Exception:
+                train_steps = None
+        if train_steps and train_steps > 0 and train_steps != int(self.args.fm_steps):
+            if os.environ.get("ALLOW_FM_STEPS_MISMATCH") != "1":
+                raise SystemExit(
+                    f"[fm-steps] 训练用 {train_steps} 步 Euler，服务端 --fm-steps "
+                    f"{self.args.fm_steps}；二者必须一致（A/B 才允许 ALLOW_FM_STEPS_MISMATCH=1）"
+                )
+            print("[fm-steps][WARN] 步数不一致但已放行（A/B）", flush=True)
+        elif train_steps in (None, -1):
+            print(f"[fm-steps][WARN] {meta_path} 不存在或无 fm_steps：无法校验（旧 ckpt 口径）",
+                  flush=True)
+        return train_steps
+
     def _load(self) -> None:
         import torch
 
         from diff_vla_wbc.g1_tasks import load_gr00t_processor
         from diff_vla_wbc.gr00t_vlm import Gr00tVLM
+
+        self._train_fm_steps = self._check_fm_steps()
 
         self.model = Gr00tVLM.from_pretrained(
             checkpoint=Path(self.args.ckpt),
@@ -152,6 +182,13 @@ class Engine:
             device=self.args.device,
         ).eval()
         self.processor = load_gr00t_processor(self.args.ckpt, vlm_path=self.args.vlm_path)
+        self.codec = None
+        if getattr(self.args, "decode", "codec") == "codec":
+            from diff_vla_wbc.action_codec import ActionCodec  # noqa: PLC0415
+            self.codec = ActionCodec(self.processor, device=self.args.device)
+            print(self.codec.audit(), flush=True)
+        print(f"[AUDIT][server] decode={getattr(self.args, 'decode', 'codec')} "
+              f"fm_steps={self.args.fm_steps} train_fm_steps={self._train_fm_steps}", flush=True)
         cfg = getattr(self.processor, "config", None)
         size = getattr(cfg, "image_target_size", None) if cfg is not None else None
         if isinstance(size, (list, tuple)) and len(size) == 2:
@@ -203,6 +240,11 @@ class Engine:
                     self.model, batch, initial_noise=noise, num_steps=self.args.fm_steps,
                 )
             full = full.detach().to("cpu").float().numpy()[0]        # (horizon, >=78)
+            if self.codec is not None:
+                import torch as _t  # noqa: PLC0415
+                with _t.no_grad():
+                    dec = self.codec.decode(_t.from_numpy(full).to(self.codec.lo.device).unsqueeze(0)).squeeze(0).cpu().numpy()
+                full = np.concatenate([dec, full[:, self.codec.dim:]], axis=-1).astype(np.float32)
             chunk64 = full[:, :64]
             fingers = full[:, 64:78]
             # HA's ``vla_action_hand_binary`` is (frames, 2) = (left, right); keep the
@@ -266,9 +308,15 @@ class Handler(BaseHTTPRequestHandler):
             Handler.n_infer += 1
             # img_mean/img_std: a frozen camera shows up as a constant pair across requests,
             # which is the failure mode we hit on the 570 box (RTX sensors need a render pass).
+            _h14 = getattr(self.engine, "last_hands14_chunk", None)
             print(f"[server] infer #{Handler.n_infer} dt={dt_ms:.1f}ms "
                   f"img={rgb.shape} img_mean={rgb.mean():.1f} img_std={rgb.std():.1f} "
-                  f"tok_mean={chunk.mean():+.3f} state={state.shape[0]} task={task[:40]!r}",
+                  # 手部统计取 engine 缓存的 14 维（Handler 里没有局部变量 fingers）
+                  
+                  f"tok_mean={chunk.mean():+.3f} tok_absmean={np.abs(chunk).mean():.4f} "
+                  f"hand14_max={float(np.abs(_h14).max()) if _h14 is not None else float('nan'):.3f} "
+                  f"hand_gt170={float((np.abs(_h14) > 1.70).mean()) if _h14 is not None else float('nan'):.3f} "
+                  f"state={state.shape[0]} task={task[:40]!r}",
                   flush=True)
             self._json(200, {
                 "latent64_chunk": chunk.tolist(),
@@ -294,6 +342,9 @@ def main() -> int:
     ap.add_argument("--horizon", type=int, default=40, help="action chunk length the head was trained with")
     ap.add_argument("--action-dim", type=int, default=78, help="64 token + 7 + 7 hands")
     ap.add_argument("--fm-steps", type=int, default=4, help="flow-matching Euler steps")
+    ap.add_argument("--decode", choices=("codec", "none"), default="codec",
+                    help="codec = GR00T min-max 逆变换回原始 token/手指空间（官方 ckpt 必须用）；"
+                         "none = 旧口径（我们自己 raw-space 微调过的 ckpt 用）")
     ap.add_argument("--state-order", choices=("ha_v31", "standard"), default="ha_v31",
                     help="order of the 29 joints inside the incoming 64-d vla_state "
                          "(ha_v31 = HumanoidArena asset order, which the current ckpt was "
