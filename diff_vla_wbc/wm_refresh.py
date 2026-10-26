@@ -69,6 +69,8 @@ def refresh_wm(
     if n < batch:
         raise ValueError(f"真转移只有 {n} 条，少于 batch={batch}")
     wm = wm.to(dev)
+    # 刷新期间解冻（调用方在策略回路里是冻结的）；结束时会重新冻结
+    wm.requires_grad_(True)
     theta0 = [p.detach().clone() for p in wm.parameters()]
     params = list(wm.parameters())
     opt = torch.optim.Adam(params, lr=lr)
