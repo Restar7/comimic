@@ -41,6 +41,10 @@ EPISODE_SAMPLING_RATE="${EPISODE_SAMPLING_RATE:-0.1}"
 
 export PATH="$GR00T/.venv/bin:$PATH"
 export VIRTUAL_ENV="$GR00T/.venv"
+# ---- 执行器口径（与 WBC/闭环一致；VLA 训练本身不用，但下游联合微调/评测会读）------
+export SUPERMIMIC_HA_ALIGN=1
+export SUPERMIMIC_ROBOT_USD=${SUPERMIMIC_ROBOT_USD:-$COMIMIC/trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd}
+
 export HF_HOME=/inspire/hdd/global_user/liumengfan-253108110079/cache/huggingface
 # NOTE: keep HF_HUB_OFFLINE unset. With it set, transformers tries model_info() and dies;
 # the cache is complete, so a metadata lookup is harmless (see flowbody docs 2026-10-23).

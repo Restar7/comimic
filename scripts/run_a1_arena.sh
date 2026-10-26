@@ -61,7 +61,7 @@ esac
 OUT=${OUT:-$COMIMIC/runs/ablations/A1_joint_finetune/$ARM/$TASK}
 SERVER_URL=${SERVER_URL:-http://127.0.0.1:18080}
 SM_CKPT=${SM_CKPT:-$COMIMIC/trackerlab-supermimic/logs/bones_seed_token_2x8192_isaac50/last.pt}
-SM_OBS_MODE=${SM_OBS_MODE:-relative_ori99}
+SM_OBS_MODE=${SM_OBS_MODE:-auto}   # auto = 跟随 ckpt 的 args.obs_mode（S1.3/F2）
 PORT_BASE=${PORT_BASE:-18080}
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }

@@ -84,6 +84,10 @@ class JointTrainer:
         # 随机漂移（实测 token_mse 2000 步 0.077 → 3000 步 0.093/0.108）。
         token_anchor: Callable | None = None,
         token_anchor_weight: float = 0.0,
+        # 行为级监督：π(VLA_token) 对齐 π(录制端口 token)，WBC 冻结（默认关闭）
+        action_distill_weight: float = 0.0,
+        # 梯度累积（等效 batch = batch_size * grad_accum）
+        grad_accum: int = 1,
     ):
         self.bundle = bundle
         self.adapter = adapter
@@ -98,6 +102,9 @@ class JointTrainer:
         self.sync_gradients = bool(sync_gradients)
         self.token_anchor = token_anchor
         self.token_anchor_weight = float(token_anchor_weight)
+        self.action_distill_weight = float(action_distill_weight)
+        self.grad_accum = max(1, int(grad_accum or 1))
+        self._accum_count = 0
         self.cfg = cfg or JointTrainerConfig()
         self.device = torch.device(device or bundle.device)
         self.bundle.to(self.device)
@@ -292,15 +299,42 @@ class JointTrainer:
                 terms = dict(terms)
                 terms["token_anchor"] = anchor_loss.detach()
 
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        # 动作级蒸馏（可选）：让"用 VLA token 的动作"贴近"用录制端口 token 的动作"。
+        # 完全在可微链路里（只多一次 WBC 前向），不经过仿真器，也不替代世界模型。
+        if (
+            self.action_distill_weight > 0
+            and self.token_anchor is not None
+            and hasattr(self.bundle, "act")
+        ):
+            ref_tokens = self.token_anchor(batch)
+            if ref_tokens is not None:
+                oh = batch.obs_hist
+                if oh.ndim == 3:
+                    oh = oh.reshape(oh.shape[0], -1)
+                a_vla = self.bundle.act(oh, tokens[:, 0])
+                with torch.no_grad():
+                    a_ref = self.bundle.act(oh, ref_tokens[:, 0].to(tokens.device, tokens.dtype))
+                distill = torch.nn.functional.mse_loss(a_vla.float(), a_ref.float())
+                loss = loss + self.action_distill_weight * distill
+                terms = dict(terms)
+                terms["action_distill"] = distill.detach()
+
+        # 梯度累积：accum=1 时行为与旧代码完全一致
+        _accum = self.grad_accum
+        self._accum_count += 1
+        if self._accum_count == 1:
+            self.optimizer.zero_grad(set_to_none=True)
+        (loss / _accum).backward()
         if self.sync_gradients:
             self.sync_grads()
         if self.fm_parameters:
             torch.nn.utils.clip_grad_norm_(self.fm_parameters, self.cfg.fm_clip)
         torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), self.cfg.adapter_clip)
         torch.nn.utils.clip_grad_norm_(self.bundle.policy.parameters(), self.cfg.policy_clip)
-        self.optimizer.step()
+        if self._accum_count >= _accum:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            self._accum_count = 0
         self.steps += 1
 
         metrics = {"loss": float(loss.detach())}

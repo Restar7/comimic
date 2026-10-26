@@ -286,6 +286,39 @@ class IsaacJointBundle:
             else torch.ones(NUM_JOINTS, device=self.device, dtype=torch.float32)
         )
 
+        # ---- S0.1 / J1：执行器 spec 审计 + 与 ckpt 里的 robot_spec 对齐 -----------------
+        # WBC 训练用 HA_ALIGN=1（knee 0.420 / ankle −0.230 / elbow 0.870，scale 0.3789/0.75）。
+        # 联合训练若不设这个环境变量会退回 BeyondMimic（0.669/−0.363/0.600，0.3950/0.5475），
+        # WM 想象里的 (q − default_q) 与 a_prev 换算会整体偏移 —— 必须断言，不能静默。
+        import numpy as _np  # noqa: PLC0415
+
+        _dq = _np.asarray(self.spec.default_q, dtype="float32")
+        _sc = _np.asarray(self.spec.action_scale, dtype="float32")
+        print(
+            f"[AUDIT][spec] SUPERMIMIC_HA_ALIGN={os.environ.get('SUPERMIMIC_HA_ALIGN')} "
+            f"default_q[knee/ankle/elbow]={_dq[3]:.3f}/{_dq[4]:.3f}/{_dq[18]:.3f} "
+            f"spec_scale mean/max={_sc.mean():.4f}/{_sc.max():.4f} "
+            f"action_scale_mode={getattr(self, 'action_scale_mode', '?')}",
+            flush=True,
+        )
+        _rs = ck.get("robot_spec")
+        if _rs is not None:
+            if not _np.allclose(_np.asarray(_rs["default_q"], dtype="float32"), _dq, atol=1e-6):
+                raise SystemExit(
+                    "[spec] default_q 与 WBC 训练不一致：\n"
+                    f"  ckpt : {_np.asarray(_rs['default_q'], dtype='float32')[:8]}\n"
+                    f"  现在 : {_dq[:8]}\n"
+                    "  修法：export SUPERMIMIC_HA_ALIGN=1 + SUPERMIMIC_ROBOT_USD=<训练时的 USD>"
+                )
+            if not _np.allclose(_np.asarray(_rs["action_scale"], dtype="float32"), _sc, atol=1e-6):
+                raise SystemExit("[spec] action_scale 与 WBC 训练不一致（见 AUDIT 行）")
+            print("[AUDIT][spec] robot_spec 对齐 PASS", flush=True)
+        elif os.environ.get("COMIMIC_ALLOW_NO_SPEC") != "1":
+            raise SystemExit(
+                "[spec] 该 WBC ckpt 没有 robot_spec；先跑 scripts/stamp_robot_spec.py 生成 _spec.pt，"
+                "或设 COMIMIC_ALLOW_NO_SPEC=1 临时放行（结果需标注）"
+            )
+
         # ---- reference motion (Isaac-side packed library, frame-aligned with the npz)
         self.motion = CompactMotionLib.from_packed(
             str(packed_motion), self.kin, str(self.device), layout="canonical"
@@ -422,6 +455,50 @@ class IsaacJointBundle:
     def reward(self, state, action, prev_action, reference, bodies=None):
         r, terms = self.mdp.reward(flat_state_tuple(state), reference.f, action, prev_action, terms=True)
         out = {k: v for k, v in terms.items()}
+
+        # ---- 2026-10-25 新增（默认关闭，SM/CLI 开关控制）-------------------------
+        # reward_mode="linear"：把 6 个 exp(-e/std^2) 跟踪核换成线性的 -(e/std^2)，
+        # 避免"误差小的时候核已经饱和到 1 -> reward 对 token 不敏感"（0.083/0.10）。
+        # posture_weight>0：加连续的姿态惩罚 -w*(relu(tilt-0.5)^2 + relu(0.6-height)^2)，
+        # 让"歪/快倒"在想象里也有梯度（世界模型的终止头几乎不触发）。
+        _mode = str(getattr(self, "reward_mode", "saturating")).lower()
+        _pw = float(getattr(self, "posture_weight", 0.0) or 0.0)
+        # reward_vel_scale（2026-10-26）：WM 的**速度通道**最不准（refresh 后 qd_corr≈0.64，
+        # 位置/姿态是 7e-4）。速度项贡献给优化器的基本就是"模型误差方向"，可设 0 精确扣掉。
+        # 注意：这里从 saturating 核里**精确减去**那两项（e_* 是原始误差，核 = w·exp(-e/std²)·dt），
+        # 所以 _vs 在两种 reward_mode 下语义一致，且不会改评估口径以外的任何项。
+        _vs = float(getattr(self, "reward_vel_scale", 1.0))
+        if _mode == "linear" or _pw > 0:
+            c = self.mdp.cfg
+            dt = 0.02  # CONTROL_DT；与 mdp.reward 内部的乘数一致
+            if _mode == "linear":
+                r_lin = -(
+                    c.w_body_pos * terms["e_body_pos"] / (c.body_pos_std ** 2)
+                    + c.w_body_ori * terms["e_body_ori"] / (c.body_ori_std ** 2)
+                    + c.w_body_linvel * terms["e_body_linvel"] / (c.body_linvel_std ** 2)
+                    + c.w_body_angvel * terms["e_body_angvel"] / (c.body_angvel_std ** 2)
+                    + c.w_root_pos * terms["e_root_pos"] / (c.root_pos_std ** 2)
+                    + c.w_root_ori * terms["e_root_ori"] / (c.root_ori_std ** 2)
+                ) * dt
+                r = r_lin + (r - terms["track"] * dt)   # 保留 action_rate / joint_limit 惩罚
+            if _pw > 0:
+                # state 平铺：p(3) + quat wxyz(4) + q(29) + v(3) + w(3) + qd(29)
+                p_z = state[..., 2]
+                quat = state[..., 3:7]
+                import torch as _t
+                # up_alignment = R[2,2] = 1 - 2(x^2 + y^2)
+                x, y = quat[..., 1], quat[..., 2]
+                up = 1 - 2 * (x * x + y * y)
+                tilt = _t.acos(up.clamp(-1.0, 1.0))
+                posture = (_t.relu(tilt - 0.5) ** 2 + _t.relu(0.6 - p_z) ** 2).mean()
+                r = r - _pw * posture * dt
+                out["posture_penalty"] = posture.detach()
+        if _vs != 1.0:
+            c = self.mdp.cfg
+            _sub = (c.w_body_linvel * torch.exp(-terms["e_body_linvel"] / c.body_linvel_std ** 2)
+                    + c.w_body_angvel * torch.exp(-terms["e_body_angvel"] / c.body_angvel_std ** 2)) * 0.02
+            r = r - (1.0 - _vs) * _sub
+            out["vel_dropped"] = _sub.detach()
         out["total"] = r
         return out
 

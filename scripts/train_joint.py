@@ -20,6 +20,20 @@ import sys
 import time as _time
 from pathlib import Path
 
+# ---------------------------------------------------------------------------------------------
+# S0.1 / J1：执行器 spec 必须在**任何** diff_vla_wbc / trackerLab import 之前锁定。
+# WBC 训练用的是 HA_ALIGN=1（knee 0.420 / ankle −0.230 / elbow 0.870，action_scale 0.3789/0.75）；
+# 不设这个环境变量时 get_robot("g1") 会退回 BeyondMimic（0.669/−0.363/0.600，0.3950/0.5475），
+# 于是 WM 想象里每一帧 obs 的 (q − default_q) 和 reference_start 的 a_prev 都整体偏移。
+# ---------------------------------------------------------------------------------------------
+import os as _os  # noqa: E402
+
+_os.environ.setdefault("SUPERMIMIC_HA_ALIGN", "1")
+_os.environ.setdefault(
+    "SUPERMIMIC_ROBOT_USD",
+    str(Path(__file__).resolve().parents[1] / "trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd"),
+)
+
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,6 +156,17 @@ def main() -> None:
     ap.add_argument("--hand-mask-threshold", type=float, default=0.05,
                     help="frames whose reference hand is below this are excluded from the hand "
                          "loss (HA has 4/7 tasks with all-zero hands)")
+    ap.add_argument("--action-distill-weight", type=float, default=0.0,
+                    help="动作级蒸馏权重：‖π(VLA token) − π(录制端口 token)‖²（WBC 冻结，"
+                         "纯可微链路，不经仿真）。0 = 关闭")
+    ap.add_argument("--grad-accum", type=int, default=1,
+                    help="梯度累积步数（等效 batch = batch_size × 该值）；1 = 关闭")
+    ap.add_argument("--reward-mode", choices=("saturating", "linear"), default="saturating",
+                    help="奖励形态：saturating = exp(-e/std^2)（旧行为）；linear = -(e/std^2)（去饱和）")
+    ap.add_argument("--posture-weight", type=float, default=0.0,
+                    help="连续的姿态惩罚权重：-w*(relu(tilt-0.5)^2 + relu(0.6-height)^2)*dt；0 = 关闭")
+    ap.add_argument("--anchor-anneal-steps", type=int, default=0,
+                    help="token 锚定退火步数：在该步数内从设定值线性退到 10%%；0 = 不退火")
     ap.add_argument("--token-anchor-weight", type=float, default=0.0,
                     help="token 锚定损失权重 λ：λ*MSE(VLA token, 端口 token)。reward 一饱和就没有"
                          "东西钉住 token，模型会在平坦区里漂移（实测 2000→3000 步 token_mse "
@@ -219,7 +244,8 @@ def main() -> None:
         print(f"[dist] rank {_rank}/{_world} local_rank={_local} backend=nccl", flush=True)
     _is_main = _rank == 0
 
-    torch.manual_seed(args.seed)
+    _seed = int(args.seed) + 1000 * int(_rank)   # S0.5/J6：每 rank 不同 seed
+    torch.manual_seed(_seed)
     device = torch.device(f"cuda:{_os.environ.get('LOCAL_RANK', '0')}") if _world > 1 else torch.device(args.device)
     _forbid_legacy_dataset(args.motion, "--motion")
     if args.recorded_tokens is not None:
@@ -451,9 +477,13 @@ def main() -> None:
         token_source=None if _use_prefetch else fm_sampler,
         token_dim=64,
         token_horizon=adapter.cfg.token_horizon,
-        seed=args.seed,
+        seed=_seed,
         hand_dir=hand_dir,
     )
+    # 奖励形态/姿态惩罚（isaac_joint.reward 里读取；默认关闭 = 旧行为）
+    if hasattr(bundle, "__dict__"):
+        bundle.reward_mode = args.reward_mode
+        bundle.posture_weight = float(args.posture_weight)
     cfg = JointTrainerConfig(
         horizon=args.horizon,
         adapter_lr=args.adapter_lr,
@@ -476,7 +506,7 @@ def main() -> None:
                 return _sample_full(vlm_batch)
 
     token_anchor = None
-    if args.token_anchor_weight > 0:
+    if args.token_anchor_weight > 0 or args.action_distill_weight > 0:
         from diff_vla_wbc.data import RecordedTokenSource  # noqa: PLC0415
 
         _tdir = args.motion[0] if args.motion[0].is_dir() else args.motion[0].parent
@@ -493,6 +523,7 @@ def main() -> None:
     trainer = JointTrainer(
         bundle, adapter, fm_sampler=fm_sampler, fm_parameters=fm_params, cfg=cfg, device=device,
         token_anchor=token_anchor, token_anchor_weight=args.token_anchor_weight,
+        action_distill_weight=args.action_distill_weight, grad_accum=args.grad_accum,
         hand_weight=args.hand_loss_weight,
         hand_grasp_boost=args.hand_grasp_boost,
         hand_mask_threshold=args.hand_mask_threshold,
@@ -638,6 +669,7 @@ def main() -> None:
             torch.cuda.set_rng_state_all(cuda_rng)
         m = {
             "step": step,
+            "fm_steps": int(args.vlm_steps),
             "elapsed_s": _time.time() - _T0 if "_T0" in globals() else 0.0,
             "h": int(args.horizon),
             "token_mse": sum(tok_mse) / len(tok_mse),
@@ -712,6 +744,9 @@ def main() -> None:
             batch.model_inputs = _vla_prefetch.get(
                 batch.frames, lambda: _vla_memo.get(batch.frames)
             )
+        if args.anchor_anneal_steps > 0:
+            _frac = min(1.0, max(0, step - _start_step) / float(args.anchor_anneal_steps))
+            trainer.token_anchor_weight = args.token_anchor_weight * (1.0 - 0.9 * _frac)
         metrics = trainer.train_step(batch)
         if (
             args.wm_update_every
@@ -740,6 +775,7 @@ def main() -> None:
             torch.save(
                 {
                     "step": step,
+                    "fm_steps": int(args.vlm_steps),
                     "fm": {
                         n: p.detach().to("cpu", dtype=torch.float32)
                         for n, p in vlm_model.named_parameters()
@@ -788,6 +824,7 @@ def main() -> None:
         torch.save(
             {
                 "step": step,
+                "fm_steps": int(args.vlm_steps),
                 "fm": {
                     n: p.detach().to("cpu", dtype=torch.float32)
                     for n, p in vlm_model.named_parameters()

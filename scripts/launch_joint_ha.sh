@@ -17,6 +17,8 @@
 set -euo pipefail
 
 COMIMIC=/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic
+export SUPERMIMIC_HA_ALIGN=1
+export SUPERMIMIC_ROBOT_USD="$COMIMIC/trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd"
 REPO="$COMIMIC/third_party/SuperMimic-Reproduced"
 SM_CKPT="${SM_CKPT:-/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint.pt}"   # 写死：Isaac Lab/PhysX 版（见 runs/OFFICIAL_SUPERMIMIC.json）
 VLM_PATH="$COMIMIC/groot_repro/nvidia/Cosmos-Reason2-2B-weights"

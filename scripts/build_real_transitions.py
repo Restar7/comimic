@@ -78,7 +78,7 @@ def main() -> int:
         T = min(len(pos), len(q), lengths[ci])
         # !! 录制的 root 线/角速度全是 0（实测 std=0），必须用差分补 —— 否则 WM 会把速度
         #    通道拟合成常数，归一化时 1/std^2 还会炸到 1e12。
-        dt = 1.0 / float(z["fps"]) if "fps" in z else 0.02
+        dt = 0.02  # HA 录制全部 50 Hz（npz 的 fps 字段在 with 块内读，别在这儿取）
         lin = np.gradient(pos[:T].astype(np.float64), dt, axis=0).astype(np.float32)
         q = q.astype(np.float32)
         _qa, _qb = quat[:-1].astype(np.float64), quat[1:].astype(np.float64)

@@ -265,3 +265,23 @@ OUT_ROOT=$PWD/runs/anchor4000_hand_eval2 \
 
 > 原则：**每一步都要有"过/不过"的门禁**（§4.8），不过就不往下走——
 > 这轮踩过的坑（action_scale、静默兜底、手部未执行）都是"没有审计行"导致的。
+
+---
+
+## 8. 实施状态（2026-10-26 代码已落地，默认全部关闭）
+
+| 改动 | 文件 | 开关 | 默认 | 冒烟验证 |
+|---|---|---|---|---|
+| 奖励去饱和（`exp` → `-(e/std²)`） | `diff_vla_wbc/isaac_joint.py` | `--reward-mode linear` | `saturating`（旧行为） | ✅ 4 步无 NaN，`rollout/reward` 出现负值（0.024 → −0.004/0.043） |
+| 连续姿态惩罚（tilt/height） | 同上 | `--posture-weight` | 0 | ✅ 同上 |
+| 动作级蒸馏 `π(VLA tok) ≈ π(rec tok)` | `diff_vla_wbc/train.py` | `--action-distill-weight` | 0 | ✅ `loss/action_distill` 正常输出（2.5–7.3） |
+| token 锚定退火 | `scripts/train_joint.py` | `--anchor-anneal-steps` | 0 | ✅ 与锚定共存 |
+| 梯度累积 | `diff_vla_wbc/train.py` | `--grad-accum` | 1（=旧行为） | ✅ accum=2 跑通 |
+| 手部直通（VLA 14 维 → 手指） | server / client / `action_provider_supermimic.py` | `SM_HAND` / `SM_HAND_SCALE` | 1 / 1.0 | ✅ DoubleDesk 300 步跑通（手指未见闭合，待查侧内顺序） |
+| action_scale 强制锁 + 正确 import | `action_provider_supermimic.py` | 固定 | 强制 | ✅ `[LOCKED] mean 0.3789 max 0.75` |
+
+**安全性**：所有开关默认关闭 → 与旧代码逐位等价（`grad_accum=1` 时 backward/step 与原逻辑一致；
+`reward_mode=saturating` 且 `posture_weight=0` 时 reward 直通不改）。
+
+**注意**：`--reward-mode linear` 下 `rollout_reward` 的量纲变了（可正可负），**不能与旧的
+0.083/0.079 直接比较**；换口径时必须用同一 reward_mode 重跑对照。

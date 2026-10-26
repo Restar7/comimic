@@ -50,6 +50,22 @@ class V3Config:
     # 所以这里用 batch 里已有的标签 chunk 当**先验代理**，零额外成本；
     # 语义上是"别离开底模自己会说的地方"，不是"学标签"（λ_a=0 时完全不参与）。
     anchor_weight: float = 0.0
+    # ---- token trust region（尺度无关的硬约束，B 方案）----
+    # 为什么需要：anchor 是 MSE·λ_a，数值上比 λ_r·|loss_r| 小 2–3 个数量级，
+    # 挡不住奖励梯度（A1 在 step100 把 tok_mse 顶到 ×3.75 就是这么来的）。
+    # 这里改成无量纲 hinge：只在 RMSE 超出 eps 时才给力，且力度与奖励项同量级。
+    trust_eps: float = 0.0            # 0 = 关；容差 = token 相对先验的 RMSE（归一化 token 空间）
+    trust_weight: float = 0.0         # hinge 权重（无量纲；1.0 ≈ 越界即与 λ_r·|J| 同量级）
+    # ---- 动作空间 trust region（比 token 空间更本质：动作才是 WBC/WM 的输入）----
+    act_eps: float = 0.0              # 0 = 关；容差 = (a − a_ref) 的逐关节 RMS（归一化动作空间）
+    act_weight: float = 0.0           # hinge 权重（无量纲）
+    # ---- critic 的监督来源 ----
+    # "imagined"（旧）= 想象转移上的 GAE；"real"（新）= 真录制轨迹的 return-to-go
+    critic_source: str = "imagined"
+    critic_batch: int = 256
+    # 按 clip 去时间趋势：return-to-go 天然随"剩余步数"下降，直接当 bootstrap 会诱导策略
+    # "让状态看起来像更早的帧"（滞后）。减去同 clip 均值后，V 变成"相对质量"，自举才有意义。
+    critic_center: bool = True
     grad_log_every: int = 0           # 打印分项梯度范数
     clip_head: float = 0.5            # VLA head 的梯度范数裁剪（先测再定，见文档 §2.6）
 
@@ -82,6 +98,39 @@ class JointTrainerV3(JointTrainerV2):
             f"critic_clip={self.v3.critic_clip}/{self.v3.critic_value_clip} "
             f"head_clip={self.v3.clip_head} H={self.cfg.horizon} K={self.cfg.fm_steps}"
         )
+
+    # ------------------------------------------------------------------ 真数据 critic
+    def attach_real_returns(self, rets: torch.Tensor, states: torch.Tensor,
+                            ref_rows: torch.Tensor) -> None:
+        """挂上 grounded 的价值目标：``rets[f]`` = 真录制轨迹从帧 f 起的折扣回报。
+
+        ``ref_rows`` = motion library 的 canonical 参考行 ``(N,71)``（与 ``_ref_states`` 同口径）。
+        """
+        from .isaac_joint import canonical_to_flat, default_xi  # noqa: PLC0415
+
+        n = int(rets.shape[0])
+        if int(states.shape[0]) != n or int(ref_rows.shape[0]) != n:
+            raise SystemExit(
+                f"[v3] real returns 长度不一致：ret={n} states={int(states.shape[0])} ref={int(ref_rows.shape[0])}")
+        self._real_ret = rets.to(self.device).float()
+        if bool(getattr(self.v3, "critic_center", True)):
+            motion = self.bundle.motion
+            starts = motion.clip_start.detach().cpu().long()
+            lens = motion.clip_len.detach().cpu().long()
+            cen = self._real_ret.clone()
+            for ci in range(int(lens.numel())):
+                s, L = int(starts[ci]), int(lens[ci])
+                if L > 0:
+                    seg = self._real_ret[s:s + L]
+                    cen[s:s + L] = seg - seg.mean()
+            self._real_ret_raw = self._real_ret
+            self._real_ret = cen
+        self._real_states = states.to(self.device).float()
+        self._real_ref_states = canonical_to_flat(ref_rows.float()).to(self.device)
+        self._real_xi = default_xi(n, self.device)
+        self.log(f"[AUDIT][v3][critic] source={self.v3.critic_source} n={n} "
+                 f"ret_mean={float(self._real_ret.mean()):+.4f} std={float(self._real_ret.std()):.4f} "
+                 f"ref_shape={tuple(self._real_ref_states.shape)}")
 
     # ------------------------------------------------------------------ 参考状态
     def _ref_states(self, batch) -> torch.Tensor:
@@ -149,6 +198,39 @@ class JointTrainerV3(JointTrainerV2):
             loss_anchor = torch.nn.functional.mse_loss(
                 tokens[:, :n_anchor].float(), prior[:, :n_anchor].float())
             loss = loss + v3.anchor_weight * loss_anchor
+        # ---- token trust region：relu(RMSE/eps − 1)^2 ----
+        loss_trust = None
+        rmse_tok = None
+        if v3.trust_eps > 0 and v3.trust_weight > 0:
+            with torch.no_grad():
+                prior_t = batch.port_tokens.to(tokens.dtype)          # 底模先验代理（≈标签）
+            n_t = min(int(tokens.shape[1]), int(prior_t.shape[1]))
+            diff = tokens[:, :n_t].float() - prior_t[:, :n_t].float()  # (B,T,64) 带梯度
+            rmse_tok = diff.pow(2).mean(dim=tuple(range(1, diff.dim()))).sqrt()   # (B,)
+            excess = torch.relu(rmse_tok / float(v3.trust_eps) - 1.0)
+            loss_trust = float(v3.trust_weight) * excess.pow(2).mean()
+            loss = loss + loss_trust
+        # ---- 动作空间 trust region：relu(RMS(a − a_ref)/eps − 1)^2 ----
+        # 参照 = **用标签 token 跑同一段 rollout** 得到的动作序列（无梯度）。
+        # 为什么不用库里的命令 q_cmd：实测 WBC 的动作与 (q_cmd−dq)/scale 有 ~1.1 RMS 的
+        # 系统性偏差（反馈项/口径差），当中心没有意义。用"标签 token 的动作"作中心，
+        # 度量的是**token 变化导致的行为变化**——这正是 WBC/WM 训练域的定义方式。
+        loss_act = None
+        act_rms = None
+        if v3.act_eps > 0 and len(getattr(batch, "references", []) or []) > 0:
+            with torch.no_grad():
+                roll_ref = imagine_with_tokens(
+                    self.bundle, tokens=batch.port_tokens.detach().to(tokens.dtype),
+                    state=batch.start_state, obs_hist=batch.obs_hist,
+                    history=batch.history, xi=batch.xi, references=batch.references,
+                    prev_action=batch.prev_action, horizon=cfg.horizon,
+                )
+            diff_a = rollout.actions.float() - roll_ref.actions.float()
+            act_rms = diff_a.pow(2).mean(-1).sqrt()                              # (H,B)
+            excess_a = torch.relu(act_rms / float(v3.act_eps) - 1.0)
+            loss_act = float(v3.act_weight) * excess_a.pow(2).mean()
+            if float(v3.act_weight) > 0:
+                loss = loss + loss_act
         if loss_hand is not None:
             loss = loss + v3.lambda_hand * loss_hand
 
@@ -166,6 +248,15 @@ class JointTrainerV3(JointTrainerV2):
 
         if loss_anchor is not None:
             metrics["loss/anchor"] = float(loss_anchor.detach())
+        if loss_act is not None:
+            metrics["loss/act"] = float(loss_act.detach())
+            metrics["act/rmse"] = float(act_rms.mean().detach())
+            metrics["act/frac_out"] = float((act_rms > float(v3.act_eps)).float().mean().detach())
+        if loss_trust is not None:
+            metrics["loss/trust"] = float(loss_trust.detach())
+            metrics["trust/rmse"] = float(rmse_tok.mean().detach())
+            metrics["trust/frac_out"] = float(
+                (rmse_tok > float(v3.trust_eps)).float().mean().detach())
         bucket = getattr(batch, "bucket", None)
         if bucket is not None:
             with torch.no_grad():
@@ -198,8 +289,22 @@ class JointTrainerV3(JointTrainerV2):
             self._accum_count = 0
         self.steps += 1
 
-        # ---------- critic 更新（GAE over 想象转移）----------
-        if self.critic is not None and self.critic_opt is not None:
+        # ---------- critic 更新 ----------
+        if (self.critic is not None and self.critic_opt is not None
+                and getattr(v3, "critic_source", "imagined") == "real"
+                and getattr(self, "_real_ret", None) is not None):
+            from .token_critic import critic_fit_supervised  # noqa: PLC0415
+            from .isaac_joint import FrameRef, canonical_to_flat, default_xi  # noqa: PLC0415
+
+            cm = critic_fit_supervised(
+                self.critic, self.critic_opt,
+                self._real_states, self._real_ref_states, self._real_xi, self._real_ret,
+                epochs=v3.critic_epochs, minibatches=v3.critic_minibatches,
+                batch=v3.critic_batch, clip_norm=v3.critic_clip, clip_value=v3.critic_value_clip,
+            )
+            metrics["critic/v_loss"] = cm["v_loss"]
+            metrics["critic/v_ev"] = cm["v_ev"]
+        elif self.critic is not None and self.critic_opt is not None:
             dones = (rollout.termination_probs[1:].detach() > 0.5).float()
             cm = critic_update(
                 self.critic, self.critic_opt,

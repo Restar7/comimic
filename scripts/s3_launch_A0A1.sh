@@ -29,6 +29,8 @@ ANCHOR=${ANCHOR:-0.05}
 PUSH_STD=${PUSH_STD:-0.03}
 PUSH_ANG=${PUSH_ANG:-0.05}
 WM_REFRESH_EVERY=${WM_REFRESH_EVERY:-50}
+TRUST_EPS=${TRUST_EPS:-0}          # token trust region 容差（0 = 关；A1 建议 0.15）
+TRUST_WEIGHT=${TRUST_WEIGHT:-0}    # hinge 权重（0 = 关；A1 建议 1.0）
 TAG=${TAG:-A0A1_h20}
 
 WBC=${WBC:-$COMIMIC/runs/S1_handover/WBC_A20000_wmvel_cmd.pt}
@@ -55,6 +57,7 @@ launch_arm() {   # $1=gpu  $2=lambda_r  $3=run name
   EXTRA="--v3 --lambda-hand $LAMBDA_HAND --critic \
          --start-source recorded --wm-refresh-every $WM_REFRESH_EVERY \
          --anchor-weight $ANCHOR --push-std $PUSH_STD --push-ang $PUSH_ANG \
+         --trust-eps $TRUST_EPS --trust-weight $TRUST_WEIGHT \
          --grad-log-every 20 --clip-head 10" \
     bash scripts/launch_joint_ha_v2.sh
 }

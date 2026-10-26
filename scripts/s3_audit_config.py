@@ -101,7 +101,7 @@ def add(cid, item, expect, got, ok, warn=False):
 
 
 # ---------------------------------------------------------------- 1. 想象步数 H
-def check_horizon(cli_h: int | None) -> int:
+def check_horizon(cli_h: int | None, allow_dev: bool = False) -> int:
     got_entry = _arg_default(_read(TRAIN_ENTRY), "--horizon")
     ok = got_entry is not None and int(got_entry) == REPLAN
     add("H0", "入口 --horizon 默认", f"{REPLAN} (= 部署重规划周期)", got_entry, ok)
@@ -114,7 +114,8 @@ def check_horizon(cli_h: int | None) -> int:
         got_queue is not None and int(got_queue) == REPLAN)
 
     h = REPLAN if cli_h is None else int(cli_h)
-    add("H3", "本次启动 H", str(REPLAN), h, h == REPLAN)
+    # H 阶梯实验会刻意偏离部署口径（只为测"裁判几步之内可信"），显式放行成 WARN
+    add("H3", "本次启动 H", str(REPLAN), h, h == REPLAN, warn=bool(allow_dev))
     return h
 
 
@@ -213,7 +214,7 @@ def check_executor():
 
 
 # ---------------------------------------------------------------- 6. 训练配方
-def check_recipe(h: int, lam_r: float | None):
+def check_recipe(h: int, lam_r: float | None, allow_dev: bool = False):
     train = _read(TRAIN_ENTRY)
     v2 = _read(TRAINER_V2)
     v3 = _read(V3_STEP)
@@ -243,8 +244,9 @@ def check_recipe(h: int, lam_r: float | None):
         boot = round(float(gam) ** h, 4)
     except Exception:                                        # noqa: BLE001
         pass
+    # gamma^H 与 H 绑定：H 阶梯实验里它必然不等于 0.8179，降级成 WARN
     add("R5", "critic bootstrap gamma^H", "0.99^20 ≈ 0.8179", f"gamma={gam} lam={lam} → {boot}",
-        gam == "0.99" and boot is not None and abs(boot - 0.8179) < 2e-3)
+        gam == "0.99" and boot is not None and abs(boot - 0.8179) < 2e-3, warn=bool(allow_dev))
 
     add("R6", "token BC 关闭（v3）", "hand-only mask[...,64:78]",
         "有" if "hand_mask[..., 64:78]" in v3 else "无", "hand_mask[..., 64:78]" in v3)
@@ -263,20 +265,46 @@ def check_recipe(h: int, lam_r: float | None):
         add("R10", "本次启动 lambda_r", "0(A0) / 0.1(A1)", lam_r, lam_r in (0.0, 0.1))
 
 
+def check_v4(launcher_src: str) -> None:
+    """v4 口径：奖励去速度 / grounded critic / 动作空间约束。"""
+    import re as _re
+
+    def _sh(var):
+        m = _re.search(rf'^{var}=\$\{{{var}:-([^}}]*)\}}', launcher_src, _re.M)
+        return m.group(1).strip() if m else None
+
+    add("V0", "奖励去速度通道 (reward_vel_scale)", "0",
+        _sh("REWARD_VEL_SCALE"), _sh("REWARD_VEL_SCALE") == "0")
+    add("V1", "critic 监督来源", "real（真录制 return-to-go）",
+        _sh("CRITIC_SOURCE"), _sh("CRITIC_SOURCE") == "real")
+    add("V2", "动作空间约束 eps", "0.30（≈1.4× 底模自身动作偏差 0.21）",
+        _sh("ACT_EPS"), _sh("ACT_EPS") == "0.30")
+    add("V3", "动作空间约束权重", "1.0", _sh("ACT_WEIGHT"), _sh("ACT_WEIGHT") == "1.0")
+    add("V4", "token 空间旧约束已关", "trust 0/0",
+        f'{_sh("TRUST_EPS")}/{_sh("TRUST_WEIGHT")}',
+        _sh("TRUST_EPS") == "0" and _sh("TRUST_WEIGHT") == "0")
+    rr = ROOT / "runs/wm_real/real_returns_vs0.pt"
+    add("V5", "真回报文件（vel_scale=0 版）", "real_returns_vs0.pt",
+        f'{rr.exists()} ({rr.stat().st_size/2**20:.0f} MB)' if rr.exists() else "缺失", rr.exists())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizon", type=int, default=None)
     ap.add_argument("--lambda-r", type=float, default=None)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--allow-horizon-deviation", action="store_true",
+                    help="H 阶梯实验：允许 --horizon != 20（只降级成 WARN）")
     ap.add_argument("--strict", action="store_true", help="WARN 也算失败")
     a = ap.parse_args()
 
-    h = check_horizon(a.horizon)
+    h = check_horizon(a.horizon, allow_dev=a.allow_horizon_deviation)
     check_replan()
     check_forward()
     check_token_space()
     check_executor()
-    check_recipe(h, a.lambda_r)
+    check_recipe(h, a.lambda_r, allow_dev=a.allow_horizon_deviation)
+    check_v4(_read(ROOT / "scripts/s3_launch_one.sh"))
 
     n_fail = sum(r[4] == "FAIL" for r in ROWS)
     n_warn = sum(r[4] == "WARN" for r in ROWS)

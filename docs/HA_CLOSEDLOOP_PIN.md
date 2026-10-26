@@ -94,6 +94,7 @@ git diff configs/ha_closedloop_pin.json      # ← 必须逐项 review
 | `HOI_grap_cup`（ArtVIP-Livingroom-GrapCup） | 本 checkout **没注册任务、没有 ArtVIP 资产**，跑不了。官方 7 类里也没有它 |
 | `FootballSingle` 的成功率绝对值 | 任务/场景都在契约里，但我们的 VLA 训练集第 7 类是 grap_cup、**没见过 football** → 对两条路线都是 OOD，只能看相对差 |
 | 训练数据 / SuperMimic ckpt 的"最优"选择 | 契约只锁**默认路径 + sha**，不锁你换哪个 ckpt 做实验（换 ckpt 不算契约漂移，但要在结果里写清） |
+| **执行器口径开关** `SONIC_HA_ALIGN`（SONIC provider）/ `SM_DRIVE`、`SM_DEFAULT_POSE`（WBC provider） | provider 源码不在契约里。`SONIC_HA_ALIGN=1` = 把 SONIC decoder 的 target/default/kp-kd 换成 HA_ALIGN 表（见 `docs/L1_SONIC_HA_ALIGN_20261026.md`）——**这是另一个执行器**，结果必须单独标臂，不得与 `SONIC_HA_ALIGN=0` 混表。日志里的 `[SonicActionProvider][ALIGN]` 行是唯一凭证 |
 | 贴图 | 当前 `wait_for_textures: false`（灰模）。要开贴图 = 改 yaml = 必须 `--write` 重新固化，**不能偷偷开** |
 
 ---

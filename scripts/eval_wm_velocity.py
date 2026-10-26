@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,16 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 for p in (ROOT, ROOT / "trackerlab-supermimic/source/trackerLab"):
     sys.path.insert(0, str(p))
+
+# LOCKED 2026-10-26 (S1.1)：G1 WBC 是用 SUPERMIMIC_HA_ALIGN=1 训的。不设这个变量，
+# `get_robot("g1")` 退回 BeyondMimic 表（action_scale mean 0.395 vs 0.379、default_q 膝 0.669
+# vs 0.42），ckpt 里的 `robot_spec` 断言会直接拒绝 —— 这正是它该做的事。
+if os.environ.get("SM_ALLOW_SCALE_MISMATCH") != "1":
+    os.environ.setdefault("SUPERMIMIC_HA_ALIGN", "1")
+    os.environ.setdefault(
+        "SUPERMIMIC_ROBOT_USD",
+        str(ROOT / "trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd"))
+print(f"[eval_wm][LOCKED] SUPERMIMIC_HA_ALIGN={os.environ.get('SUPERMIMIC_HA_ALIGN')}", flush=True)
 
 from diff_vla_wbc.data import MotionBatchProvider, RecordedTokenSource  # noqa: E402
 from diff_vla_wbc.isaac_joint import flat_state_tuple, load_isaac_bundle  # noqa: E402

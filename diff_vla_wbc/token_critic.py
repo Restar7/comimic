@@ -111,3 +111,35 @@ def critic_update(
 
 
 __all__ = ["TokenCritic", "critic_update", "gae_targets", "value_estimate"]
+
+
+def critic_fit_supervised(critic, opt, states, ref_states, xi, targets, *,
+                          epochs: int = 5, minibatches: int = 4, batch: int = 256,
+                          clip_norm: float = 1.0, clip_value: float = 0.1) -> dict:
+    """用**真数据**监督 critic（不经过 WM）：``V(s, ref, xi) → ret_to_go``。
+
+    与 ``critic_update``（想象转移上的 GAE）互补：这一条提供 grounded 的目标，
+    避免"critic 拟合想象回报 → bootstrap 又把 WM 偏差放大进策略梯度"。
+    """
+    import torch.nn.functional as F
+
+    n = int(states.shape[0])
+    bs = min(int(batch), n)
+    last_v, ev_last, n_seen = 0.0, 0.0, 0
+    for _ in range(max(1, int(epochs))):
+        for _ in range(max(1, int(minibatches))):
+            idx = torch.randint(0, n, (bs,), device=states.device)
+            v = critic(states[idx], ref_states[idx], xi[idx])
+            y = targets[idx]
+            loss = F.mse_loss(v, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), clip_norm)
+            torch.nn.utils.clip_grad_value_(critic.parameters(), clip_value)
+            opt.step()
+            with torch.no_grad():
+                var = float(y.var(unbiased=False))
+                ev = 1.0 - float(loss) / max(var, 1e-9)
+            last_v, ev_last = float(loss), ev
+            n_seen += bs
+    return {"v_loss": last_v, "v_ev": ev_last, "n": n_seen}

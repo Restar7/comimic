@@ -128,7 +128,7 @@ python -u script/eval_scripts/sonic/sim_eval_vla.py \
   --env_config_yaml "$TASK_YAML" \
   --seed 0 --max_steps "$MAX_STEPS" \
   --episode_batch_json "$OUT/batch.json" \
-  --sm_ckpt "$SM_CKPT" --sm_obs_mode relative_ori99 --sm_token_source http \
+  --sm_ckpt "$SM_CKPT" --sm_obs_mode "${SM_OBS_MODE:-auto}" --sm_token_source http \
   --sv_task_name "$INSTR" --model_label "$ROUTE" \
   --sonic_encoder_path "$SONIC_DIR/model_encoder.onnx" \
   --sonic_decoder_path "$SONIC_DIR/model_decoder.onnx" \

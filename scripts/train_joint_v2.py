@@ -221,6 +221,25 @@ def main() -> int:
     ap.add_argument("--anchor-weight", type=float, default=0.0,
                     help="先验锚定 λ_a：λ_a·‖token − 底模先验‖²（先验代理 = 标签 chunk；"
                          "底模输出与标签 MSE 只有 0.004，所以数值等价）。0 = 关。建议 0.05")
+
+    ap.add_argument("--trust-eps", type=float, default=0.0,
+                    help="token trust region 容差（相对先验的 RMSE，归一化 token 空间）。"
+                         "只在 RMSE>eps 时给力；0=关。建议 0.15（≈底模自身偏差 0.10 的 1.5×）")
+    ap.add_argument("--trust-weight", type=float, default=0.0,
+                    help="trust region hinge 权重（无量纲）。1.0 ≈ 越界即与 lambda_r*|J| 同量级")
+
+    ap.add_argument("--act-eps", type=float, default=0.0,
+                    help="动作空间 trust region 容差：(a−a_ref) 的逐关节 RMS。0=关。"
+                         "动作才是 WBC/WM 的输入，比 token 空间更本质")
+    ap.add_argument("--act-weight", type=float, default=0.0,
+                    help="动作空间 hinge 权重（无量纲）。1.0 ≈ 越界即与 lambda_r*|J| 同量级")
+    ap.add_argument("--critic-source", choices=("imagined", "real"), default="imagined",
+                    help="critic 的监督来源：imagined=想象转移 GAE（旧）；real=真录制轨迹 return-to-go（grounded）")
+    ap.add_argument("--critic-real", type=Path, default=ROOT / "runs/wm_real/real_returns.pt",
+                    help="--critic-source real 用的真回报文件（scripts/build_real_returns.py 生成）")
+    ap.add_argument("--reward-mode", choices=("saturating", "linear"), default="saturating")
+    ap.add_argument("--reward-vel-scale", type=float, default=1.0,
+                    help="奖励里速度两项的系数（0=关）。WM 的速度通道最不准（qd_corr~0.64）")
     ap.add_argument("--obs-noise", type=float, default=0.0,
                     help="观测层 DR：给 VLA 输入的**本体感觉**通道（腿/腰/臂的 q）加 ±noise rad 均匀噪声；"
                          "不动 hand / projected_gravity 通道。0 = 关")
@@ -315,7 +334,10 @@ def main() -> int:
         args.wbc_ckpt, device=device, npz=files,
         packed_motion=args.motion_packed, obs_mode=None, hist=None, token_dim=64,
     )
-    bundle.reward_mode = "saturating"     # §5 第 8 条：不改奖励核
+    bundle.reward_mode = str(args.reward_mode)
+    bundle.reward_vel_scale = float(args.reward_vel_scale)
+    print(f"[AUDIT][reward] mode={bundle.reward_mode} vel_scale={bundle.reward_vel_scale} "
+          f"(速度通道 qd_corr≈0.64 不可信；0=精确扣掉两项)", flush=True)
     bundle.posture_weight = 0.0
     print(f"[info] library = {bundle.library.summary() if hasattr(bundle.library, 'summary') else '?'}",
           flush=True)
@@ -564,21 +586,46 @@ def main() -> int:
             critic_lr=args.critic_lr, gamma=args.gamma, lam=args.lam,
             push_std=args.push_std, push_ang=args.push_ang,
             anchor_weight=args.anchor_weight,
+            trust_eps=args.trust_eps, trust_weight=args.trust_weight,
+            act_eps=args.act_eps, act_weight=args.act_weight,
+            critic_source=args.critic_source,
             grad_log_every=args.grad_log_every,
             clip_head=args.clip_head,
         )
         trainer = JointTrainerV3(bundle, vlm, codec, cfg=cfg, v3=v3cfg, device=device)
+        if args.critic_source == "real":
+            if _real is None or _recorded_states is None:
+                raise SystemExit("[fail] --critic-source real 需要 --start-source recorded 与真转移文件")
+            _rrp = Path(args.critic_real)
+            if not _rrp.exists():
+                raise SystemExit(f"[fail] 缺真回报文件 {_rrp}；先跑 scripts/build_real_returns.py")
+            _rr = torch.load(str(_rrp), map_location="cpu", weights_only=False)
+            _rr_ret = _rr["ret"]
+            if int(_rr_ret.shape[0]) != int(_recorded_states.shape[0]):
+                raise SystemExit(
+                    f"[fail] real returns 长度 {int(_rr_ret.shape[0])} != recorded_states "
+                    f"{int(_recorded_states.shape[0])}；用同一个 --reward-mode/--reward-vel-scale 重建")
+            _rr_meta = _rr.get("meta") or {}
+            for _k, _want in (("reward_mode", args.reward_mode),
+                              ("reward_vel_scale", float(args.reward_vel_scale))):
+                if _k in _rr_meta and _rr_meta[_k] != _want:
+                    raise SystemExit(
+                        f"[fail] real returns 的 {_k}={_rr_meta[_k]} 与本次训练 {_want} 不一致；"
+                        "重建：python3 scripts/build_real_returns.py --reward-mode ... --reward-vel-scale ...")
+            trainer.attach_real_returns(_rr_ret, _recorded_states, bundle.motion.ref.detach().float())
         (out / "v3_config.json").write_text(json.dumps(v3cfg.__dict__, indent=1, default=str))
         # 口径的一行真相：token 监督 / 手部 / 锚定 / DR 分桶 / critic 自举 / WM 保鲜
         _pn, _pm = float(args.dr_p_nominal), float(args.dr_p_mid)
         print(
             f"[AUDIT][v3] token_BC=OFF hand_mask=64:78 lam_hand={args.lambda_hand} "
             f"lam_r={args.lambda_r} anchor={args.anchor_weight} "
+            f"trust=({args.trust_eps},{args.trust_weight}) "
             f"dr={bool(args.dr)} buckets={_pn:.2f}/{_pm:.2f}/{max(0.0, 1-_pn-_pm):.2f} "
             f"dr_max(xy,yaw,dq,dqd)=({args.dr_xy_max},{args.dr_yaw_max},{args.dr_dq_max},{args.dr_dqd_max}) "
             f"start={args.start_source} burnin={0 if args.no_burnin else args.burnin_steps} "
             f"push=({args.push_std},{args.push_ang}) "
-            f"critic={args.critic} lam={args.lam} gamma^H={args.gamma ** args.horizon:.4f} "
+            f"critic={args.critic}/{args.critic_source} lam={args.lam} gamma^H={args.gamma ** args.horizon:.4f} "
+            f"act=({args.act_eps},{args.act_weight}) reward=({args.reward_mode},{args.reward_vel_scale}) "
             f"wm_refresh_every={args.wm_refresh_every} clip_head={args.clip_head} "
             f"H={args.horizon} K={args.fm_steps} batch={args.batch_size} accum={args.grad_accum}",
             flush=True,
