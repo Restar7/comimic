@@ -67,6 +67,10 @@ def _rand(batch: int, device, generator, scale: float) -> torch.Tensor:
     生成器与目标张量可能不同设备（provider 的种子生成器在 CPU 上，为了让同一 seed 在
     任意设备上给出同一组扰动），所以先按生成器设备采样再搬到目标设备。
     """
+    if torch.is_tensor(scale):
+        sc = scale.to(device).reshape(-1, 1)
+        u = torch.rand(batch, 1, device=device, generator=generator)
+        return (u * 2.0 - 1.0) * sc
     if scale <= 0:
         return torch.zeros(batch, device=device)
     dev = torch.device(device)
@@ -121,6 +125,7 @@ def sample_burnin(
     port_tokens: Callable[[torch.Tensor], torch.Tensor],
     token_fn: Callable[..., torch.Tensor] | None = None,
     recorded_states: torch.Tensor | None = None,
+    perturb_scales: torch.Tensor | None = None,   # (B,4) = xy, yaw, dq, dqd（DR 用，覆盖标量）
     horizon: int,
     k: int = 10,
     xi: torch.Tensor | None = None,
@@ -177,7 +182,11 @@ def sample_burnin(
         state = start["state"]
         history = start["observations"].clone()        # (H_in,B,W)
         a_prev = start["prev_action"]
-    if perturb:
+    if perturb and perturb_scales is not None:
+        _ps = perturb_scales.to(state.device).float()
+        state = perturb_state(state, xy=_ps[:, 0], yaw=_ps[:, 1], dq=_ps[:, 2], dqd=_ps[:, 3],
+                              generator=generator)
+    elif perturb:
         state = perturb_state(state, xy=xy, yaw=yaw, dq=dq, dqd=dqd, generator=generator)
 
     refs_k = bundle.teacher_references(motion, f0, int(k)) if k > 0 else []

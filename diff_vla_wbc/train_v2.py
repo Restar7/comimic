@@ -390,6 +390,7 @@ class BurnInBatchProvider:
         wbc_chunk_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
         online_tokens=None,
         recorded_states: torch.Tensor | None = None,
+        dr=None,                     # diff_vla_wbc.dr.DRConfig：域随机化（分桶）
         batch_size: int = 4,
         horizon: int = 16,
         token_horizon: int = 40,
@@ -415,6 +416,7 @@ class BurnInBatchProvider:
         self.online_tokens = online_tokens
         # v3：真录制机器人状态（起点用它，而不是参考帧）
         self.recorded_states = recorded_states
+        self.dr = dr
         self.batch_size = int(batch_size)
         self.horizon = int(horizon)
         self.token_horizon = int(token_horizon)
@@ -442,12 +444,18 @@ class BurnInBatchProvider:
         base = self.inner.sample(frames)
         frames = base.frames
         port_chunk = self.port_source(frames)
+        _dr_scales, _dr_bucket = None, None
+        if self.dr is not None:
+            from .dr import sample_batch  # noqa: PLC0415
+
+            _dr_scales, _dr_bucket = sample_batch(int(frames.numel()), self.dr, generator=self.rng)
         if self.burnin and self.burnin_steps > 0:
             bi = sample_burnin(
                 self.bundle, self.library, frames,
                 port_tokens=self.port_frame_source,
                 token_fn=(self.online_tokens if self.online_tokens is not None else None),
                 recorded_states=self.recorded_states,
+                perturb_scales=_dr_scales,
                 horizon=self.horizon, k=self.burnin_steps,
                 generator=self.rng,
                 perturb=self.perturb, **self.p,
@@ -475,6 +483,8 @@ class BurnInBatchProvider:
         else:
             base.wbc_tokens = self.wbc_chunk_source(frames)
         base.burnin = bi
+        base.bucket = (_dr_bucket.to(self.bundle.device) if _dr_bucket is not None
+                       else torch.zeros(frames.numel(), dtype=torch.long, device=self.bundle.device))
         return base
 
     def _reference_start(self, frames: torch.Tensor) -> BurnInResult:
