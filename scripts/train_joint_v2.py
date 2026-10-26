@@ -189,7 +189,9 @@ def main() -> int:
     ap.add_argument("--critic-lr", type=float, default=3e-4)
     ap.add_argument("--lam", type=float, default=0.95, help="GAE lambda")
     ap.add_argument("--push-std", type=float, default=0.0,
-                    help="rollout 内过程扰动：每步给 root 线/角速度加 U(-std,std)")
+                    help="rollout 内过程扰动：每步给 root **线速度**加 U(-std,std) m/s")
+    ap.add_argument("--push-ang", type=float, default=0.0,
+                    help="同上，root 角速度 rad/s（要小，否则软终止会打断想象）")
     ap.add_argument("--start-source", choices=("reference", "recorded"), default="reference",
                     help="burn-in 起点：recorded = 真录制机器人状态（v3 推荐）")
     ap.add_argument("--real-transitions", type=Path,
@@ -202,8 +204,9 @@ def main() -> int:
     ap.add_argument("--wm-kl-anchor", type=float, default=1e-3)
     ap.add_argument("--grad-log-every", type=int, default=0,
                     help="每 N 步打印分项梯度范数（奖励 vs 手部）")
-    ap.add_argument("--clip-head", type=float, default=0.5,
-                    help="VLA head 的梯度范数裁剪阈值。1.0 只适合小 MLP；1.6B head 要先测 p99 再定")
+    ap.add_argument("--clip-head", type=float, default=10.0,
+                    help="VLA head 的梯度范数裁剪阈值（只做防尖峰；Adam/AdamW 下全局缩放近似无效果，"
+                         "实测 pre-clip 范数 4–9，所以默认 10）")
     ap.add_argument("--state-vel-weight", type=float, default=0.05)
     ap.add_argument("--fm-lr", type=float, default=1e-5)
     ap.add_argument("--fm-clip", type=float, default=0.5)
@@ -471,7 +474,8 @@ def main() -> int:
         v3cfg = V3Config(
             lambda_r=args.lambda_r, lambda_hand=args.lambda_hand, use_critic=args.critic,
             critic_lr=args.critic_lr, gamma=args.gamma, lam=args.lam,
-            push_std=args.push_std, grad_log_every=args.grad_log_every,
+            push_std=args.push_std, push_ang=args.push_ang,
+            grad_log_every=args.grad_log_every,
             clip_head=args.clip_head,
         )
         trainer = JointTrainerV3(bundle, vlm, codec, cfg=cfg, v3=v3cfg, device=device)
@@ -597,7 +601,8 @@ def main() -> int:
         "wbc_token_space": args.wbc_token_space,
         "token_space_mismatch": bool(_space_mismatch),
         "v3": bool(args.v3), "lambda_hand": float(args.lambda_hand),
-        "push_std": float(args.push_std), "start_source": str(args.start_source),
+        "push_std": float(args.push_std), "push_ang": float(args.push_ang),
+        "clip_head": float(args.clip_head), "start_source": str(args.start_source),
         "wm_refresh_every": int(args.wm_refresh_every),
         "wbc_token_window": str(args.wbc_token_window),
         "wbc_token_source": str(args.wbc_token_source),

@@ -43,7 +43,8 @@ class V3Config:
     critic_minibatches: int = 4
     critic_clip: float = 1.0          # SuperMimic: clip_grad_norm_(critic, 1.0)
     critic_value_clip: float = 0.1    # SuperMimic: clip_grad_value_(critic, 0.1)
-    push_std: float = 0.0             # rollout 内过程扰动（root 线/角速度）
+    push_std: float = 0.0             # rollout 内过程扰动：root **线速度**（m/s）
+    push_ang: float = 0.0             # 同上，root 角速度（rad/s）；太大会直接触发软终止
     grad_log_every: int = 0           # 打印分项梯度范数
     clip_head: float = 0.5            # VLA head 的梯度范数裁剪（先测再定，见文档 §2.6）
 
@@ -106,7 +107,7 @@ class JointTrainerV3(JointTrainerV2):
             self.bundle, tokens=tokens, state=batch.start_state, obs_hist=batch.obs_hist,
             history=batch.history, xi=batch.xi, references=batch.references,
             prev_action=batch.prev_action, horizon=cfg.horizon,
-            obs_noise=cfg.obs_noise, push_std=v3.push_std,
+            obs_noise=cfg.obs_noise, push_std=v3.push_std, push_ang=v3.push_ang,
         )
         H = cfg.horizon
         ret = discounted_return(rollout, v3.gamma)               # (B,)
@@ -189,12 +190,13 @@ class JointTrainerV3(JointTrainerV2):
 
     # ------------------------------------------------------------------ WM 保鲜
     def refresh_wm(self, data: dict, *, steps: int = 200, batch: int = 2048,
-                   lr: float = 1e-4, vel_weight: float = 5.0, kl_anchor: float = 1e-3) -> dict:
+                   lr: float = 1e-4, vel_weight: float = 5.0, kl_anchor: float = 1e-3,
+                   log=None) -> dict:
         from .wm_refresh import refresh_wm  # noqa: PLC0415
 
         out = refresh_wm(self.bundle.wm, data, steps=steps, batch=batch, lr=lr,
                          vel_weight=vel_weight, kl_anchor=kl_anchor, device=self.device,
-                         log=self.log)
+                         log=self.log if log is None else log)
         from .rollout import freeze_world_model  # noqa: PLC0415
 
         freeze_world_model(self.bundle.wm)

@@ -302,6 +302,7 @@ def imagine_with_tokens(
     horizon: int = 8,
     obs_noise: float = 0.0,
     push_std: float = 0.0,
+    push_ang: float = 0.0,
 ) -> Rollout:
     """Token route: the conditioning is the VLA's own 64-d motion token.
 
@@ -353,12 +354,19 @@ def imagine_with_tokens(
         obs_flat = _flat_history(bundle, history)
         action = _call_act(bundle, obs_flat, cond, ref)
         next_state = bundle.step(current, action, xi)
-        if push_std and push_std > 0:
-            # 过程扰动：每步给 root 线/角速度加噪（state 36:42），制造中段偏离，
+        if (push_std and push_std > 0) or (push_ang and push_ang > 0):
+            # 过程扰动：root 线速度（36:39）/角速度（39:42）加噪，制造中段偏离，
             # 让 token 的好坏真正有差别（标称条件下区分度只有 ~6%）。
-            kick = (torch.rand_like(next_state[:, 36:42]) * 2.0 - 1.0) * float(push_std)
+            # 角速度要小：它直接推动 tilt，过大会让软终止把整段想象打断。
+            lin = torch.zeros_like(next_state[:, 36:39])
+            ang = torch.zeros_like(next_state[:, 39:42])
+            if push_std and push_std > 0:
+                lin = (torch.rand_like(lin) * 2.0 - 1.0) * float(push_std)
+            if push_ang and push_ang > 0:
+                ang = (torch.rand_like(ang) * 2.0 - 1.0) * float(push_ang)
             next_state = torch.cat(
-                (next_state[:, :36], next_state[:, 36:42] + kick, next_state[:, 42:]), dim=-1
+                (next_state[:, :36], next_state[:, 36:39] + lin, next_state[:, 39:42] + ang,
+                 next_state[:, 42:]), dim=-1
             )
         bodies = _call_robot_bodies(bundle, next_state)
         terms = bundle.reward(next_state, action, a_prev, ref, bodies)
