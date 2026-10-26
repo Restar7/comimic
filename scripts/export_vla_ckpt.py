@@ -190,7 +190,10 @@ def main() -> None:
         else:
             dst.symlink_to(src.resolve())
 
-    (args.out / INDEX_NAME).symlink_to((args.base / INDEX_NAME).resolve())
+    _idx_dst = args.out / INDEX_NAME
+    if _idx_dst.exists() or _idx_dst.is_symlink():      # 重复导出到同一目录必须幂等
+        _idx_dst.unlink()
+    _idx_dst.symlink_to((args.base / INDEX_NAME).resolve())
     for name in SIDE_FILES:
         src = args.base / name
         dst = args.out / name
