@@ -32,6 +32,11 @@ os.environ.setdefault(
     str(ROOT / "trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd"),
 )
 sys.path.insert(0, str(ROOT))
+# trackerTask（robot spec）在 trackerlab-supermimic/source 下
+for _p in (ROOT / "trackerlab-supermimic/source/trackerTask",
+           ROOT / "trackerlab-supermimic/source/trackerLab"):
+    if _p.is_dir() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 
 def main() -> int:
@@ -71,6 +76,25 @@ def main() -> int:
             q = np.asarray(z["joint_pos"], np.float32)
             qd = np.asarray(z["joint_vel"], np.float32)
         T = min(len(pos), len(q), lengths[ci])
+        # !! 录制的 root 线/角速度全是 0（实测 std=0），必须用差分补 —— 否则 WM 会把速度
+        #    通道拟合成常数，归一化时 1/std^2 还会炸到 1e12。
+        dt = 1.0 / float(z["fps"]) if "fps" in z else 0.02
+        lin = np.gradient(pos[:T].astype(np.float64), dt, axis=0).astype(np.float32)
+        q = q.astype(np.float32)
+        _qa, _qb = quat[:-1].astype(np.float64), quat[1:].astype(np.float64)
+        def _qmul(x, y):
+            x0, x1, x2, x3 = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
+            y0, y1, y2, y3 = y[..., 0], y[..., 1], y[..., 2], y[..., 3]
+            return np.stack([x0 * y0 - x1 * y1 - x2 * y2 - x3 * y3,
+                             x0 * y1 + x1 * y0 + x2 * y3 - x3 * y2,
+                             x0 * y2 - x1 * y3 + x2 * y0 + x3 * y1,
+                             x0 * y3 + x1 * y2 - x2 * y1 + x3 * y0], -1)
+        _qinv = np.concatenate([_qb[:, :1], -_qb[:, 1:]], 1)
+        _dq = _qmul(_qa, _qinv)
+        _dq = _dq / (np.linalg.norm(_dq, axis=-1, keepdims=True) + 1e-9)
+        _dq = np.where(_dq[:, :1] < 0, -_dq, _dq)
+        ang = (2.0 * _dq[:, 1:] / dt).astype(np.float32)
+        ang = np.concatenate([ang, ang[-1:]], 0)
         s = np.concatenate([pos[:T], quat[:T], q[:T], lin[:T], ang[:T], qd[:T]], 1)  # (T,71)
         st = starts[ci]
         act = cmd_q[st + 1 : st + T + 1]                          # a_t 用 t+1 的命令（q_target 语义）
@@ -92,6 +116,13 @@ def main() -> int:
         "default_q": dq, "action_scale": sc,
         "meta": {"source": str(a.npz_dir), "cmd": str(a.packed),
                  "note": "s=executed(q from npz, root vel from npz); a=(cmd_q(t+1)-dq)/scale"},
+    }
+    _st = out["states"]
+    out["scales"] = {
+        "v": _st[:, 36:39].std(0).clamp_min(1e-2),
+        "w": _st[:, 39:42].std(0).clamp_min(1e-2),
+        "qd": _st[:, 42:71].std(0).clamp_min(1e-2),
+        "p": _st[:, 0:3].std(0).clamp_min(1e-2),
     }
     a.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(out, a.out)
