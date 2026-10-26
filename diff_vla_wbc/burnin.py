@@ -61,6 +61,13 @@ class BurnInResult:
     hist_states: torch.Tensor | None = None          # (B,K+1,71) burn-in 轨迹（诊断）
 
 
+def _scale_active(scale) -> bool:
+    """标量或 per-sample 张量（DR）：只要有一个样本要扰动就进入分支。"""
+    if torch.is_tensor(scale):
+        return bool(float(scale.abs().max()) > 0)
+    return float(scale) > 0
+
+
 def _rand(batch: int, device, generator, scale: float) -> torch.Tensor:
     """U(-scale, scale) ``(B,)``；``generator=None`` 时用全局 RNG。
 
@@ -95,9 +102,9 @@ def perturb_state(
         raise ValueError(f"expected flat state (B,71), got {tuple(state.shape)}")
     out = state.clone()
     b, device = out.shape[0], out.device
-    if xy > 0:
+    if _scale_active(xy):
         out[:, 0:2] += _rand(b, device, generator, xy)[:, None]
-    if yaw > 0:
+    if _scale_active(yaw):
         from trackerLab.kinematics.supermimic.rotations import (  # noqa: PLC0415
             axis_angle_to_mat,
             mat_to_quat,
@@ -109,9 +116,9 @@ def perturb_state(
         axis[:, 2] = 1.0
         R = axis_angle_to_mat(axis, ang) @ quat_to_mat(out[:, 3:7])
         out[:, 3:7] = mat_to_quat(R)
-    if dq > 0:
+    if _scale_active(dq):
         out[:, 7:36] += _rand(b, device, generator, dq)[:, None]
-    if dqd > 0:
+    if _scale_active(dqd):
         out[:, 42:71] += _rand(b, device, generator, dqd)[:, None]
     return out
 
