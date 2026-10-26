@@ -157,6 +157,10 @@ def main() -> int:
     ap.add_argument("--prefetch-vla", dest="prefetch_vla", action="store_true", default=True)
     ap.add_argument("--no-prefetch-vla", dest="prefetch_vla", action="store_false")
     ap.add_argument("--time-budget-minutes", type=float, default=0.0)
+    # ---------------- 门禁（S3 四道自检，不训练）----------------
+    ap.add_argument("--gate-only", action="store_true",
+                    help="只跑 codec / 冻结 / burn-in / FM-BC 四道门禁（写 gates.json 后退出）")
+    ap.add_argument("--gate-out", type=Path, default=None)
     args = ap.parse_args()
 
     _forbid_legacy_dataset(args.motion, "--motion")
@@ -286,6 +290,26 @@ def main() -> int:
 
     # 起点就做一次冻结门禁（S3.2）：之后每次保存都会再比一次
     assert_wbc_frozen(bundle, args.wbc_ckpt)
+
+    # ---------------------------------------------------------------- 门禁模式（不训练）
+    if args.gate_only:
+        from diff_vla_wbc.v2_gates import run_gates  # noqa: PLC0415
+
+        ref_provider = BurnInBatchProvider(
+            bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
+            batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
+            seed=int(args.seed), hand_dir=args.motion[0],
+            burnin=False,                    # 对照组：起点 = 参考帧（旧口径）
+            perturb=False,
+        )
+        gates = run_gates(
+            args, bundle, vlm, codec, trainer, provider, ref_provider, processor,
+            args.gate_out or (out / "gates.json"),
+        )
+        prefetch.close()
+        return 0 if all(
+            bool(v.get("pass", True)) for k, v in gates.items() if not k.startswith("_")
+        ) else 1
 
     # ---------------------------------------------------------------- 固定评测窗口（S3.7）
     eval_batches = []
