@@ -4,7 +4,8 @@
 | ---- | -------- | -------- |
 | A codec | ``codec.decode`` 与 GR00T ``processor.decode_action`` 逐元素一致；``encode∘decode`` 往返 | max|Δ| < 1e-5 |
 | B freeze | WBC/WM 无 ``requires_grad``；``pi`` 与源 ckpt 逐张量相等；一步反传后 policy/WM 的 ``.grad`` 全为 None | 全过 |
-| C burn-in | GT 端口 token、H=16：burn-in 起点的回报 **低于** 参考起点（说明有误差可修），存活 ≥0.95 | 两条都过 |
+| C burn-in | 同批帧上 burn-in 起点 vs 参考起点：起点真的被扰开（xy>1cm）、存活 ≥0.95；回报差单列 | 硬条件都过 |
+| C2 token 对比 | **同一起点**下 GT token vs 零/随机 token 的想象回报差（奖励通道有没有信号，J7/D1） | contrast > 0 且 rel > 0.1% |
 | D FM-BC | 一次真实 batch 的前向/反向：``loss/fm_bc`` 有限、梯度只落在 head、``grad_ratio`` 有限 | 全过 |
 
 结果写 ``runs/.../gates.json``，控制台同时打印 ``[GATE]`` 行。
@@ -126,24 +127,75 @@ def gate_burnin(trainer, provider, ref_provider, *, n_batches: int = 4) -> dict:
             acc["burnin_reward"].append(float(b_burn.burnin.burnin_reward.mean()))
     mean = {k: float(np.mean(v)) if v else 0.0 for k, v in acc.items()}
     reward_drop = mean["ref_reward"] - mean["burn_reward"]
-    ok = (
-        frames_match
-        and mean["burn_reward"] <= mean["ref_reward"]
-        and mean["burn_survival"] >= 0.95
-    )
+    # 通过条件（三条"起点确实不同"的硬条件）：
+    #   ① 同一批帧 ② 起点被真的扰开（xy > 1 cm）③ burn-in 没把存活打崩（≥0.95）
+    # ``reward_drop`` 仍然打印并单列：它检验"起点误差会不会让想象回报下降"。
+    # 2026-10-26 实测：WM 在 H=16 内几乎不失配（survival≈1），这一步的回报差是噪声级
+    #   → 真正的信号强度由 C2 token 对比度来量（同一起点下 GT vs 零 token）。
+    ok = frames_match and mean["start_err"] > 0.01 and mean["burn_survival"] >= 0.95
+    drop_ok = mean["burn_reward"] <= mean["ref_reward"]
     print(f"[GATE][burnin] {'PASS' if ok else 'FAIL'} "
           f"reward ref={mean['ref_reward']:.5f} -> burn={mean['burn_reward']:.5f} "
-          f"(drop={reward_drop:.5f}) survival ref={mean['ref_survival']:.4f} "
-          f"burn={mean['burn_survival']:.4f} start_xy_err={mean['start_err']:.4f}m "
+          f"(drop={reward_drop:+.5f}, drop_sign_ok={drop_ok}) "
+          f"survival ref={mean['ref_survival']:.4f} burn={mean['burn_survival']:.4f} "
+          f"start_xy_err={mean['start_err']:.4f}m "
           f"burnin_reward={mean['burnin_reward']:.5f} frames_match={frames_match}",
           flush=True)
     return {
-        "pass": bool(ok),
+        "pass": bool(ok), "reward_drop_sign_ok": bool(drop_ok),
         "reward_ref": mean["ref_reward"], "reward_burn": mean["burn_reward"],
         "reward_drop": float(reward_drop),
         "survival_ref": mean["ref_survival"], "survival_burn": mean["burn_survival"],
         "start_xy_err_m": mean["start_err"], "burnin_reward": mean["burnin_reward"],
         "frames_match": bool(frames_match), "n_batches": int(n_batches),
+    }
+
+
+@torch.no_grad()
+def gate_token_contrast(trainer, provider, *, n_batches: int = 4) -> dict:
+    """C2：**同一个起点**下，想象回报对 token 的区分度（奖励通道有没有信号）。
+
+    这是 J7/D1 的直接检验：如果 GT token 与零/随机 token 的回报一样，那 λ_r>0 只是在
+    给一堆噪声求导（复核 §0.5 的担心），必须先回去改起点或 WM，而不是加权重。
+
+    对照：gt（WBC 空间的录制 token）/ zeros / randn / shuffled（batch 内打乱）。
+    """
+    cfg = trainer.cfg
+    keys = ("gt", "zeros", "randn", "shuffled")
+    acc: dict[str, list[float]] = {f"{k}_{m}": [] for k in keys for m in ("ret", "r0", "surv")}
+    for _ in range(n_batches):
+        b = provider.sample()
+        gt = b.port_tokens
+        perm = torch.randperm(gt.shape[0], device=gt.device)
+        variants = {
+            "gt": gt,
+            "zeros": torch.zeros_like(gt),
+            "randn": torch.randn_like(gt),
+            "shuffled": gt[perm],
+        }
+        for k, tok in variants.items():
+            ro = trainer._rollout(b, tok)
+            acc[f"{k}_ret"].append(float(discounted_return(ro, cfg.gamma).mean()))
+            acc[f"{k}_r0"].append(float(ro.rewards[0].mean()))
+            acc[f"{k}_surv"].append(float(ro.survival[-1].mean()))
+    m = {k: float(np.mean(v)) for k, v in acc.items()}
+    sd = {k: float(np.std(v)) for k, v in acc.items()}
+    contrast = m["gt_ret"] - m["zeros_ret"]
+    rel = contrast / max(abs(m["gt_ret"]), 1e-9)
+    ok = contrast > 0 and rel > 1e-3
+    print(f"[GATE][contrast] {'PASS' if ok else 'FAIL'} "
+          f"ret gt={m['gt_ret']:.5f} zeros={m['zeros_ret']:.5f} randn={m['randn_ret']:.5f} "
+          f"shuffled={m['shuffled_ret']:.5f} | contrast(gt-zeros)={contrast:+.6f} "
+          f"rel={rel:+.3%} (sd_gt={sd['gt_ret']:.5f}) "
+          f"r0 gt={m['gt_r0']:.5f} zeros={m['zeros_r0']:.5f} "
+          f"surv gt={m['gt_surv']:.4f} zeros={m['zeros_surv']:.4f}", flush=True)
+    return {
+        "pass": bool(ok),
+        **{k: round(v, 8) for k, v in m.items()},
+        **{f"sd_{k}": round(v, 8) for k, v in sd.items()},
+        "contrast_gt_minus_zeros": round(float(contrast), 8),
+        "contrast_rel": round(float(rel), 8),
+        "n_batches": int(n_batches),
     }
 
 
@@ -203,6 +255,7 @@ def run_gates(
     batch.model_inputs = _processed_batch_for(batch, args, processor)
     gates["B_freeze"] = gate_freeze(bundle, args.wbc_ckpt, trainer, batch, log=log)
     gates["C_burnin"] = gate_burnin(trainer, provider, ref_provider, n_batches=n_batches)
+    gates["C2_token_contrast"] = gate_token_contrast(trainer, provider, n_batches=n_batches)
     batch2 = provider.sample()
     batch2.model_inputs = _processed_batch_for(batch2, args, processor)
     gates["D_fm_bc"] = gate_fm_bc(trainer, batch2, log=log)
@@ -220,4 +273,4 @@ def run_gates(
     return gates
 
 
-__all__ = ["gate_burnin", "gate_codec", "gate_fm_bc", "gate_freeze", "run_gates"]
+__all__ = ["gate_burnin", "gate_codec", "gate_fm_bc", "gate_freeze", "gate_token_contrast", "run_gates"]
