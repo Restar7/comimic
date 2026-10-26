@@ -220,6 +220,30 @@ class MotionBatch:
         return self.__dict__.copy()
 
 
+def resolve_clip_files(npz_dir: str | Path, names: list[str]) -> list[Path]:
+    """按库里的 clip 名找 npz；名字对不上时退回**同序号**文件。
+
+    2026-10-26（token 前端交接）：`runs/isaac_motion/ha_cmd/packed.pt` 是从 `data/ha_raw` 建的，
+    clip 名是 raw 的 `ep<timestamp>`；而 `data/npz/ha_tokens` 的 stem 是顺序号 `ep000000`。
+    两个库的 **clip 数与每段长度逐位相同**（699 / 634016，lengths 全等），只是命名不同，
+    所以按序号回退是安全的（帧对齐不受影响）。
+    """
+    npz_dir = Path(npz_dir)
+    files = sorted(npz_dir.glob("*.npz"))
+    by_name = {p.stem: p for p in files}
+    miss = [n for n in names if n not in by_name]
+    if not miss:
+        return [by_name[n] for n in names]
+    if len(files) != len(names):
+        raise FileNotFoundError(
+            f"{npz_dir}: {len(miss)}/{len(names)} 个 clip 名找不到，且文件数 {len(files)} != {len(names)}；"
+            f"前几个缺失名：{miss[:3]}"
+        )
+    print(f"[data][warn] {npz_dir}: {len(miss)}/{len(names)} 个 clip 名与库不一致"
+          f"（例：{miss[0]}），按**同序号**回退（长度已核对一致）", flush=True)
+    return files
+
+
 class RecordedTokenSource:
     """Replay the dataset's own motion tokens (``g1_motion_token_64``) as the conditioning.
 
@@ -275,11 +299,15 @@ class RecordedTokenSource:
         self.label_used = 0
         self._starts = [int(c.start) for c in library.clips]
         self._names = [c.name for c in library.clips]
+        # 名字对不上（ha_cmd 库用 raw ep id）→ 按同序号回退，见 resolve_clip_files
+        self._files = resolve_clip_files(self.npz_dir, self._names)
         self._cache: dict[str, torch.Tensor] = {}
         self._bisect = bisect.bisect_right
 
     def _load_token(self, name: str) -> torch.Tensor:
-        port = self.port_dir / f"{name}.npy"
+        _npz = self._files[self._names.index(name)] if name in self._names else None
+        _stem = _npz.stem if _npz is not None else name
+        port = self.port_dir / f"{_stem}.npy"
         if self.token_space == "label":
             port = None            # 强制走 npz 标签
         if port is not None and not port.is_file() and self.token_space == "port":
@@ -288,7 +316,8 @@ class RecordedTokenSource:
             tok = torch.as_tensor(np.load(port), dtype=torch.float32)
             self.port_used += 1
             return tok
-        with np.load(self.npz_dir / f"{name}.npz") as d:
+        _path = _npz if _npz is not None else self.npz_dir / f"{name}.npz"
+        with np.load(_path) as d:
             if "g1_motion_token_64" not in d:
                 raise KeyError(f"{name}.npz has no g1_motion_token_64 (recorded token)")
             self.label_used += 1
@@ -344,6 +373,9 @@ class MotionBatchProvider:
         self._hand_cache: dict[str, torch.Tensor] = {}
         self._hand_starts = [int(c.start) for c in library.clips]
         self._hand_names = [c.name for c in library.clips]
+        self._hand_files = (
+            resolve_clip_files(self.hand_dir, self._hand_names) if self.hand_dir is not None else None
+        )
         self.batch_size = int(batch_size)
         self.horizon = int(horizon)
         self.token_source = token_source
@@ -414,7 +446,9 @@ class MotionBatchProvider:
                 name = self._hand_names[ci]
                 tok = self._hand_cache.get(name)
                 if tok is None:
-                    with np.load(self.hand_dir / f"{name}.npz") as z:
+                    _hp = (self._hand_files[ci] if self._hand_files is not None
+                           else self.hand_dir / f"{name}.npz")
+                    with np.load(_hp) as z:
                         tok = torch.as_tensor(np.ascontiguousarray(z["g1_hand_joints_14"]), dtype=torch.float32)
                     if len(self._hand_cache) > 128:
                         self._hand_cache.clear()
@@ -516,6 +550,7 @@ def sample_reference_windows(
 
 __all__ = [
     "MotionBatch",
+    "resolve_clip_files",
     "MotionBatchProvider",
     "motion_npz_from_body_csv_dir",
     "motion_npz_from_lafan1_csv",

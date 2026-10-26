@@ -150,7 +150,7 @@ def main() -> int:
                     help="BC 目标的 token 空间。S0.4：npz 的 g1_motion_token_64 与录制 "
                          "encoder_latent 逐位相等，是 VLA 的原生空间 -> 默认 label；"
                          "port 只用于复现旧行为")
-    ap.add_argument("--wbc-token-space", choices=("label", "port"), default="port",
+    ap.add_argument("--wbc-token-space", choices=("auto", "label", "port"), default="auto",
                     help="冻结 WBC 的训练空间（burn-in 的 conditioning 必须用它）。当前 "
                          "WBC_v2 是端口空间；S1 用标签空间重训后改成 label")
     ap.add_argument("--motion-packed", type=Path, default=PACKED_CMD_MOTION,
@@ -305,6 +305,9 @@ def main() -> int:
     # hold 窗口 + 仿真机器人 anchor（B 模式）。BC 标签仍是 npz 的 g1_motion_token_64。
     from diff_vla_wbc.sonic_frontend import LibraryTokenBuilder, library_kind  # noqa: PLC0415
 
+    # token 空间跟着窗口口径走：hold ⇒ label（HA 录制/部署口径），future ⇒ port（旧端口空间）
+    if getattr(args, "wbc_token_space", "auto") == "auto":
+        args.wbc_token_space = "label" if args.wbc_token_window == "hold" else "port"
     _lib_kind = library_kind(args.motion_packed)
     if args.wbc_token_window == "hold" and _lib_kind != "command" and not args.allow_library_mismatch:
         raise SystemExit(
