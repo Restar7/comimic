@@ -389,6 +389,7 @@ class BurnInBatchProvider:
         port_frame_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
         wbc_chunk_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
         online_tokens=None,
+        recorded_states: torch.Tensor | None = None,
         batch_size: int = 4,
         horizon: int = 16,
         token_horizon: int = 40,
@@ -412,6 +413,8 @@ class BurnInBatchProvider:
         # 环内 token（hold builder + 仿真 anchor）：非 None 时 burn-in 与 GT 臂都用它，
         # 侧车源只作回退（交接文档 §5.3）。
         self.online_tokens = online_tokens
+        # v3：真录制机器人状态（起点用它，而不是参考帧）
+        self.recorded_states = recorded_states
         self.batch_size = int(batch_size)
         self.horizon = int(horizon)
         self.token_horizon = int(token_horizon)
@@ -444,6 +447,7 @@ class BurnInBatchProvider:
                 self.bundle, self.library, frames,
                 port_tokens=self.port_frame_source,
                 token_fn=(self.online_tokens if self.online_tokens is not None else None),
+                recorded_states=self.recorded_states,
                 horizon=self.horizon, k=self.burnin_steps,
                 generator=self.rng,
                 perturb=self.perturb, **self.p,
