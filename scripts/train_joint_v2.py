@@ -204,6 +204,21 @@ def main() -> int:
     ap.add_argument("--wm-kl-anchor", type=float, default=1e-3)
     ap.add_argument("--grad-log-every", type=int, default=0,
                     help="每 N 步打印分项梯度范数（奖励 vs 手部）")
+    # ---------------- DR（域随机化）+ 模型可信度 ----------------
+    ap.add_argument("--dr", dest="dr", action="store_true", default=True,
+                    help="域随机化：起点/过程扰动按 nominal/mid/hard 分层采样（默认开）")
+    ap.add_argument("--no-dr", dest="dr", action="store_false")
+    ap.add_argument("--dr-xy-max", type=float, default=0.20, help="hard 桶的 root xy 上限 (m)")
+    ap.add_argument("--dr-yaw-max", type=float, default=0.25, help="hard 桶的 yaw 上限 (rad)")
+    ap.add_argument("--dr-dq-max", type=float, default=0.05)
+    ap.add_argument("--dr-dqd-max", type=float, default=0.30)
+    ap.add_argument("--dr-p-nominal", type=float, default=0.25)
+    ap.add_argument("--dr-p-mid", type=float, default=0.45)
+    ap.add_argument("--lambda-u", type=float, default=0.0,
+                    help="WM 集成分歧惩罚：r_t ← r_t·exp(−λ_u·u_t)。建议 1.0 起")
+    ap.add_argument("--ensemble", dest="ensemble", action="store_true", default=False,
+                    help="用已有的多个 WM 做集成分歧（--lambda-u>0 时生效）")
+    ap.add_argument("--ensemble-ckpts", nargs="*", type=Path, default=None)
     ap.add_argument("--clip-head", type=float, default=10.0,
                     help="VLA head 的梯度范数裁剪阈值（只做防尖峰；Adam/AdamW 下全局缩放近似无效果，"
                          "实测 pre-clip 范数 4–9，所以默认 10）")
@@ -338,6 +353,20 @@ def main() -> int:
         raise SystemExit(f"[fail] 需要 {args.real_transitions}；先跑 scripts/build_real_transitions.py")
     _recorded_states = _real["states"].to(device) if _real is not None else None
 
+    from diff_vla_wbc.dr import DRConfig, estimate_ranges  # noqa: PLC0415
+
+    _dr_cfg = DRConfig(
+        enabled=bool(args.dr), p_nominal=args.dr_p_nominal, p_mid=args.dr_p_mid,
+        xy_max=args.dr_xy_max, yaw_max=args.dr_yaw_max,
+        dq_max=args.dr_dq_max, dqd_max=args.dr_dqd_max,
+        push_std=args.push_std, push_ang=args.push_ang,
+    )
+    print(f"[AUDIT][dr] enabled={_dr_cfg.enabled} p={_dr_cfg.p_nominal}/{_dr_cfg.p_mid}/rest "
+          f"max(xy,yaw,dq,dqd)=({_dr_cfg.xy_max},{_dr_cfg.yaw_max},{_dr_cfg.dq_max},{_dr_cfg.dqd_max}) "
+          f"push=({_dr_cfg.push_std},{_dr_cfg.push_ang})", flush=True)
+    if _real is not None:
+        print("[AUDIT][dr][data] " + json.dumps(estimate_ranges(_real)), flush=True)
+
     # ---------------------------------------------------------------- token 前端（交接文档 §5.1/§5.3）
     # hold 窗口 + 仿真机器人 anchor（B 模式）。BC 标签仍是 npz 的 g1_motion_token_64。
     from diff_vla_wbc.sonic_frontend import LibraryTokenBuilder, library_kind  # noqa: PLC0415
@@ -428,7 +457,7 @@ def main() -> int:
     provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
         wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
-        recorded_states=_recorded_states,
+        recorded_states=_recorded_states, dr=_dr_cfg,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=int(args.seed), hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -439,7 +468,7 @@ def main() -> int:
     eval_provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
         wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
-        recorded_states=_recorded_states,
+        recorded_states=_recorded_states, dr=_dr_cfg,
         batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
         seed=20261026, hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
@@ -471,10 +500,16 @@ def main() -> int:
     if args.v3:
         from diff_vla_wbc.v3_step import JointTrainerV3, V3Config  # noqa: PLC0415
 
+        _ens = args.ensemble_ckpts
+        if _ens is None:
+            _ens = [ROOT / "runs/S1_handover/WBC_A20000_obs93.pt",
+                    ROOT / "trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint_spec.pt"]
         v3cfg = V3Config(
             lambda_r=args.lambda_r, lambda_hand=args.lambda_hand, use_critic=args.critic,
             critic_lr=args.critic_lr, gamma=args.gamma, lam=args.lam,
             push_std=args.push_std, push_ang=args.push_ang,
+            lambda_u=args.lambda_u, ensemble=bool(args.ensemble),
+            ensemble_ckpts=tuple(_ens),
             grad_log_every=args.grad_log_every,
             clip_head=args.clip_head,
         )
@@ -520,10 +555,21 @@ def main() -> int:
               flush=True)
     eval_out = args.eval_out or (out / "eval_curve.jsonl")
 
+    # 固定 WM 快照：训练中会做 WM 保鲜，若评测用"活的 WM"，`imag_return_gt` 这类读数会跟着漂
+    # （实测 ret_gt 0.449 → 0.155），跨步不可比。评测一律用加载时的快照。
+    import copy as _copy
+
+    _eval_wm = _copy.deepcopy(bundle.wm)
+
     def run_eval(step: int) -> dict:
         for b in eval_batches:
             b.model_inputs = memo.get(b.frames)
-        m = fixed_eval(trainer, eval_batches)
+        _live_wm = bundle.wm
+        try:
+            bundle.wm = _eval_wm
+            m = fixed_eval(trainer, eval_batches)
+        finally:
+            bundle.wm = _live_wm
         m["h"] = int(args.horizon)
         m["lambda_r"] = float(args.lambda_r)
         m["fm_steps"] = int(args.fm_steps)
