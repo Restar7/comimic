@@ -301,6 +301,7 @@ def imagine_with_tokens(
     prev_action: torch.Tensor | None = None,
     horizon: int = 8,
     obs_noise: float = 0.0,
+    push_std: float = 0.0,
 ) -> Rollout:
     """Token route: the conditioning is the VLA's own 64-d motion token.
 
@@ -352,6 +353,13 @@ def imagine_with_tokens(
         obs_flat = _flat_history(bundle, history)
         action = _call_act(bundle, obs_flat, cond, ref)
         next_state = bundle.step(current, action, xi)
+        if push_std and push_std > 0:
+            # 过程扰动：每步给 root 线/角速度加噪（state 36:42），制造中段偏离，
+            # 让 token 的好坏真正有差别（标称条件下区分度只有 ~6%）。
+            kick = (torch.rand_like(next_state[:, 36:42]) * 2.0 - 1.0) * float(push_std)
+            next_state = torch.cat(
+                (next_state[:, :36], next_state[:, 36:42] + kick, next_state[:, 42:]), dim=-1
+            )
         bodies = _call_robot_bodies(bundle, next_state)
         terms = bundle.reward(next_state, action, a_prev, ref, bodies)
         logits = bundle.termination_logits(next_state, ref)

@@ -24,6 +24,18 @@ from typing import Any, Callable
 
 import torch
 
+HISTORY = 10
+NUM_JOINTS = 29
+XI_DIM = 33
+
+
+def _flat_tuple(flat: torch.Tensor):
+    """扁平 state (…,71) → trackerlab 状态元组 (p, R, v, w, q, qd)。"""
+    from .isaac_joint import flat_state_tuple  # noqa: PLC0415
+
+    return flat_state_tuple(flat)
+
+
 #: 默认扰动幅度（重设计 §3.5）
 PERTURB_DEFAULTS = {
     "xy": 0.05,      # m
@@ -108,6 +120,7 @@ def sample_burnin(
     *,
     port_tokens: Callable[[torch.Tensor], torch.Tensor],
     token_fn: Callable[..., torch.Tensor] | None = None,
+    recorded_states: torch.Tensor | None = None,
     horizon: int,
     k: int = 10,
     xi: torch.Tensor | None = None,
@@ -136,19 +149,37 @@ def sample_burnin(
 
         xi = default_xi(b, device)
 
+    state_device = frames.device
     # 1) f 往前退 K 帧（夹到 clip 起点）
     clip_first = motion.clip_start[motion.clip_id[frames]].to(device)
     f0 = torch.clamp(frames - int(k), min=clip_first)
 
     # 2) 参考状态 + 参考历史（在 f0 处），然后加扰动
-    start = bundle.reference_start(motion, f0)
-    state = start["state"]
+    if recorded_states is not None:
+        # ★ v3：起点用**真录制机器人状态**（部署口径），历史也用真状态 + 命令推出的 a_prev 重建
+        clip_first64 = motion.clip_start[motion.clip_id[f0]].to(f0.device)
+        hrows = torch.clamp(
+            f0[:, None] + (torch.arange(HISTORY, device=f0.device) - (HISTORY - 1)),
+            min=clip_first64[:, None],
+        )
+        st_hist = recorded_states[hrows.reshape(-1)].float().to(state_device).reshape(b, HISTORY, -1)
+        q_cmd = motion.ref[hrows.reshape(-1).to(motion.ref.device), 13:13 + NUM_JOINTS].float()
+        a_hist = (q_cmd - bundle.default_joint_pos) / bundle.action_scale
+        xi_rep = xi[:, None].expand(b, HISTORY, XI_DIM).reshape(-1, XI_DIM)
+        obs = bundle.mdp.obs(
+            _flat_tuple(st_hist.reshape(-1, 71)), a_hist, xi_rep, hrows.reshape(-1)
+        ).reshape(b, HISTORY, -1)
+        state = recorded_states[f0].float().to(state_device)
+        history = obs.permute(1, 0, 2).contiguous()          # (H_in,B,W)
+        a_prev = a_hist.reshape(b, HISTORY, -1)[:, -1]
+    else:
+        start = bundle.reference_start(motion, f0)
+        state = start["state"]
+        history = start["observations"].clone()        # (H_in,B,W)
+        a_prev = start["prev_action"]
     if perturb:
         state = perturb_state(state, xy=xy, yaw=yaw, dq=dq, dqd=dqd, generator=generator)
-    history = start["observations"].clone()        # (H_in,B,W)
-    a_prev = start["prev_action"]
 
-    # 3) no_grad 走 K 步：cond = 端口 GT token(f0+t)，ref = 帧 f0+t+1（与 rollout 同口径）
     refs_k = bundle.teacher_references(motion, f0, int(k)) if k > 0 else []
     hist_states = [state]
     rewards, survival = [], torch.ones(b, device=device)
