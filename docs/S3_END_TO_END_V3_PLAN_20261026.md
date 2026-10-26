@@ -3,6 +3,9 @@
 > 目标：把联合微调从"BC 精修"改回**端到端闭环**语义 —— VLA 输出 token → 人形执行器(WBC)+可微动力学(WM)
 > 真的执行 → 执行误差/回报反传回 action head；**全身（token）不做任何标签模仿**，只有手部保留标签监督。
 > 本文给出 7 项改动的完整实现意见（文件 / 接口 / 超参 / 验收 / 风险）+ 梯度 clip 的评估。
+>
+> **⚠️ 口径提示**：本文 §2.4 / §11 里的 `H=32` 是历史实验值。**最终口径 H=20**（部署每 20 步重规划，
+> `HA_VLA_EXEC_STEPS=20`），理由与证据见 **§12**。新跑一律 `--horizon 20`。
 
 ---
 
@@ -14,8 +17,8 @@
 | 手部 | 混在 78 维 BC 里 | **单独监督**（hand-only FM 掩码，权重 `λ_hand`） |
 | 执行器 / WM | 冻结 | **WBC 冻结；WM 用真实转移"保鲜"** |
 | 起点 | 参考帧（+WM 自走 burn-in） | **真录制机器人状态**（+扰动 + burn-in） |
-| 信用分配 | 16 步 pathwise | **32 步 + token-critic bootstrap（GAE λ）** |
-| 规模 | H=16 / batch 4 / accum 4 | **H=32 / batch 8 / accum 4** |
+| 信用分配 | 16 步 pathwise | **20 步 + token-critic bootstrap（GAE λ，γ^20）** |
+| 规模 | H=16 / batch 4 / accum 4 | **H=20 / batch 4 / accum 8** |
 | 场景 | 5 cm 扰动、温吞 | **25 cm 扰动 + rollout 内推扰 + 偏离惩罚** |
 
 **前提事实**（见 §1）：奖励对 token 的依赖是真实的（最难格 **39.8%**），但 VLA 目前离 GT 只有 **0–3.6%**
@@ -108,10 +111,15 @@ def gae_targets(rewards, dones, values, gamma=0.99, lam=0.95): ...
 
 **注意**：critic 会**固化 WM 的偏差**（bootstrap 的是想象回报）。所以 2.1（保鲜）必须先做，否则 critic 会把模型利用放大。
 
-### 2.4 想象规模：H=32 / batch 8 / accum 4
+### 2.4 想象规模：H=20 / batch 4 / accum 8
+
+> **H 的最终取值 = 20**（不是 32，也不是 40）：部署侧 receding horizon 每 20 步重规划一次
+> （`HA_VLA_EXEC_STEPS=20`，2.5 Hz @ 50 Hz），一步推理的影响只延伸到下次 replan；
+> 20 步之后的信用由 `γ^20·V(s_20)` 的 critic bootstrap 承担。完整证据链见 §12。
 
 - 成本主要在 **FM 采样（K=4 次 DiT 前后向）**，而 H 只影响 WBC+WM 的 rollout（很便宜）；
-  ⇒ **H 16→32 几乎免费**，batch 8 ≈ ×2 时间（约 2.5–3 s/微步，1000 步 ≈ 45–60 min）；
+  ⇒ H 20→32 几乎免费，但**没必要**：多算的步数在部署里根本执行不到；
+  真正贵的是 batch（≈ 线性），batch 4 × accum 8 = 等效 32 的稳定更新；
 - 若 OOM：`--fm-grad-backend checkpointed`（显存 O(1)，慢 ~30%）；
 - 审计行要打：`imagined_steps_per_s = batch*H / s_per_step`（目标 ≥100）。
 
@@ -335,13 +343,40 @@ runs/s3_v4_noBC   batch 8 × accum 4 · H=32 · K=4 · λ_r=0.3 · λ_hand=0.2 �
 - 闭环验收仍需能跑 Isaac 的容器（本机不可用）。
 ---
 
-## 12. 口径更正：闭环 chunk **每 40 步**重取（不是 12，也不是 20）
+## 12. 口径更正（最终）：闭环**每 20 步**重规划 ⇒ H=20
 
-代码事实（`third_party/HumanoidArena/.../action_provider_supermimic.py:_next_latent`）：
-只有 chunk 队列**空了**才重新 `infer`，队列长度 = 服务端返回的 40 行。
+这一节改过两次，记录最终结论与证据链，避免再被旧数字带偏。
 
-* 实测：300 步 episode → `logs/ft2000_server2.log` 里 **8 次 infer**（300/40 = 7.5 → 8）✔
-* 复核文档 J8 说"每 12 步重取"（源自旧 run 的 300/25）**不成立**；
-* ⇒ **一次 chunk 的 40 帧会全部被执行**，所以想象步数应当 **H=40**（而不是 16/32）；
-  H=32 只覆盖前 80%，最后 8 帧只受先验锚定、不受奖励。
-* ⇒ 回放服务的 `--consume` 也应是 **40**。
+**部署参照（`action_provider_sonic.py`，即 HA 官方 sonic 链路）**
+
+```python
+# action_provider_sonic.py:2488-2505
+# receding horizon：一次推理只执行前 EXEC_STEPS 步，然后重新规划
+exec_steps = int(os.environ.get("HA_VLA_EXEC_STEPS", "20"))
+if exec_steps > 0 and self._lerobot_chunk_popped >= exec_steps:
+    self._lerobot_chunk_queue.clear()      # 丢掉剩余帧，下一帧重新 infer
+```
+
+* 默认 `HA_VLA_EXEC_STEPS=20` ⇒ **2.5 Hz @ 50 Hz** 重规划；一个 40 帧 chunk 只执行前 20 帧。
+* 这是 HA 官方链路的既有行为，不是我们引入的。
+
+**我们自己的 `action_provider_supermimic.py`（原状 = bug）**
+
+* 原实现：只有队列**空了**才重新 `infer` ⇒ 40 帧全消费 ⇒ 300 步 episode **8 次 infer**
+  （`logs/ft2000_server2.log` 实测 8 次）。
+* 所以"每 40 步重规划"是**我们的 provider 缺 receding-horizon 截断**造成的，不是部署口径。
+* 已修：该文件现在同样读 `HA_VLA_EXEC_STEPS`；为了不污染 S1/S2 已有 O1/O2 结果，
+  **默认 0 = 旧行为（全消费）**，要按部署口径评测就 `export HA_VLA_EXEC_STEPS=20`。
+
+**由此确定 S3 的想象口径**
+
+| 项 | 值 | 理由 |
+|---|---|---|
+| 想象步数 `H` | **20** | 与部署的重规划周期一致：一步推理的影响只延伸到下一次 replan |
+| chunk 长度 | 40 | 服务端只返回 40 行，取前 20 用 |
+| 折扣后自举 `γ^H·V(s_H)` | H=20 | 20 步之后的信用走 critic bootstrap，不靠把 H 拉长 |
+| 回放服务 `--consume` | **20** | 与部署同口径 |
+
+> 旧写法"H=40（甚至 33/32）"是错误外推。H 不是世界模型的属性、也不是 chunk 的属性，
+> 而是**决策-信用口径**：部署每 20 步重规划一次，我们就只需对这 20 步负责；
+> 更长时域的收益通过 `γ^20·V(s_20)` 由 critic 承担（这也是 `token_critic` + GAE(λ) 存在的意义）。

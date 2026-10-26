@@ -128,9 +128,21 @@ class JointTrainerV2:
             f"H={self.cfg.horizon} K={self.cfg.fm_steps} lam_bc={self.cfg.lambda_bc} "
             f"lam_r={self.cfg.lambda_r} lam_s={self.cfg.lambda_s} lam_a={self.cfg.lambda_a} "
             f"grad_accum={self.cfg.grad_accum} backend={self.cfg.grad_backend} "
-            f"head_eval={self.cfg.head_eval_mode}",
+            f"head_eval={self.cfg.head_eval_mode} "
+            f"anchor={getattr(self.cfg, 'anchor_weight', 0.0)} "
+            f"dr={getattr(self.cfg, 'dr', None) is not None} "
+            f"dr_buckets={self._dr_buckets()} "
+            f"critic={getattr(self.cfg, 'critic', True)} lam={getattr(self.cfg, 'lam', 0.95)} "
+            f"wm_refresh={getattr(self.cfg, 'wm_refresh_every', 0)} "
+            f"burnin={getattr(self.cfg, 'burnin_steps', 0)}",
             flush=True,
         )
+
+    def _dr_buckets(self) -> str:
+        cfg = getattr(self.cfg, "dr", None)
+        if cfg is None:
+            return "off"
+        return f"{getattr(cfg,'p_nominal',0):.2f}/{getattr(cfg,'p_mid',0):.2f}/{1-getattr(cfg,'p_nominal',0)-getattr(cfg,'p_mid',0):.2f}"
 
     # ------------------------------------------------------------------ freeze
     def _freeze_executor(self) -> None:

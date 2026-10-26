@@ -4,15 +4,16 @@
 与 `scripts/ha_vla_latent64_server.py` **协议完全一致**（`GET /`、`POST /reset`、`POST /infer`），
 所以闭环只要换 `SERVER_URL`。相比旧的 `ha_gt_token_server.py`，本服务额外提供：
 
-* `--consume`：每次 infer 前进多少帧（默认 40 = 与旧 GT server 一致；若 provider 每 12 步重取，
-  应改成 12，否则 token 流会快放 3.3× —— 这是 O1/O2 复放必须核对的点）；
+* `--consume`：每次 infer 前进多少帧（默认 **20** = 部署口径：sonic provider 的
+  `HA_VLA_EXEC_STEPS=20`，即 2.5 Hz @ 50 Hz 重规划，一个 40 行 chunk 只执行前 20 帧）；
+  若 provider 仍按旧行为全消费 40 帧，就传 `--consume 40`，否则 token 流会 2× 慢放；
 * `hands14_chunk`：可选，从 npz 的 `g1_hand_joints_14` 回放（否则手部保持为零 = 张开）。
   三臂必须用**同一套手部处理**，否则比的是手不是 token。
 
 用法：
     python3 scripts/ha_replay_token_server.py --tokens runs/oracle_tokens/xxx.npy --port 18083
     python3 scripts/ha_replay_token_server.py --npz-tokens data/npz/ha_tokens/xxx.npz --key g1_motion_token_64 \
-        --hands-npz data/npz/ha_tokens/xxx.npz --port 18082 --consume 12
+        --hands-npz data/npz/ha_tokens/xxx.npz --port 18082 --consume 20
 """
 from __future__ import annotations
 
@@ -26,8 +27,8 @@ class Handler(BaseHTTPRequestHandler):
     tokens: np.ndarray = None       # (T,64)
     hands: np.ndarray | None = None  # (T,14) or None
     cursor: int = 0
-    horizon: int = 40
-    consume: int = 40
+    horizon: int = 40      # 服务端一次返回的行数（chunk 长度，部署侧固定 40）
+    consume: int = 20      # 每次 infer 前进的帧数 = 重规划周期（HA_VLA_EXEC_STEPS）
     n_infer: int = 0
 
     def log_message(self, fmt, *a):
@@ -82,7 +83,8 @@ def main() -> int:
     ap.add_argument("--hands-npz", type=str, default=None, help="含 g1_hand_joints_14 的 npz（可选）")
     ap.add_argument("--hands-key", type=str, default="g1_hand_joints_14")
     ap.add_argument("--horizon", type=int, default=40)
-    ap.add_argument("--consume", type=int, default=40)
+    ap.add_argument("--consume", type=int, default=20,
+                    help="每次 infer 前进帧数；= 部署的 HA_VLA_EXEC_STEPS（默认 20）")
     ap.add_argument("--port", type=int, default=18083)
     a = ap.parse_args()
 

@@ -38,7 +38,13 @@ SERVER_URL=${SERVER_URL:-http://127.0.0.1:18080}
 ISAAC_GPU=${ISAAC_GPU:-0}
 OUT_ROOT=${OUT_ROOT:-$COMIMIC/runs/ha_isaac_eval}
 # 我们的 SuperMimic WBC（token-conditioned，trackerlab 训练产物，ckpt 里要有 "pi" 键）
-SM_CKPT=${SM_CKPT:-$COMIMIC/trackerlab-supermimic/logs/bones_seed_token_2x8192_isaac50/last.pt}
+# LOCKED 2026-10-26：执行器必须与 S3 联合微调**同一个** ckpt —— C6h
+# （C2 策略 + 按 ha_cmd 命令流域重标的 WM；hold 窗口 + robot_spec）。
+# 旧默认 bones_seed_token_2x8192（future 窗口、旧库）会让闭环与训练各说各话。
+SM_CKPT=${SM_CKPT:-$COMIMIC/runs/S1_handover/WBC_A20000_wmvel_cmd.pt}
+# receding horizon：部署每 20 步重规划（= 训练 H=20 的口径来源）。
+# supermimic provider 默认 0（旧行为：全消费 40 帧），闭环必须显式打开。
+export HA_VLA_EXEC_STEPS=${HA_VLA_EXEC_STEPS:-20}
 # http = 真闭环（VLA 出 token）；zeros = 对照实验（不调 VLA，用零 token）
 SM_TOKEN_SOURCE=${SM_TOKEN_SOURCE:-http}
 # 上游 SONIC provider 用这个开关决定吃 40 维 semantic 还是我们返回的 64 维 latent
@@ -149,7 +155,7 @@ exec python -u script/eval_scripts/sonic/sim_eval_vla.py \
   --env_config_yaml "$TASK_YAML" \
   --seed "$SEED" --repeat_idx "$REPEAT" \
   --max_steps "$MAX_STEPS" \
-  --sm_ckpt "$SM_CKPT" --sm_obs_mode relative_ori99 --sm_token_source "$SM_TOKEN_SOURCE" \
+  --sm_ckpt "$SM_CKPT" --sm_obs_mode "${SM_OBS_MODE:-auto}" --sm_token_source "$SM_TOKEN_SOURCE" \
   --sv_task_name "${TASK_INSTRUCTION:-$TASK_ID}" \
   --model_label "${MODEL_LABEL:-$TASK}" \
   --sonic_encoder_path "$SONIC_DIR/model_encoder.onnx" \

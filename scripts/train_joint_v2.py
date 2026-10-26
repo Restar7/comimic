@@ -171,7 +171,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log-every", type=int, default=10)
     # ---------------- 损失 ----------------
-    ap.add_argument("--horizon", type=int, default=16, help="想象 rollout 步数（S3.5：H=16）")
+    ap.add_argument("--horizon", type=int, default=20,
+                    help="想象 rollout 步数。**默认 20 = 部署口径**：sonic provider 用 "
+                         "HA_VLA_EXEC_STEPS=20 做 receding horizon（2.5 Hz @ 50 Hz），一个 40 帧 "
+                         "chunk 只执行前 20 帧，所以一步推理只对这 20 步负责；更长的信用走 "
+                         "gamma^H*V(s_H) 的 critic bootstrap（计划文档 §12）")
     ap.add_argument("--gamma", type=float, default=0.99)
     ap.add_argument("--lambda-bc", type=float, default=1.0, help="FM-BC 主项权重（恒定，不退火）")
     ap.add_argument("--lambda-r", type=float, default=0.3, help="奖励项权重（扫 0 / 0.1 / 0.3 / 1.0）")
