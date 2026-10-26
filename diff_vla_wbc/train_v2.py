@@ -460,7 +460,13 @@ class BurnInBatchProvider:
         base.port_tokens = port_chunk
         if self.online_tokens is not None:
             # GT 臂：整段用 burn-in 结束时的机器人 root 算 token（= 部署时一次查询出整段）
-            _idx = frames[:, None] + torch.arange(self.token_horizon, device=frames.device)[None, :]
+            # 夹到 clip 末尾：frames 上界是 num_frames-horizon-2，+39 会越界（实测触发
+            # CUDA device-side assert）。与 teacher_references 同口径。
+            _last = self.library.clip_end[self.library.clip_id[frames]].to(frames.device)
+            _idx = torch.minimum(
+                frames[:, None] + torch.arange(self.token_horizon, device=frames.device)[None, :],
+                _last[:, None],
+            )
             base.wbc_tokens = self.online_tokens.chunk(_idx, robot_quat=bi.state[:, 3:7])
         else:
             base.wbc_tokens = self.wbc_chunk_source(frames)
