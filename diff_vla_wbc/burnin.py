@@ -75,12 +75,12 @@ def _rand(batch: int, device, generator, scale: float) -> torch.Tensor:
     任意设备上给出同一组扰动），所以先按生成器设备采样再搬到目标设备。
     """
     if torch.is_tensor(scale):
-        sc = scale.to(device).float().reshape(-1, 1)
+        sc = scale.to(device).float().reshape(-1)
         dev = torch.device(device)
         if generator is not None and torch.device(generator.device).type != dev.type:
-            u = torch.rand(batch, 1, device=generator.device, generator=generator).to(dev)
+            u = torch.rand(batch, device=generator.device, generator=generator).to(dev)
         else:
-            u = torch.rand(batch, 1, device=dev, generator=generator)
+            u = torch.rand(batch, device=dev, generator=generator)
         return (u * 2.0 - 1.0) * sc
     if scale <= 0:
         return torch.zeros(batch, device=device)
