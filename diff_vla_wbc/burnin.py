@@ -107,6 +107,7 @@ def sample_burnin(
     frames: torch.Tensor,
     *,
     port_tokens: Callable[[torch.Tensor], torch.Tensor],
+    token_fn: Callable[..., torch.Tensor] | None = None,
     horizon: int,
     k: int = 10,
     xi: torch.Tensor | None = None,
@@ -119,8 +120,9 @@ def sample_burnin(
 ) -> BurnInResult:
     """用**冻结 WBC + 冻结 WM + 端口 GT token** 生成 rollout 起点（重设计 §3.5 第 1–3 步）。
 
-    ``port_tokens(frames) -> (B,64)`` 给出每一帧的端口 GT token（``RecordedTokenSource``
-    以 ``token_horizon=1`` 调用即可）。``bundle`` 只需要 ``reference_start`` /
+    ``port_tokens(frames) -> (B,64)``：侧车 token（旧端口空间）。
+    ``token_fn(frames, state=...) -> (B,64)``：**环内** token（hold builder + 当时仿真机器人的
+    anchor，交接文档 §5.3）；给了它就用它，``port_tokens`` 变成回退。``bundle`` 只需要 ``reference_start`` /
     ``flatten_history`` / ``observation`` / ``act`` / ``step`` / ``reward`` /
     ``termination_logits`` —— ``IsaacJointBundle`` 全部满足。
     """
@@ -152,7 +154,11 @@ def sample_burnin(
     rewards, survival = [], torch.ones(b, device=device)
     for t in range(int(k)):
         ref = refs_k[t]
-        cond = port_tokens(f0 + t)
+        if token_fn is not None:
+            # B 模式：命令取该帧参考、anchor 取**当前仿真机器人 root**（部署/录制口径）
+            cond = token_fn(f0 + t, state=state)
+        else:
+            cond = port_tokens(f0 + t)
         obs_flat = bundle.flatten_history(history)
         action = bundle.act(obs_flat, cond, ref)
         nxt = bundle.step(state, action, xi)
