@@ -88,10 +88,17 @@ def refresh_wm(
         S, S1 = flat_state_tuple(states), flat_state_tuple(nxt)
         p, R, v, w, q, qd = wm.step(S, actions, xi)
         # 位置/朝向/关节（用各自的尺度归一，避免量纲压制）
+        # 位置按量纲归一；朝向用 1−cos = (3−trace)/2（identity 时为 0，不是 −0.5）
         pos = (p - S1[0]).square().mean() / (S1[0].square().mean() + 1e-6)
-        ori = (1.0 - (R * S1[1]).sum(-1).sum(-1) * 0.5).mean()          # 1−cos
+        ori = ((3.0 - (R * S1[1]).sum(-1).sum(-1)) * 0.5).mean()
         qj = (q - S1[4]).square().mean()
-        vel = (v - S1[2]).square().mean() + (w - S1[3]).square().mean() + (qd - S1[5]).square().mean()
+        # 速度通道按数据 std 归一（否则 rad/s 的量纲会把它独自变成主项）
+        sv = S1[2].std(0).mean().clamp_min(1e-6)
+        sw = S1[3].std(0).mean().clamp_min(1e-6)
+        sq = S1[5].std(0).mean().clamp_min(1e-6)
+        vel = (((v - S1[2]).square().mean() / sv ** 2)
+               + ((w - S1[3]).square().mean() / sw ** 2)
+               + ((qd - S1[5]).square().mean() / sq ** 2))
         anchor = sum((pp - p0).square().sum() for pp, p0 in zip(params, theta0))
         loss = pos + ori + qj + vel_weight * vel + kl_anchor * anchor
         opt.zero_grad(set_to_none=True)
@@ -110,8 +117,10 @@ def refresh_wm(
         "loss_last": losses[-1] if losses else None,
         "before": before, "after": after,
     }
-    log("[AUDIT][wm-refresh] " + str({k: (round(v, 6) if isinstance(v, float) else v) for k, v in out.items()
-                                      if k in ("steps", "loss_first", "loss_last")}))
+    log("[AUDIT][wm-refresh] steps={} loss {:.4f}→{:.4f} | qd_corr {:.3f}→{:.3f} | pos {:.2e}→{:.2e}".format(
+        out["steps"], out["loss_first"] or 0.0, out["loss_last"] or 0.0,
+        before.get("qd_corr", float("nan")), after.get("qd_corr", float("nan")),
+        before.get("pos_mse", float("nan")), after.get("pos_mse", float("nan"))))
     return out
 
 
