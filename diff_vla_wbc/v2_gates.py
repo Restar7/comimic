@@ -153,49 +153,71 @@ def gate_burnin(trainer, provider, ref_provider, *, n_batches: int = 4) -> dict:
 
 @torch.no_grad()
 def gate_token_contrast(trainer, provider, *, n_batches: int = 4) -> dict:
-    """C2：**同一个起点**下，想象回报对 token 的区分度（奖励通道有没有信号）。
+    """C2：**同一个起点**下，想象回报对 conditioning 的区分度（奖励通道有没有信号）。
 
-    这是 J7/D1 的直接检验：如果 GT token 与零/随机 token 的回报一样，那 λ_r>0 只是在
-    给一堆噪声求导（复核 §0.5 的担心），必须先回去改起点或 WM，而不是加权重。
+    这是 J7/D1 的直接检验：如果 GT token 与零/随机 token 的回报一样，那 λ_r>0 只是在给噪声
+    求导（复核 §0.5 的担心），必须先回去改起点或 WM，而不是加权重。
 
-    对照：gt（WBC 空间的录制 token）/ zeros / randn / shuffled（batch 内打乱）。
+    对照（全部受同样的起点/参考/观测，只换 conditioning）：
+    ``gt`` / ``mean``（整批 GT 的均值 token，即"条件均值"）/ ``shuffled``（batch 内打乱）
+    / ``zeros`` / ``randn``（分布外）。
+
+    ⚠️ **必须用配对统计**：2026-10-26 实测，8 个窗口时 GT−zeros 只有 +0.0004（被噪声淹没），
+    换成 64 个窗口的配对检验就是 **+0.372（+33.8%），配对 t=30.2，GT 在 64/64 窗口胜出**。
+    所以判据用 ``paired_t`` 与胜率，不用均值差（窗口间差异本身就有 20% 的 sd）。
     """
     cfg = trainer.cfg
-    keys = ("gt", "zeros", "randn", "shuffled")
-    acc: dict[str, list[float]] = {f"{k}_{m}": [] for k in keys for m in ("ret", "r0", "surv")}
+    keys = ("gt", "mean", "shuffled", "zeros", "randn")
+    per_window: dict[str, list[float]] = {k: [] for k in keys}
+    r0: dict[str, list[float]] = {k: [] for k in keys}
+    surv: dict[str, list[float]] = {k: [] for k in keys}
     for _ in range(n_batches):
         b = provider.sample()
         gt = b.port_tokens
         perm = torch.randperm(gt.shape[0], device=gt.device)
         variants = {
             "gt": gt,
+            "mean": gt.mean(0, keepdim=True).expand_as(gt).contiguous(),
+            "shuffled": gt[perm],
             "zeros": torch.zeros_like(gt),
             "randn": torch.randn_like(gt),
-            "shuffled": gt[perm],
         }
         for k, tok in variants.items():
             ro = trainer._rollout(b, tok)
-            acc[f"{k}_ret"].append(float(discounted_return(ro, cfg.gamma).mean()))
-            acc[f"{k}_r0"].append(float(ro.rewards[0].mean()))
-            acc[f"{k}_surv"].append(float(ro.survival[-1].mean()))
-    m = {k: float(np.mean(v)) for k, v in acc.items()}
-    sd = {k: float(np.std(v)) for k, v in acc.items()}
-    contrast = m["gt_ret"] - m["zeros_ret"]
-    rel = contrast / max(abs(m["gt_ret"]), 1e-9)
-    ok = contrast > 0 and rel > 1e-3
-    print(f"[GATE][contrast] {'PASS' if ok else 'FAIL'} "
-          f"ret gt={m['gt_ret']:.5f} zeros={m['zeros_ret']:.5f} randn={m['randn_ret']:.5f} "
-          f"shuffled={m['shuffled_ret']:.5f} | contrast(gt-zeros)={contrast:+.6f} "
-          f"rel={rel:+.3%} (sd_gt={sd['gt_ret']:.5f}) "
-          f"r0 gt={m['gt_r0']:.5f} zeros={m['zeros_r0']:.5f} "
-          f"surv gt={m['gt_surv']:.4f} zeros={m['zeros_surv']:.4f}", flush=True)
+            per_window[k].extend(discounted_return(ro, cfg.gamma).tolist())
+            r0[k].extend(ro.rewards[0].tolist())
+            surv[k].extend(ro.survival[-1].tolist())
+
+    m = {k: float(np.mean(v)) for k, v in per_window.items()}
+    se = {k: float(np.std(v, ddof=1) / np.sqrt(len(v))) for k, v in per_window.items()}
+    paired = np.asarray(per_window["gt"]) - np.asarray(per_window["zeros"])
+    p_se = float(paired.std(ddof=1) / np.sqrt(len(paired))) if len(paired) > 1 else float("nan")
+    p_t = float(paired.mean() / p_se) if p_se and p_se > 0 else float("nan")
+    wins = float((paired > 0).mean())
+    contrast = m["gt"] - m["zeros"]
+    rel = contrast / max(abs(m["gt"]), 1e-9)
+    ok = bool(contrast > 0 and p_t >= 3.0 and wins >= 0.8)
+    print(
+        f"[GATE][contrast] {'PASS' if ok else 'FAIL'} n={len(per_window['gt'])} "
+        f"ret gt={m['gt']:.5f} mean={m['mean']:.5f} shuffled={m['shuffled']:.5f} "
+        f"zeros={m['zeros']:.5f} randn={m['randn']:.5f} | "
+        f"contrast(gt-zeros)={contrast:+.5f} rel={rel:+.2%} paired_t={p_t:.2f} "
+        f"gt_win_frac={wins:.2f} | r0 gt={np.mean(r0['gt']):.5f} zeros={np.mean(r0['zeros']):.5f} "
+        f"| surv gt={np.mean(surv['gt']):.4f} zeros={np.mean(surv['zeros']):.4f}",
+        flush=True,
+    )
     return {
-        "pass": bool(ok),
-        **{k: round(v, 8) for k, v in m.items()},
-        **{f"sd_{k}": round(v, 8) for k, v in sd.items()},
-        "contrast_gt_minus_zeros": round(float(contrast), 8),
-        "contrast_rel": round(float(rel), 8),
-        "n_batches": int(n_batches),
+        "pass": ok,
+        "n_windows": len(per_window["gt"]),
+        **{f"ret_{k}": round(m[k], 6) for k in keys},
+        **{f"se_{k}": round(se[k], 6) for k in keys},
+        **{f"r0_{k}": round(float(np.mean(r0[k])), 6) for k in keys},
+        **{f"surv_{k}": round(float(np.mean(surv[k])), 6) for k in keys},
+        "contrast_gt_minus_zeros": round(float(contrast), 6),
+        "contrast_rel": round(float(rel), 6),
+        "paired_se": round(p_se, 6),
+        "paired_t": round(p_t, 3),
+        "gt_win_frac": round(wins, 4),
     }
 
 
