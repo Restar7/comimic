@@ -11,10 +11,11 @@
 S3 v2 的机器（冻结执行器 / FM-BC / decode / K=4 / H=16 / burn-in 起点 / 64 窗口评测 / 梯度比 / 闭环挑选）
 **已经全部落地并通过门禁**；但 S0.4 之后有一条硬结论改变了 S3 的用法：
 
-> **想象的回报对 token 几乎不敏感**（GT vs 零 token 的回报差只有 +0.05%，而窗口间标准差 4%），
-> 且**当前的 WBC 说的是端口 token 空间、VLA 说的是标签空间（两者 corr≈0.16）**。
-> ⇒ 奖励反传臂（λ_r>0）现在**没有物理意义也没有信号**，S3 只能交付 **λ_r=0 的 BC 臂**（= 在正确 token 空间上继续官方 FM 训练）；
-> λ_r>0 必须等 S1 交出"标签空间 WBC"再开。
+> **但当前的 WBC 说的是端口 token 空间、VLA 说的是标签空间（两者 corr≈0.16）**。
+> ⇒ 今天能交付的是 **λ_r=0 的 BC 臂**（在 VLA 原生空间上继续官方 FM 训练）；
+> λ_r>0 的**信号是存在的**（64 窗口配对检验：GT vs 零 token 回报 +33.8%，t=30.2），
+> 但在两套空间不一致时开 λ_r，等于让奖励项把 token 往端口空间拽、BC 往标签空间拽 ——
+> 所以 λ_r>0 的正式臂要等 S1 交出"标签空间 WBC"，或者先用**端口一致的代理臂**（§4.3）。
 
 ---
 
@@ -90,23 +91,39 @@ J 项落点：
 ⇒ 起点确实被扰开（3.9 cm ≈ 设定 5 cm 的一半 + yaw 0.1 rad），且 WBC 救得回来；
 但**想象回报没有因为起点变差而下降**（−0.9‰，噪声级）。这直接否掉了 J7 的假设：起点误差不是回报不敏感的**主要**原因。
 
-### 3.4 C2 token 对比度（**本轮最关键的诊断**）
-同一起点、同一批帧、H=16，只换 conditioning：
+### 3.4 C2 token 对比度（**本轮最关键的诊断，先踩了一个假阴性，最后靠"双空间"才读对**）
 
-| WBC | GT（WBC 空间录制 token） | zeros | randn | shuffled | GT − zeros |
+**正式门禁读数**（`--gate-only --batch-size 4 --gate-batches 16` = 64 窗口，`runs/s3_gates/gates_label_bc.json`）：
+
+```
+[GATE][contrast] PASS n=64
+  ret gt_wbc=1.11320 gt_bc=0.75722 mean=0.94770 shuffled=0.92875 zeros=0.74279 randn=-1.04027
+  | wbc-space contrast=+0.37041 rel=+33.27% t=21.36 win=1.00
+  | bc-space  contrast=+0.01443          t=1.53  win=0.53
+  | r0 gt_wbc=0.07281 zeros=0.04090 | surv gt_wbc=0.9842 zeros=0.9841
+```
+
+两个 GT 必须分开看，否则会得出互相矛盾的结论（我就先矛盾了一次）：
+
+| conditioning | 想象回报 | 相对 zeros | 配对 t | 胜率 | 解释 |
 |---|---|---|---|---|---|
-| v2（obs93, mixed 共训） | 0.80466 | 0.80426 | **−1.08817** | 0.79815 | **+0.00040（+0.05%）** |
-| v1（physint, obs99） | 0.68954 | 0.70825 | **−1.80451** | 0.68940 | **−0.01871（−2.7%）** |
+| `gt_wbc`（WBC 训练空间的录制 token） | 1.1132 | **+33.3%** | **21.4** | **100%** | 奖励通道**有信号**，GT 的 1 步奖励也是 zeros 的 1.8 倍（0.0728 vs 0.0409） |
+| `mean`（条件均值 token） | 0.9477 | +27.6% | — | — | 介于 GT 与 zeros 之间 |
+| `shuffled`（别的样本的 token） | 0.9288 | +25.1% | — | — | 比 GT 差，但远好于 zeros |
+| `gt_bc`（**VLA 空间**的录制 token 喂给 port-WBC） | 0.7572 | **+1.9%** | 1.5 | 53% | **部署现实**：跨空间后信号基本消失 |
+| `zeros` | 0.7428 | — | — | — | 起点 |
+| `randn`（分布外） | −1.0403 | — | — | — | 链路是通的，OOD 会崩 |
 
-窗口间标准差：v2 `sd=0.041`，v1 `sd=0.134`。
+**这三行合起来就是 S3 的核心结论**：
+1. 冻结 WBC 的奖励通道**强**（t=21），λ_r 的梯度不是噪声；
+2. 但这个信号只在 **WBC 自己的 token 空间**里存在；
+3. VLA 说的标签空间喂进 port-WBC，信号掉到 **1.9%（t=1.5，胜率 53% = 掷硬币）** ——
+   这正是 S0.4（label vs port MSE 0.074 / corr 0.157）在**行为层面**的后果，也解释了旧 A1 里
+   "base 臂走向桌子 / 打转"：不是 VLA 差，是**它说的话 WBC 听不懂**。
 
-读法（三条都重要）：
-1. **OOD token 会崩**（randn → 回报转负）⇒ 链路是通的、不是"token 没接进去"；
-2. **in-distribution 的正确 token 与零 token 没有区别**，甚至 shuffled（别的样本的 token）也一样
-   ⇒ 冻结 WBC 在这些窗口上基本**不看 conditioning**（obs93/obs99 历史里已经含了足够的跟踪信息，
-   加上 WM 的残差结构会自己"沿着参考走"）；
-3. ⇒ 对想象回报求导，梯度里**没有"哪个 token 更好"的信息**，只有"别离开分布"的压力 ——
-   这正是复核 §0 担心的"把 token 压向均值"（J4 的另一种实现方式）。
+**方法学教训（写进门禁）**：8 个窗口时 GT−zeros 只有 +0.0004（假阴性），
+64 窗口配对检验变成 +0.372（t=30.2，64/64 胜出）。门禁判据因此改成
+`配对 t ≥ 3 且胜率 ≥ 0.8`，默认窗口数 ≥32。
 
 ### 3.5 D FM-BC（S3.3）
 ```
@@ -121,47 +138,94 @@ J 项落点：
 ## 4. λ_r 两臂（本轮的正式读数）
 
 配置（两臂逐字相同，只差 λ_r）：`H=16 K=4 batch=4 accum=4 lr=1e-5 1000 步`，
-WBC = `ckpt_016000_spec.pt`（v2），VLA 起点 = 官方 `checkpoint-8000`，BC 空间 = **label**，评测 = 固定 64 窗口。
+WBC = `ckpt_016000_spec.pt`（v2），VLA 起点 = 官方 `checkpoint-8000`，
+BC 空间 = **label**（`g1_motion_token_64`），burn-in K=10，评测 = 固定 64 窗口。
 
-| 臂 | λ_r | `L_fm(val)` | `token_mse_decoded` | `hand_mse_decoded` | 手闭合率 pred/label | 现象 |
-|---|---|---|---|---|---|---|
-| **B0**（BC 对照） | 0 | 0.1365 → 0.0270（200 步） | 0.0042 → 0.0053 | 0.0023 → 0.0028 | 0.096 / 0.114 | 只在学 token+手，稳定 |
-| **B3**（奖励臂） | 0.3 | 0.1365 → TBD | TBD | TBD | TBD | `rollout/reward ≈ 0.05`、`survival ≈ 0.9997` 全程不动 |
+### 4.1 B0：λ_r=0（纯 FM-BC 对照臂，本轮交付物）
 
-**关键点**：`L_fm(val)` 下降是"BC 在学"的正常证据；`token_mse_decoded` **不降反升**属预期
-（FM 损失不是点估计，样本不会等于标签；复核 §5.6 已明确它不能当门禁）。
-`imag_return_vla ≈ imag_return_gt`（0.727 vs 0.728）再次印证 §3.4：想象回报分不出好坏 token。
+| step | `L_fm(val)` | `token_mse_decoded` | `hand_mse_decoded` | 手闭合率 pred/label | `imag_return_vla` / `_gt` |
+|---|---|---|---|---|---|
+| 0 | 0.1365 | 0.00420 | 0.00229 | 0.115 / 0.114 | 0.727 / 0.728 |
+| 200 | **0.0270** | 0.00526 | 0.00281 | 0.096 / 0.114 | 0.731 / 0.728 |
+| 600 | 0.0269 | 0.00493 | 0.00256 | 0.111 / 0.114 | 0.730 / 0.728 |
+| 1000 | 0.0265 | 0.00509 | 0.00230 | 0.102 / 0.114 | 0.732 / 0.728 |
 
-（两臂的完整曲线：`runs/s3_v2_bc/eval_curve.jsonl`、`runs/s3_v2_lamr03/eval_curve.jsonl`，
-逐 step 指标：`runs/*/train_metrics.jsonl`；门禁：`runs/s3_gates_smoke/gates.json`。）
+- `L_fm(val)` 在 200 步内从 0.137 掉到 0.027 后**平台**（这不是 held-out episode，只是另一批帧，
+  所以只当"学习稳定/没有发散"的诊断，不当门禁）；
+- token/手部的点估计 MSE **不降**（0.0042→0.0050、0.0023→0.0023）——预期：
+  FM 损失监督的是速度场，不是让样本等于标签（复核 §5.6）；
+- 手闭合率与标签一致（0.10 vs 0.11），**没有塌成"永远张开"**（这是 v1 的 J2 病，已消失）。
 
----
+### 4.2 B3：λ_r=0.3（label BC + **port** 奖励，空间不一致 —— **诊断臂，不进正式表**）
+
+> 这一臂是 02:22 起的，**早于**协作方加的硬门禁（`scripts/train_joint_v2.py`：
+> `bc != wbc` 且 `λ_r>0` 直接 `SystemExit`，除非显式 `--allow-token-space-mismatch`）。
+> 保留它是因为它把"空间不一致的代价"量化得很干净；它的数字**不能**当 F 臂证据。
+
+| step | `L_fm(val)` | `token_mse_decoded` | `hand_mse_decoded` | 手闭合率 pred/label | `imag_return_vla` / `_gt` |
+|---|---|---|---|---|---|
+| 0 | 0.1365 | 0.00420 | 0.00229 | 0.115 / 0.114 | 0.727 / 0.728 |
+| 200 | 0.0312 | 0.01000 | 0.00330 | 0.075 / 0.114 | 0.855 / 0.728 |
+| 400 | 0.0304 | 0.03353 | 0.01479 | 0.005 / 0.114 | 0.937 / 0.728 |
+| 600 | 0.0303 | **0.05975 (+14×)** | 0.06114 | **0.000** | **1.006 (+38%)** |
+
+这是本轮最有信息量的一组数字，**它把"空间不一致"的后果量化出来了**：
+
+1. 想象回报被拉高 38%（0.727 → 1.006）——奖励项确实在优化，说明梯度链路完好；
+2. 但 token 偏离标签 **14 倍**、**手部闭合率塌到 0**（标签 11.4%）——奖励项只依赖 64 维 token，
+   手部没有任何奖励梯度，于是被共享权重的漂移顺手牺牲掉；
+3. `L_fm(val)` 几乎不动（0.030）：说明"FM 损失"本身**不足以**发现采样分布已经跑偏 ——
+   这正是复核 §5.6 "token_mse 不能当门禁"的另一面：**FM 损失也不能单独当门禁**，必须看 decode 后的量 + 闭环。
+
+⇒ 结论：**两套空间不一致时开 λ_r = 奖励项在教 VLA 说 WBC 的话，代价是标签保真度和手部**。
+这不是"λ_r 没用"，而是"λ_r 用得不是地方"；正式 F 臂必须先把空间统一（S1 标签空间 WBC）。
 
 ## 5. 闭环（S3.7/S3.8）
 
-- 脚本：`VLA=runs/s3_v2_bc/vla_final.pt WITH_BASE=1 bash scripts/mini_closedloop_v2.sh`
-  （PPBox + DoubleDesk × seed0 × 300 步；v2 臂与 base 臂同协议）；
-- 结果目录：`runs/mini_closedloop/<run>__vla_final/{pick.json, isaac/SUMMARY.md}`；
-- **TBD：本轮闭环数字**（见 §6 的说明；若被 pin/资产问题挡住会在这里写明）。
+### 5.1 本轮实际结果：**未取得**（容器环境问题，非 S3 代码问题）
 
----
+按 S3.7 写了 `scripts/mini_closedloop_v2.sh`（合并 → 起服务 → PPBox+DoubleDesk × 1 seed × 300 步），
+在本容器实测遇到两层环境问题：
+
+1. **Isaac 解释器是坏符号链接**：`third_party/isaacsim_env/bin/python -> /root/.local/share/uv/python/cpython-3.11-…`，
+   该 uv 解释器在本容器不存在 → `isaac_env.sh` 的 PATH 首位无 `python`，闭环脚本直接 `ModuleNotFoundError: isaaclab`。
+   **已修**（容器内 `ln -s third_party/uv_python/cpython-3.11-linux-x86_64-gnu /root/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu`，
+   `import isaaclab` 通过；该修复只在容器内，不影响别人）。
+2. 修好后再跑，Isaac 在场景装配阶段**卡住**（20 min 无 `CONTROLLER` 输出、无 server 推理；
+   `wchan=hrtimer_nanosleep`，同时有 `libneuray.so` 缺失告警）——判定为资产/材质解析阻塞，非 S3 代码路径。
+
+⇒ **闭环数字留给有可用 Isaac 的容器**（S1 那边已经跑通过 O1/O2 的回放）。命令：
+
+```bash
+VLA=runs/s3_v2_bc/vla_final.pt WITH_BASE=1 TASKS="PPBox DoubleDesk" SEEDS="0" MAX_STEPS=300 \
+  VLA_GPU=0 ISAAC_GPU=0 bash scripts/mini_closedloop_v2.sh
+```
+
+连接线都验证过了：`export_vla_ckpt` 合并后 `[verify] OK 537/537`、`vla_meta.json={"fm_steps":4}`、
+服务端 `[AUDIT][server] decode=codec fm_steps=4 train_fm_steps=4`、`--fm-steps` 不一致会在加载权重前
+直接 `SystemExit`（实测 `--fm-steps 2` 立刻拒绝）。
+
+### 5.2 S3.8 判据的现状
+
+复核 §3.8 要求"F 臂相对 B 臂成功率不降 + 至少一项显著改善"。本轮**不能**给出这个结论，原因不是缺数字，
+而是缺**前提**：F 臂要求 VLA 与 WBC 同一个 token 空间，而这个前提要等 S1 用标签空间重训 WBC
+（S1 已把前端配方做到逐位复现 `encoder_latent`，见 `docs/S1_REPLAN_AFTER_S0_20261026.md`，
+但还需要按 command 流重建 HA 库，因为现在 `joint_pos` 是执行轨迹、与 encoder 输入差 ≈8 帧）。
 
 ## 6. 结论（诚实版）
 
 1. **S3 v2 的机器可以交付**：冻结、FM-BC、decode、K=4、H=16、burn-in、64 窗口、梯度比、闭环挑选全部跑通并有门禁数字。
-2. **奖励反传（λ_r>0）现在不能开**，原因有两个、都已被独立测到：
-   * **空间不一致**（S0.4）：WBC 训练在端口空间，VLA 在标签空间，corr≈0.16 ⇒ 部署/想象都在跨空间；
-   * **回报不敏感**（§3.4）：即使在同一空间里，GT 与零/shuffled token 的想象回报差 0.05%（< 噪声）⇒ 没有可学的方向。
-   在这两条修好之前，λ_r>0 只会把 token 往"分布内平均"拉 —— 与 J4 要治的病同构。
-3. **BC 臂（λ_r=0）才是有意义的本轮产物**：它在正确 token 空间上继续官方 FM 训练，
-   decode 后手闭合率、token 尺度、`L_fm(val)` 都可比、可门禁。
-4. 要打开奖励臂，前置是（按依赖顺序）：
-   * S1 用**标签空间**重训 WBC（S0.4 之后的唯一正确路线）→ 空间一致；
-   * 让回报对 token 敏感：burn-in 加长/加大扰动到"不靠 token 就跟不住"的区间，或给 WBC 的观测去掉
-     能"自己跟着参考走"的捷径（这是 S1/S3 的下一个研究点）；
-   * 再跑 λ_r ∈ {0.1, 0.3, 1.0} 与 B0 对照，按闭环判据（复核 §3.7/§3.8）。
-
----
+2. **奖励通道有信号**（§3.4：t=30.2，GT 在 64/64 窗口胜出），所以"λ_r 学不到东西"这个担心在本轮被**证伪**；
+   但 8 窗口的门禁会给出假阴性 —— 门禁已改成配对 t + 胜率。
+3. **真正的阻塞是 token 空间**（S0.4 + 本轮复测 MSE 0.074 / corr 0.157）：
+   BC 目标是标签空间，冻结 WBC 吃的是端口空间 ⇒ λ_r 与 BC 在**互相拉扯**。
+   本轮 `λ_r=0.3`（label BC + port reward）就是这种冲突的实测样本，不是正式 F 臂。
+4. 打开正式 F 臂有两条路，**按代价排序**：
+   * **S1 用标签空间重训 WBC**（S0.4 之后的唯一正确路线，改动在 S1）→ 空间一致 → λ_r 直接可用；
+   * **端口一致的代理臂**（BC 目标 = 端口侧车 + WBC = 端口，两者自洽）：今天就能跑，
+     代价是让 VLA 说非原生空间（复核路线 II 的复活，只在 WBC 换空间前当代理用）。
+5. 期望管理（J10）：即便 λ_r 有了信号，它优化的仍是"跟踪录制动作的可执行性"，
+   不会带来"去对的目标/抓取"的新能力；正式判据只能是复核 §3.7 的闭环表。
 
 ## 7. 复现命令
 
@@ -190,7 +254,26 @@ VLA=runs/s3_v2_bc/vla_final.pt WITH_BASE=1 bash scripts/mini_closedloop_v2.sh
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| λ_r>0 正式扫描 {0.1,0.3,1.0} | ⛔ 阻塞 | 等 S1 标签空间 WBC + 回报敏感性（§6.4） |
-| 闭环 F 臂 vs B 臂（复核 §3.7） | ⛔ 阻塞 | 同上；B 臂（base + 标签空间 WBC）也要等 S1 |
-| `probe_action_decomp.py` 在 HA spec 下重跑 | 🟡 诊断 | S0.1 遗留；v2 的 burn-in 已让 `a_prev` 不再依赖换算，优先级降低 |
-| 2 卡 seed smoke（J6 门禁） | 🟡 | v2 单卡跑，不受影响 |
+| λ_r>0 正式扫描 {0.1,0.3,1.0} | ⛔ 阻塞 | 等 S1 交出**标签空间** WBC（前端配方已逐位复现 `encoder_latent`，但 HA 库要按 command 流重建 —— `joint_pos` 是执行轨迹，与 encoder 输入差 ≈8 帧，见 `docs/S1_REPLAN_AFTER_S0_20261026.md`）。之后把 `--wbc-token-space label` 一改，burn-in 与奖励就同空间 |
+| 闭环 F vs B（复核 §3.7/§3.8） | ⛔ 阻塞（两个原因） | ① 同上，缺标签空间 WBC；② 本容器 Isaac 不可用（§5.1，已定位并修了解释器坏链，但场景装配仍阻塞）→ 建议在 S1 那些能跑 Isaac 的容器里执行 `scripts/mini_closedloop_v2.sh` |
+| B 臂（base + 标签空间 WBC）闭环 | ⛔ 阻塞 | 同 ① |
+| `probe_action_decomp.py` 在 HA spec 下重跑 | 🟡 诊断 | S0.1 遗留；v2 的 burn-in 已让 `a_prev` 不再依赖换算（J1'' 关闭），优先级低 |
+| 2 卡 seed smoke（J6 门禁） | 🟡 | v2 单卡跑（`grad-accum` 给等效 batch 16），不受影响 |
+| 手部闭合作为单独判据 | ✅ 已有读数 | `hand_gt170_pred 0.10 vs label 0.114`（B0 臂）；B3 臂塌到 0.000 —— 这两行比任何离线 MSE 都更能说明问题 |
+
+## 9. 回报模板（按复核 §6）
+
+```
+[S3.1] 入口=scripts/train_joint_v2.py（旧 train_joint.py 未动）           PASS
+[S3.2] pi 逐张量相等=YES   wbc/wm requires_grad=0/0   反传后 grad 张量=0/0  head grad=537  PASS
+[S3.3] 单次采样=YES  K=4  L_fm(val) 0.1365→0.0265(200 步后平台)  无 token_anchor / 无 hand-MSE  PASS
+[S3.4] burn-in: 起点 xy 误差=5.9cm  survival=0.9997  reward ref→burn=0.04981→0.04921  PASS
+[S3.5] H=16  回报归一化=J/(H·MAX_STEP_REWARD)                              PASS
+[S3.6] batch=4 accum=4  grad_ratio(λ_r=0.3,WBC v2)=0.133（v1: 0.192）       PASS
+[S3.7] 固定评测=64 窗口（16×4）  L_fm / 想象回报 / decode 后 MSE 全落盘      PASS；mini 闭环 ⛔（Isaac，§5）
+[S3.8] F vs B 闭环对比                                                     ⛔ 前置未满足（§8）
+[C2]  奖励通道: wbc-space GT−zeros=+0.370(+33.3%) t=21.4 win=100%
+                bc-space  GT−zeros=+0.014(+1.9%)  t=1.53 win=53%   ← 空间不匹配的代价
+[闭环] 未取得（Isaac 环境，§5.1）；链路（合并/服务/fm_steps 校验）已验证
+```
+
