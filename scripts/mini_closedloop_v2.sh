@@ -44,8 +44,13 @@ echo "[mini] vla=$VLA"
 echo "[mini] base=$BASE"
 echo "[mini] merged=$MERGED  out=$OUT  K=$K decode=$DECODE"
 
-python3 "$COMIMIC/scripts/export_vla_ckpt.py" --base "$BASE" --vla "$VLA" \
-  --out "$MERGED" --force || { echo "[fail] 合并失败"; exit 2; }
+if [[ -f "$MERGED/vla_merge_report.json" && "${FORCE_MERGE:-0}" != "1" ]]; then
+  echo "[mini] 复用已有合并目录 $MERGED（FORCE_MERGE=1 可强制重做）"
+else
+  rm -rf "$MERGED"
+  python3 "$COMIMIC/scripts/export_vla_ckpt.py" --base "$BASE" --vla "$VLA" \
+    --out "$MERGED" --force || { echo "[fail] 合并失败"; exit 2; }
+fi
 
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -56,7 +61,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export PYTHONPATH=$ROOT/third_party/gr00t_deps/_noflash
+# 服务端要能 import gr00t（tyro 在 gr00t_deps 里）；_noflash 只负责把 flash_attn 顶掉
+export PYTHONPATH="$ROOT:$ROOT/Isaac-GR00T:$ROOT/third_party/gr00t_deps:$ROOT/third_party/gr00t_deps/_noflash"
 export NO_ALBUMENTATIONS_UPDATE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1
 python3 "$ROOT/scripts/ha_vla_latent64_server.py" \
   --ckpt "$MERGED" --port "$PORT" --device "cuda:$VLA_GPU" --bf16 \
