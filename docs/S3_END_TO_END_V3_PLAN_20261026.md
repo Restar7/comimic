@@ -287,3 +287,49 @@ python3 scripts/train_joint_v2.py \
 
 **读法**：端到端反传在"偏离 regime"里有 **~30% 的天花板**（不是 3.6% —— 之前的 3.6% 是拿"同方向 GT token"当上限定错了）；
 而且**轻锚定不损失回报、还能把漂移压低 8%** ⇒ "不学标签"也可以用软约束把 token 摁在流形附近。
+
+---
+
+## 11. 实施记录（v4，2026-10-26）：DR + 模型可信度 + 三个坑
+
+### 11.1 新增/改动（全部已提交）
+
+| 文件 | 内容 |
+|---|---|
+| `diff_vla_wbc/dr.py`（新） | **域随机化**：每个 batch 按 `nominal 25% / mid 45% / hard 30%` 分层抽扰动幅度（xy≤0.20 m、yaw≤0.25 rad、dq≤0.05、dqd≤0.30），并给出从真转移估量的参考值 |
+| `diff_vla_wbc/wm_ensemble.py`（新） | **WM 集成不确定性**：加载已有的 2 个 WM（`WBC_A20000_obs93`、`ckpt_010500_physint_spec`），`u=Var_models(下一帧状态)`；奖励按 `r_t ← r_t·exp(−λ_u·u_t)` 门控（低可信度处不采信） |
+| `diff_vla_wbc/v3_step.py` | 接入 `λ_u` / ensemble / 分桶指标（`bucket/{nominal,mid,hard}_{n,rew}`） |
+| `diff_vla_wbc/burnin.py` | per-sample 扰动幅度（DR）、`perturb_state`/`_rand` 支持张量、generator 设备对齐 |
+| `scripts/train_joint_v2.py` | `--dr/--no-dr`、`--dr-*-max`、`--lambda-u`、`--ensemble`、**固定 WM 快照评测**（`copy.deepcopy`，评测时临时换回），修 `v3_config.json` 的 Path 序列化 |
+
+### 11.2 三个必须记住的坑（都已修）
+
+1. **录制的 root 线/角速度全是 0**（`body_lin_vel_w[:,0].std()==0`）→ 真转移里速度通道是常数，
+   WM 保鲜的 `1/std²` 会炸到 1e12。已改成**差分重建**（`np.gradient` 位置、四元数差分角速度），
+   并存数据集级 `scales` 供归一化。
+2. **WM 保鲜会改变评估尺度**：`ret_gt` 曾从 0.449 漂到 0.155 → 评测必须用**加载时的 WM 快照**。
+3. **无约束的纯奖励训练会立刻奖励黑客**（实测 `runs/s3_v3_noBC`，200 步）：
+   token 相对标签漂 **30×**、手闭合 **0.0001**，而它的想象回报是 GT 的 **5.8×**。
+   ⇒ 这就是为什么 v4 必须带 DR + 不确定性门控；那 200 步留作"无约束"对照。
+
+### 11.3 当前正在跑（v4）
+
+```
+runs/s3_v4_noBC   batch 8 × accum 4 · H=32 · K=4 · λ_r=0.3 · λ_hand=0.2 · token BC = OFF
+起点 = 真录制状态 + DR 分层（nominal/mid/hard）· 过程推扰 0.03/0.05
+λ_u=1.0 + WM 集成（2 个模型）· WM 每 50 步用真转移保鲜 200 步
+评测 = 每 100 步 16 窗口（固定 WM 快照）
+```
+判据（分桶看，硬桶是关键）：
+- `bucket/hard_rew` 上升；`imag_return_vla` ↑（固定快照后可比）；
+- `token_mse_decoded ≤ 2×` 起点、`hand_gt170 ≥ 0.09`（这两条是防"奖励黑客"的闸门）；
+- `unc/mean` 不单调上升（否则说明在往模型外推区跑）；
+- `critic/v_ev` 转正（>0.3 更好）。
+
+### 11.4 未做（诚实清单）
+
+- **观测层 DR**（VLA 输入的 46 维状态噪声）只留了 `DRConfig.obs_noise` 字段，未接进 processor 输出——
+  需要先确认 46 维分组布局，贸然加噪会伤底模先验；
+- **前验软锚定**（`‖token − base_prior‖²`）没有默认开启：它的唯一"无标签"实例化在数值上≈标签
+  （base ckpt 的 token_mse vs 标签只有 0.004），所以先用**不确定性门控**代替，等有明确需求再开；
+- 闭环验收仍需能跑 Isaac 的容器（本机不可用）。
