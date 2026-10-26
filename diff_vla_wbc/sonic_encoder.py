@@ -305,6 +305,7 @@ def build_motion_windows(
     *,
     num_future: int = COMMAND_FRAMES,
     dt: float = 0.02,
+    window: str = "hold",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build ``(command, anchor_mf)`` for every frame from a motion reference.
 
@@ -312,15 +313,22 @@ def build_motion_windows(
     ----------
     joint_pos_mjcf, joint_vel_mjcf : ``(T, 29)`` in MJCF / SuperMimic joint order.
     ref_root_quat_wxyz : ``(T, 4)`` reference root orientation (wxyz).
+        HA 数据必须是 ``human_body_quat_w_aligned``（heading-aligned 参考朝向），不是
+        ``human_body_quat_w``：实测 ``anchor == rot6d(conj(robot_root_orientation) *
+        human_body_quat_w_aligned)``，与录制 ``consumed_anchor_rot6d`` 的 mean|Δ| ≤ 6e-5，
+        7 个任务上重算 token 与 ``encoder_latent`` 逐位相等（exact_frac 1.0000）。
     robot_root_quat_wxyz : ``(T, 4)`` robot root orientation.  ``None`` means
         "perfect tracking" (the in-loop B-mode should always pass the simulated
         robot state; the identity fallback is only for offline smoke tests).
     num_future : future-frame horizon (SONIC config uses 10).
     dt : unused placeholder for callers that may re-time windows.
+    window : ``"hold"``（部署/录制口径：当前参考帧重复 num_future 次，默认）或
+        ``"future"``（旧口径：未来 num_future 帧升序，仅作对照）。
 
     Returns
     -------
-    command : ``(T, num_future, 58)`` = ``[dof_pos(29), dof_vel(29)]`` IsaacLab order
+    command : ``(T, num_future, 58)``，内部按 **term-major** 580 维排布
+        （``[pos_0..pos_9 | vel_0..vel_9]``）；frame 维只为形状，喂 encoder 时会被 flatten。
     anchor  : ``(T, num_future, 6)`` relative 6D orientation difference
     """
     if joint_pos_mjcf.dim() != 2 or joint_pos_mjcf.shape[1] != 29:
@@ -335,9 +343,21 @@ def build_motion_windows(
     vel = joint_vel_mjcf[..., perm]
 
     T = pos.shape[0]
-    idx = torch.arange(T, device=pos.device).unsqueeze(1) + torch.arange(num_future, device=pos.device)
-    idx = idx.clamp(max=T - 1)
-    command = torch.cat([pos[idx], vel[idx]], dim=-1)  # (T, F, 58)
+    if str(window).lower() == "hold":
+        # 部署/录制口径（S1，2026-10-26）：当前参考帧重复 num_future 次。
+        idx = torch.arange(T, device=pos.device).unsqueeze(1).expand(T, num_future).contiguous()
+    elif str(window).lower() == "future":
+        idx = torch.arange(T, device=pos.device).unsqueeze(1) + torch.arange(num_future, device=pos.device)
+        idx = idx.clamp(max=T - 1)
+    else:
+        raise ValueError(f"window must be hold|future, got {window!r}")
+    # ❗布局：encoder 的 command 必须是 **term-major** 的 580 维
+    #   ``[pos_0..pos_9 (290) | vel_0..vel_9 (290)]``（= 录制 obs[4:584] 的那个块）。
+    #   按帧交错 ``cat([pos[idx], vel[idx]], -1)``（每帧 [pos_j, vel_j]）会得到完全不同的
+    #   token：实测 hold 窗口下 exact_frac 0.28 vs 1.00（HOI_double_desk 首条 clip，逐位对拍
+    #   `encoder_latent`）。中间那一维只是为了凑 (T, F, 58) 的形状，语义是"扁平 580"。
+    command = torch.cat([pos[idx].reshape(T, -1), vel[idx].reshape(T, -1)], dim=-1)
+    command = command.reshape(T, num_future, 2 * pos.shape[-1])  # (T, F, 58)，见上注释
 
     q_ref = ref_root_quat_wxyz[idx]  # (T, F, 4)
     if robot_root_quat_wxyz is None:

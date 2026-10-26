@@ -134,6 +134,8 @@ def main() -> int:
     ap.add_argument("--gamma", type=float, default=0.99)
     ap.add_argument("--lambda-bc", type=float, default=1.0, help="FM-BC 主项权重（恒定，不退火）")
     ap.add_argument("--lambda-r", type=float, default=0.3, help="奖励项权重（扫 0 / 0.1 / 0.3 / 1.0）")
+    ap.add_argument("--allow-token-space-mismatch", action="store_true",
+                    help="显式放行 bc!=wbc 的 token 空间不匹配（只用于诊断；这种臂的数字不能进表）")
     ap.add_argument("--lambda-s", type=float, default=0.0, help="可选 state 项权重（小权重）")
     ap.add_argument("--lambda-a", type=float, default=0.0, help="可选动作蒸馏权重（WBC 冻结）")
     ap.add_argument("--state-vel-weight", type=float, default=0.05)
@@ -260,6 +262,17 @@ def main() -> int:
             "（W5）。本轮必须 lambda_r=0（纯 BC 对照臂），等 S1 用标签空间重训 WBC 后再开 lambda_r。",
             flush=True,
         )
+        # 硬门禁（S2 复核，2026-10-26）：警告不足以挡住一次"看起来很忙但结论无效"的跑法——
+        # 02:22 就起过一次 lam_r=0.3 + bc=label/wbc=port 的臂。这种臂的 rollout 数字不能进任何表。
+        if float(getattr(args, "lambda_r", 0.0)) > 0 and not getattr(
+            args, "allow_token_space_mismatch", False
+        ):
+            raise SystemExit(
+                "[fail] token 空间不匹配 (bc=%s != wbc=%s) 却要求 lambda_r=%s：奖励梯度的物理意义"
+                "不成立，结果不能当证据。要么 --lambda-r 0（BC 对照臂），要么等 S1 用标签空间重训 "
+                "WBC 后 --wbc-token-space label；真的只做诊断请显式 --allow-token-space-mismatch。"
+                % (args.bc_token_space, args.wbc_token_space, args.lambda_r)
+            )
 
     def port_chunk(frames):  # noqa: ANN001  (B,) -> (B,40,64)
         return port_chunk_src({"frames": frames})
