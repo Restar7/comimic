@@ -60,6 +60,23 @@ q_ref_aligned = human_body_quat_w_aligned            # wxyz，heading-aligned �
 
 门禁：`tests/test_sonic_token_contract.py`（anchor 公式 + 逐位 parity，数据缺失时 skip）。
 
+
+## 4b. ⚠️ 库里的"根朝向"必须是**参考**（不是机器人）—— 逐位实测
+
+`SonicTokenBuilder` 的 anchor = `rot6d(conj(robot_quat) ⊗ lib.root_quat)`。所以**库里存的
+根四元数就是 token 的参考朝向**。用 HOI_double_desk 首条 clip（800 帧）对拍 `encoder_latent`：
+
+| 库里 `quat` 用哪个字段 | 与 npz 标签的 exact_frac | max\|Δ\| |
+|---|---|---|
+| `human_body_quat_w_aligned`（**正确**） | **1.0000** | 0.0 |
+| `robot_root_orientation`（`build_ha_command_lib.py` 现状） | 0.7427 | 1.88e-01 |
+| `human_body_quat_w`（未做 heading 对齐） | 0.0662 | 1.19e+00 |
+
+⇒ **`build_ha_command_lib.py` 的 `quat` 槽要放 `human_body_quat_w_aligned`**（token 的参考），
+机器人根姿态另开一个字段给跟踪用；否则 in-loop token 与 VLA 输出空间系统性差 ~26% 元素
+（1–3 个 FSQ 格），"混库"与 O1 回放都会对不上。
+（BONES-SEED 的库里根四元数本来就是运动自身的参考朝向，所以那边没这个问题。）
+
 ## 4. 对 S1 的直接含义
 
 1. **HA 数据不需要 builder**：直接用 npz 里的 `g1_motion_token_64`（= encoder_latent）当 WBC 的 token 条件；
