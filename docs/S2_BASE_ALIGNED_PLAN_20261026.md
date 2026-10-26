@@ -130,6 +130,30 @@ python3 scripts/probe_token_reproduction.py --clips 1 --from-token-npz 8 \
     --out runs/S2_gates/g0b_token_reproduction.json
 ```
 
+### 4.1 ❗`build_motion_windows` 现在的 `window="hold"` 只修了一半（实测）
+
+S1 刚给 `diff_vla_wbc/sonic_encoder.py:build_motion_windows` 加了 `window="hold"`（窗口语义对了），
+但**置换**和**布局**还没改。用 HOI_double_desk 首条 clip 逐位对拍（anchor 用录制值）：
+
+| 变体 | exact_frac vs `encoder_latent` |
+|---|---|
+| **hold + 字段主序 + 不置换**（正确） | **1.0000** |
+| hold + `PERM_MJCF_TO_ISAACLAB` + 字段主序 | 0.1191 |
+| hold + 不置换 + **per-frame 交错**（当前实现） | 0.2796 |
+| hold + `PERM` + per-frame 交错（当前实现） | 0.1304 |
+
+⇒ 还差两处（各 2 行）：
+
+```python
+# 1) 不置换（对 HA 数据；BONES 需要单独验证）
+pos = joint_pos_mjcf                                  # 删掉 [..., perm]
+vel = joint_vel_mjcf
+# 2) 字段主序：先 10 帧 pos、再 10 帧 vel
+command = torch.cat([pos[idx].reshape(T, -1), vel[idx].reshape(T, -1)], dim=-1).reshape(T, num_future, 58)
+```
+
+改完用 §4 的两条命令验收（期望 A/C = 1.0000，`--from-token-npz` ≥ 0.999）。
+
 ⚠️ **BONES-SEED 数据的关节顺序要单独验证**：BONES 的 CSV 是 MuJoCo 分组序，HA 录制是 Isaac 序；
 `PERM_MJCF_TO_ISAACLAB` 对 BONES 可能是必需的、对 HA 一定不能加。**按数据源分开，别一刀切。**
 
