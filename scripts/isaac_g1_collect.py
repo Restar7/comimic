@@ -111,6 +111,37 @@ def main() -> int:
     print(f"[collect] scene ready num_envs={n} 关节映射 OK（前 5: "
           f"{[(joint_names[i], idx[i]) for i in range(5)]}）", flush=True)
 
+    # ★ 根位姿必须先对齐**参考帧**：奖励里的 e_root_pos/e_root_ori 是绝对位姿差，
+    #   如果仿真从 (0,0,0.8) 起步而参考在别处，奖励会被一个巨大常数偏置吞掉（实测 e_root_pos≈20）。
+    ref = None
+    try:
+        # 参考库与训练同一份：runs/isaac_motion/ha_cmd/packed.pt 的 ref 行（canonical 71 列）
+        packed = torch.load(str(ROOT / "runs/isaac_motion/ha_cmd/packed.pt"), map_location="cpu",
+                         weights_only=False)
+        ref = torch.as_tensor(packed["ref"]).float()
+        starts = torch.as_tensor(packed["starts"]).long()
+        names = list(packed["names"])
+        if args_cli.clip in names:
+            ci = names.index(args_cli.clip)
+        else:
+            # npz 的 stem（ep000000）与库里的原始名（ep<timestamp>）不一致：按**同序号**回退
+            stems = [q.stem for q in sorted((ROOT / "data/npz/ha_tokens").glob("*.npz"))]
+            if args_cli.clip not in stems:
+                raise KeyError(f"{args_cli.clip} 既不在库里也不在 npz 里")
+            ci = stems.index(args_cli.clip)
+            print(f"[collect] clip 名按同序号回退: {args_cli.clip} -> {names[ci]}", flush=True)
+        row = ref[int(starts[ci]) + int(args_cli.start_frame)]
+        root_p = row[:3]
+        # canonical 的 quat 是 wxyz（与 flat 布局一致），Isaac 要 wxyz
+        root_q = row[3:7]
+        pose = torch.zeros(n, 7, device=DEV)
+        pose[:, :3] = root_p.to(DEV)
+        pose[:, 3:] = root_q.to(DEV)
+        robot.write_root_pose_to_sim(pose)
+        print(f"[collect] 根位姿对齐参考帧: p={root_p.tolist()} q={root_q.tolist()}", flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[collect] ⚠️ 根位姿对齐失败（奖励的 root 项会偏）: {_e}", flush=True)
+
     q0 = torch.zeros(n, robot.num_joints, device=DEV)
     q0[:, idx_t] = default_q.unsqueeze(0)
     robot.write_joint_state_to_sim(q0, torch.zeros_like(q0))
