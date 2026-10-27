@@ -174,22 +174,24 @@ class JointTrainerV2:
         # 浅拷贝：下游 ``process_backbone_output`` 会原地改写字典
         return act_in, copy_backbone_output(bb_out)
 
-    def _sample_tokens(self, act_in, bb_out, *, generator: torch.Generator | None = None):
-        """一次有梯度的 FM 采样 → ``(x_norm, x_raw, tokens)``。"""
+    def _sample_tokens(self, act_in, bb_out, *, generator: torch.Generator | None = None,
+                       noise: torch.Tensor | None = None, backend: str | None = None):
+        """一次有梯度的 FM 采样 → ``(x_norm, x_raw, tokens)``。``noise`` 给定时用它（便于两次采样对齐）。"""
         head = self.vlm.action_head
         batch = int(act_in["state"].shape[0])
         horizon = int(head.action_horizon)
         dim = int(head.action_dim)
-        noise = torch.randn(
-            batch, horizon, dim, device=self.device, dtype=head.dtype,
-            generator=generator,
-        )
+        if noise is None:
+            noise = torch.randn(
+                batch, horizon, dim, device=self.device, dtype=head.dtype,
+                generator=generator,
+            )
         with self._amp_ctx():
             x_norm = sample_once_with_grad(
                 head, bb_out, act_in,
                 initial_noise=noise,
                 num_steps=self.cfg.fm_steps,
-                grad_backend=self.cfg.grad_backend,
+                grad_backend=(backend or self.cfg.grad_backend),
                 truncated_tail=self.cfg.fm_truncated_tail,
             )
         # 采样结果回到 fp32：codec 与可微 rollout（WBC+WM）都在 fp32 里做，数值最稳
@@ -614,12 +616,21 @@ def fixed_eval(
     pw_g = acc.pop("_pw_gt", None)
     out = {k: sum(v) / len(v) for k, v in acc.items()}
     if pw_v and pw_g and len(pw_v) == len(pw_g):
-        import statistics as _st  # noqa: PLC0415
+        # 手算 mean/std：statistics 模块遇到 NaN 会抛 AttributeError（且不值得为它加依赖）
+        def _mean(xs):
+            return sum(xs) / len(xs)
+
+        def _std(xs):
+            if len(xs) < 2:
+                return 0.0
+            m = _mean(xs)
+            return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+
         d = [a - b for a, b in zip(pw_v, pw_g)]
-        out["imag_return_vla_std"] = float(_st.pstdev(pw_v)) if len(pw_v) > 1 else 0.0
-        out["imag_return_gt_std"] = float(_st.pstdev(pw_g)) if len(pw_g) > 1 else 0.0
-        out["imag_delta_mean"] = float(_st.fmean(d))
-        out["imag_delta_std"] = float(_st.pstdev(d)) if len(d) > 1 else 0.0
+        out["imag_return_vla_std"] = float(_std(pw_v))
+        out["imag_return_gt_std"] = float(_std(pw_g))
+        out["imag_delta_mean"] = float(_mean(d))
+        out["imag_delta_std"] = float(_std(d))
         out["imag_delta_win"] = float(sum(1 for x in d if x > 0) / len(d))
         out["imag_delta_win_n"] = int(len(d))
     out["eval_horizon"] = int(_h_eval)

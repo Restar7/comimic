@@ -240,6 +240,14 @@ def main() -> int:
     ap.add_argument("--trust-weight", type=float, default=0.0,
                     help="trust region hinge 权重（无量纲）。1.0 ≈ 越界即与 lambda_r*|J| 同量级")
 
+    ap.add_argument("--trust-center", choices=("label", "base"), default="label",
+                    help="动作 hinge 的中心：label=标签 rollout（旧/稳定）；"
+                         "base=底模自己的输出（P1-4，无标签，但当前会 NaN）")
+    ap.add_argument("--critic-grad-through-state", action="store_true", default=False,
+                    help="P1-1 的梯度部分：V 对 s_H 保留梯度（SHAC 本意）。默认关（冒烟会 NaN）")
+    ap.add_argument("--vla-state-from-burnin", action="store_true", default=False,
+                    help="P1-6：把 burn-in 末状态的本体感觉写回 VLA 的 state 输入"
+                         "（否则 VLA 看不到 DR 扰动，只能学常数偏置）")
     ap.add_argument("--act-eps", type=float, default=0.0,
                     help="动作空间 trust region 容差：(a−a_ref) 的逐关节 RMS。0=关。"
                          "动作才是 WBC/WM 的输入，比 token 空间更本质")
@@ -620,6 +628,9 @@ def main() -> int:
             anchor_weight=args.anchor_weight,
             trust_eps=args.trust_eps, trust_weight=args.trust_weight,
             act_eps=args.act_eps, act_weight=args.act_weight,
+            vla_state_from_burnin=bool(args.vla_state_from_burnin),
+            critic_grad_through_state=bool(args.critic_grad_through_state),
+            trust_center=str(args.trust_center),
             critic_source=args.critic_source,
             grad_log_every=args.grad_log_every,
             clip_head=args.clip_head,
@@ -633,18 +644,25 @@ def main() -> int:
                 raise SystemExit(f"[fail] 缺真回报文件 {_rrp}；先跑 scripts/build_real_returns.py")
             _rr = torch.load(str(_rrp), map_location="cpu", weights_only=False)
             _rr_ret = _rr["ret"]
-            if int(_rr_ret.shape[0]) != int(_recorded_states.shape[0]):
+            if "states" in _rr and "ref_rows" in _rr:
+                # P1-2：MC 目标文件自带 states/ref_rows（按 episode 采的 on-policy 状态）
+                print(f"[P1-2] critic 目标来自 on-policy MC：n={int(_rr_ret.shape[0])} "
+                      f"（{(_rr.get('meta') or {}).get('episodes', '?')} 集）", flush=True)
+                trainer.attach_real_returns(_rr_ret, _rr["states"].float(), _rr["ref_rows"].float())
+            elif int(_rr_ret.shape[0]) != int(_recorded_states.shape[0]):
                 raise SystemExit(
                     f"[fail] real returns 长度 {int(_rr_ret.shape[0])} != recorded_states "
                     f"{int(_recorded_states.shape[0])}；用同一个 --reward-mode/--reward-vel-scale 重建")
-            _rr_meta = _rr.get("meta") or {}
-            for _k, _want in (("reward_mode", args.reward_mode),
-                              ("reward_vel_scale", float(args.reward_vel_scale))):
-                if _k in _rr_meta and _rr_meta[_k] != _want:
-                    raise SystemExit(
-                        f"[fail] real returns 的 {_k}={_rr_meta[_k]} 与本次训练 {_want} 不一致；"
-                        "重建：python3 scripts/build_real_returns.py --reward-mode ... --reward-vel-scale ...")
-            trainer.attach_real_returns(_rr_ret, _recorded_states, bundle.motion.ref.detach().float())
+                _rr_meta = _rr.get("meta") or {}
+                for _k, _want in (("reward_mode", args.reward_mode),
+                                  ("reward_vel_scale", float(args.reward_vel_scale))):
+                    if _k in _rr_meta and _rr_meta[_k] != _want:
+                        raise SystemExit(
+                            f"[fail] real returns 的 {_k}={_rr_meta[_k]} 与本次训练 {_want} 不一致；"
+                            "重建：python3 scripts/build_real_returns.py --reward-mode ... "
+                            "--reward-vel-scale ...")
+                trainer.attach_real_returns(_rr_ret, _recorded_states,
+                                            bundle.motion.ref.detach().float())
         (out / "v3_config.json").write_text(json.dumps(v3cfg.__dict__, indent=1, default=str))
         # 口径的一行真相：token 监督 / 手部 / 锚定 / DR 分桶 / critic 自举 / WM 保鲜
         _pn, _pm = float(args.dr_p_nominal), float(args.dr_p_mid)
@@ -657,7 +675,7 @@ def main() -> int:
             f"start={args.start_source} burnin={0 if args.no_burnin else args.burnin_steps} "
             f"push=({args.push_std},{args.push_ang}) "
             f"critic={args.critic}/{args.critic_source} lam={args.lam} gamma^H={args.gamma ** args.horizon:.4f} "
-            f"act=({args.act_eps},{args.act_weight}) reward=({args.reward_mode},{args.reward_vel_scale}) "
+            f"vla_state_burnin={args.vla_state_from_burnin} act=({args.act_eps},{args.act_weight}) reward=({args.reward_mode},{args.reward_vel_scale}) "
             f"wm_refresh_every={args.wm_refresh_every} clip_head={args.clip_head} "
             f"eval_H={int(args.eval_horizon) or int(args.horizon)} amp={args.amp} "
             f"H={args.horizon} K={args.fm_steps} batch={args.batch_size} accum={args.grad_accum}",

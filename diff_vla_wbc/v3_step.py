@@ -57,6 +57,17 @@ class V3Config:
     trust_eps: float = 0.0            # 0 = 关；容差 = token 相对先验的 RMSE（归一化 token 空间）
     trust_weight: float = 0.0         # hinge 权重（无量纲；1.0 ≈ 越界即与 λ_r·|J| 同量级）
     # ---- 动作空间 trust region（比 token 空间更本质：动作才是 WBC/WM 的输入）----
+    # P1-6（A1）：把 **burn-in 末状态**的本体感觉写回 VLA 的 state 输入。
+    # 默认关；打开后 VLA 才能"看到"DR 扰动/实际偏离"，梯度才可能学成"状态相关的修正"
+    # 而不是对扰动取平均的常数偏置（见 docs/S3_FIX_PLAN_AFTER_REVIEW_20261027.md §1.1）。
+    vla_state_from_burnin: bool = False
+    # P1-4：信任域（动作 hinge）的**中心**用谁
+    #   "label" = 标签 token 的 rollout（旧行为，稳定）
+    #   "base"  = 底模自己的输出（无标签，更正确，但当前冒烟会 NaN —— 待查）
+    trust_center: str = "label"
+    # P1-1 的梯度部分：V 对 s_H 保留梯度（SHAC 本意）。默认 **关**——冒烟显示它会引入 NaN，
+    # 先把相对形式（V(s_H)−V(ref_H)）稳定下来，再单独开这个开关做 A/B。
+    critic_grad_through_state: bool = False
     act_eps: float = 0.0              # 0 = 关；容差 = (a − a_ref) 的逐关节 RMS（归一化动作空间）
     act_weight: float = 0.0           # hinge 权重（无量纲）
     # ---- critic 的监督来源 ----
@@ -132,6 +143,30 @@ class JointTrainerV3(JointTrainerV2):
                  f"ret_mean={float(self._real_ret.mean()):+.4f} std={float(self._real_ret.std()):.4f} "
                  f"ref_shape={tuple(self._real_ref_states.shape)}")
 
+    # ------------------------------------------------------------------ P1-6
+    def _patch_state_from_burnin(self, model_inputs: dict, batch) -> dict:
+        """用 burn-in 末状态（`batch.start_state`，(B,71) canonical）覆写 VLA 的 ``state.*``。
+
+        46 维布局（`g1_tasks._STATE_KEYS/_STATE_WIDTHS`）= joints29 + hands14 + gravity3，
+        正好对应 canonical 的 ``q = state[7:36]`` 分段 + 录制手部 + 由四元数算出的重力投影。
+        """
+        import numpy as np  # noqa: PLC0415
+        from .trackerlab_adapter import quat_to_mat  # noqa: PLC0415
+
+        s = batch.start_state
+        q = s[:, 7:36]                                    # (B,29) canonical
+        R = quat_to_mat(s[:, 3:7])                        # (B,3,3)
+        grav = -R[..., 2, :]                              # body 系重力投影 = -R^T e_z
+        mi = dict(model_inputs)
+        mi["state.left_leg"] = np.ascontiguousarray(q[:, 0:6].detach().cpu().numpy())
+        mi["state.right_leg"] = np.ascontiguousarray(q[:, 6:12].detach().cpu().numpy())
+        mi["state.waist"] = np.ascontiguousarray(q[:, 12:15].detach().cpu().numpy())
+        mi["state.left_arm"] = np.ascontiguousarray(q[:, 15:22].detach().cpu().numpy())
+        mi["state.right_arm"] = np.ascontiguousarray(q[:, 22:29].detach().cpu().numpy())
+        mi["state.projected_gravity"] = np.ascontiguousarray(grav.detach().cpu().numpy())
+        # 手部保持录制值（扰动不影响手）
+        return mi
+
     # ------------------------------------------------------------------ 参考状态
     def _ref_states(self, batch) -> torch.Tensor:
         """每个想象步的参考状态 ``(H+1,B,71)``（critic 输入 / 诊断用）。"""
@@ -153,8 +188,14 @@ class JointTrainerV3(JointTrainerV2):
         model_inputs = batch.model_inputs
         if model_inputs is None:
             raise SystemExit("[v3] batch 没有 model_inputs")
+        if bool(getattr(v3, "vla_state_from_burnin", False)):
+            model_inputs = self._patch_state_from_burnin(model_inputs, batch)
         act_in, bb_out = self._backbone_output(model_inputs)
-        x_norm, x_raw, tokens = self._sample_tokens(act_in, bb_out)
+        # 固定噪声：自适应头与"底模参照"用**同一个噪声**采样，两者只差 LoRA 增量
+        head = self.vlm.action_head
+        _noise = torch.randn(int(act_in["state"].shape[0]), int(head.action_horizon),
+                             int(head.action_dim), device=self.device, dtype=head.dtype)
+        x_norm, x_raw, tokens = self._sample_tokens(act_in, bb_out, noise=_noise)
         out_of_range = self.codec.out_of_range_frac(x_norm)
 
         rollout = imagine_with_tokens(
@@ -171,9 +212,28 @@ class JointTrainerV3(JointTrainerV2):
         # ---------- 奖励项（+ critic bootstrap）----------
         boot = torch.zeros_like(ret)
         if self.critic is not None:
-            with torch.no_grad():
-                vH = self.critic(rollout.states[-1].detach(), ref_states[-1].detach(), xi.detach())
-            boot = (v3.gamma ** H) * rollout.survival[-1] * vH
+            # P1-1（对齐 SuperMimic 的 SHAC 本意）：V 对 s_H **保留梯度**，只冻结 critic 的参数
+            #   （参数在自己的监督损失里更新，避免在策略损失里双计）。
+            # B2（消除符号隐患）：用 V(s_H) − V(ref_H) 的**相对形式**——ref_H 是同一帧的参考状态，
+            #   于是 boot 的语义是"偏离参考带来的额外价值"，不会出现负值乘 survival 把策略往摔里推。
+            if bool(getattr(v3, "critic_grad_through_state", False)):
+                _g = [q.requires_grad for q in self.critic.parameters()]
+                for q in self.critic.parameters():
+                    q.requires_grad_(False)
+                try:
+                    vH = self.critic(rollout.states[-1], ref_states[-1], xi)
+                    v_ref = self.critic(ref_states[-1], ref_states[-1], xi)
+                finally:
+                    for q, g in zip(self.critic.parameters(), _g):
+                        q.requires_grad_(g)
+            else:
+                with torch.no_grad():
+                    vH = self.critic(rollout.states[-1].detach(), ref_states[-1].detach(), xi.detach())
+                    v_ref = self.critic(ref_states[-1].detach(), ref_states[-1].detach(), xi.detach())
+            boot = (v3.gamma ** H) * rollout.survival[-1] * (vH - v_ref.detach())
+            metrics_v = float((vH - v_ref).mean().detach()) if hasattr(self, "critic") else 0.0
+        else:
+            metrics_v = 0.0
         loss_r = -(ret + boot).mean()
 
         # ---------- 手部（hand-only FM：token 那 64 维完全不监督）----------
@@ -220,9 +280,19 @@ class JointTrainerV3(JointTrainerV2):
         loss_act = None
         act_rms = None
         if v3.act_eps > 0 and len(getattr(batch, "references", []) or []) > 0:
+            # P1-4：`trust_center == "base"` 时中心 = **底模自己的输出**（LoRA 增量关掉、同一噪声）；
+            # 默认 "label" 保持旧行为（稳定）。base 模式当前冒烟会 NaN（见 FIX_PLAN P1-4 备注）。
+            if str(getattr(v3, "trust_center", "label")) == "base":
+                from .lora import lora_disabled  # noqa: PLC0415
+                with lora_disabled(self.vlm.action_head):
+                    _, _, _ref_tok = self._sample_tokens(
+                        act_in, bb_out, noise=_noise, backend="truncated")
+                _ref_tok = _ref_tok.detach()
+            else:
+                _ref_tok = batch.port_tokens.detach()
             with torch.no_grad():
                 roll_ref = imagine_with_tokens(
-                    self.bundle, tokens=batch.port_tokens.detach().to(tokens.dtype),
+                    self.bundle, tokens=_ref_tok.to(tokens.dtype),
                     state=batch.start_state, obs_hist=batch.obs_hist,
                     history=batch.history, xi=batch.xi, references=batch.references,
                     prev_action=batch.prev_action, horizon=cfg.horizon,
@@ -318,6 +388,7 @@ class JointTrainerV3(JointTrainerV2):
             )
             metrics["critic/v_loss"] = cm["v_loss"]
             metrics["critic/v_ev"] = cm["v_ev"]
+        metrics["critic/v_adv_H"] = float(metrics_v)
         self.last_metrics = metrics
         return metrics
 

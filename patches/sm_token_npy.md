@@ -111,3 +111,19 @@ python3 -c "import ast;[ast.parse(open(f).read()) for f in (
   在线环（VLA 实时推理）需要渲染器，见 `docs/S3_REAL_JUDGE_PLAN_20261027.md §4.G`。
 * 光标到尾时**重复最后一帧**而不是报错，方便短 clip；日志里 `npy token source` 行会打印总长度，
   跑完请核对 `episode_steps ≤ T`。
+
+---
+
+## 6. 追加补丁（2026-10-27）：状态落盘 `SM_DUMP_STATES`
+
+目的：给"真物理窗口评测 / on-policy 转移"提供逐帧状态，**奖励仍由
+`scripts/compute_collect_reward.py` 用训练同一个 `bundle.reward` 补算**（口径不重写）。
+
+* `action_provider_supermimic.py` 新增 `_record_state_dump()` / `_flush_state_dump()`；
+* `get_action()` 末尾调用 record（在 `_step_physics` 之后）；`on_env_reset()` 里 flush 上一集；
+* 环境变量 `SM_DUMP_STATES=<前缀>` 打开，产物 `<前缀>_ep000.pt` 含
+  `states (N,71) asset 序` + `actions (N,29) canonical 序` + `frames` + `joint_names`；
+* 布局：`[p(3), quat_wxyz(4), q(29), v(3), w(3), qd(29)]`。
+
+**为什么不做在 `sim_eval_vla.py` 里**：那个文件 1000+ 行、且被 pin 契约锁哈希；
+改 provider 的改动面更小、失败也不会影响评测（全部包在 try/except 里）。

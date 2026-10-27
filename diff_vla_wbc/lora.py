@@ -46,13 +46,15 @@ class LoRALinear(nn.Module):
         # A 用 kaiming、B 用 0 ⇒ 初始增量恒为 0（与原模型逐位等价）
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
+        # 1.0 = 正常；0.0 = 退化成"底模"（用来在训练中间拿到**底模会输出什么**）
+        self.delta_scale = 1.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
         out = self.base(x)
         if out.dtype != self.lora_A.dtype:
             out = out.to(self.lora_A.dtype)
         delta = torch.nn.functional.linear(torch.nn.functional.linear(x.to(self.lora_A.dtype), self.lora_A), self.lora_B)
-        return out + self.scale * delta
+        return out + (self.scale * self.delta_scale) * delta
 
 
 def apply_lora(
@@ -102,3 +104,40 @@ def lora_summary(root: nn.Module) -> dict:
         "total": total,
         "trainable_frac": (trainable / total) if total else 0.0,
     }
+
+
+def set_lora_delta_scale(root: nn.Module, scale: float) -> int:
+    """把所有 LoRA 分支的增量乘以 ``scale``（0 = 完全退化成底模）。返回改动的层数。"""
+    n = 0
+    for m in root.modules():
+        if isinstance(m, LoRALinear):
+            m.delta_scale = float(scale)
+            n += 1
+    return n
+
+
+class lora_disabled:
+    """上下文：临时把 LoRA 增量关掉（= 底模），退出时恢复。
+
+    用途：P1-4 的信任域中心 —— 拿"底模在同一输入、同一噪声下会输出什么"当参照，
+    **完全不含标签**，语义是"别离开底模本来会做的行为"。
+    """
+
+    def __init__(self, root: nn.Module):
+        self.root = root
+        self._saved: list[float] = []
+
+    def __enter__(self):
+        for m in self.root.modules():
+            if isinstance(m, LoRALinear):
+                self._saved.append(m.delta_scale)
+                m.delta_scale = 0.0
+        return self
+
+    def __exit__(self, *exc):  # noqa: ANN002
+        i = 0
+        for m in self.root.modules():
+            if isinstance(m, LoRALinear):
+                m.delta_scale = self._saved[i]
+                i += 1
+        return False
