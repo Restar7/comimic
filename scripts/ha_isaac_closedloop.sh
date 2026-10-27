@@ -42,6 +42,7 @@ OUT_ROOT=${OUT_ROOT:-$COMIMIC/runs/ha_isaac_eval}
 # （C2 策略 + 按 ha_cmd 命令流域重标的 WM；hold 窗口 + robot_spec）。
 # 旧默认 bones_seed_token_2x8192（future 窗口、旧库）会让闭环与训练各说各话。
 SM_CKPT=${SM_CKPT:-$COMIMIC/runs/S1_handover/WBC_A20000_wmvel_cmd.pt}
+# 回放模式（SM_TOKEN_SOURCE=npy）：不需要 VLA 服务/端口/相机，SM_TOKEN_NPY 指向 (T,64) token 流。
 # receding horizon：部署每 20 步重规划（= 训练 H=20 的口径来源）。
 # supermimic provider 默认 0（旧行为：全消费 40 帧），闭环必须显式打开。
 export HA_VLA_EXEC_STEPS=${HA_VLA_EXEC_STEPS:-20}
@@ -156,6 +157,7 @@ exec python -u script/eval_scripts/sonic/sim_eval_vla.py \
   --seed "$SEED" --repeat_idx "$REPEAT" \
   --max_steps "$MAX_STEPS" \
   --sm_ckpt "$SM_CKPT" --sm_obs_mode "${SM_OBS_MODE:-auto}" --sm_token_source "$SM_TOKEN_SOURCE" \
+  --sm_token_npy "${SM_TOKEN_NPY:-}" --sm_hands_npy "${SM_HANDS_NPY:-}" \
   --sv_task_name "${TASK_INSTRUCTION:-$TASK_ID}" \
   --model_label "${MODEL_LABEL:-$TASK}" \
   --sonic_encoder_path "$SONIC_DIR/model_encoder.onnx" \

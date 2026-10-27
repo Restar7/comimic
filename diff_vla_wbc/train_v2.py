@@ -72,6 +72,9 @@ class JointV2Config:
     lambda_s: float = 0.0
     lambda_a: float = 0.0
     state_vel: float = 0.05
+    # 评测视界与训练视界解耦：训练可以在短视界里求梯度（WM 更可信），
+    # 但**评估必须按部署视界**（HA_VLA_EXEC_STEPS=20），否则测不到"会不会摔"。
+    eval_horizon: int = 0        # 0 = 与 horizon 相同
     # --- 生成式 head ---
     fm_steps: int = 4
     fm_lr: float = 1e-5
@@ -180,7 +183,7 @@ class JointTrainerV2:
         tokens = x_raw[..., :64]
         return x_norm, x_raw, tokens
 
-    def _rollout(self, batch, tokens):
+    def _rollout(self, batch, tokens, horizon: int | None = None):
         return imagine_with_tokens(
             self.bundle,
             tokens=tokens,
@@ -190,7 +193,7 @@ class JointTrainerV2:
             xi=batch.xi,
             references=batch.references,
             prev_action=batch.prev_action,
-            horizon=self.cfg.horizon,
+            horizon=int(horizon or self.cfg.horizon),
             obs_noise=self.cfg.obs_noise,
         )
 
@@ -520,6 +523,7 @@ def fixed_eval(
     cfg = trainer.cfg
     head = trainer.vlm.action_head
     dev = trainer.device
+    _h_eval = int(getattr(cfg, "eval_horizon", 0) or 0) or int(cfg.horizon)
     cpu_state = torch.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     torch.manual_seed(20261026)
@@ -567,13 +571,19 @@ def fixed_eval(
                 add("hand_gt170_label", (b.hand_ref[:, :m].abs() > 1.70).float().mean())
                 add("token_shift", (tokens_vla - b.port_tokens[:, :n].float()).abs().mean())
 
+            rets: dict[str, torch.Tensor] = {}
             for name, tok in (("vla", tokens_vla), ("gt", b.port_tokens)):
-                ro = trainer._rollout(b, tok)
+                ro = trainer._rollout(b, tok, horizon=_h_eval)
                 ret = discounted_return(ro, cfg.gamma)
+                rets[name] = ret.detach()
                 add(f"imag_return_{name}", ret.mean())
-                add(f"imag_return_norm_{name}", (ret / (cfg.horizon * float(_MAX_STEP_REWARD))).mean())
+                add(f"imag_return_norm_{name}", (ret / (_h_eval * float(_MAX_STEP_REWARD))).mean())
                 add(f"imag_reward_{name}", ro.rewards.mean())
                 add(f"imag_survival_{name}", ro.survival[-1].mean())
+                if name == "gt":
+                    # 逐窗口配对统计：同一批窗口上 VLA − GT（这是判断 +2% 是否噪声的直接依据）
+                    acc.setdefault("_pw_vla", []).extend(rets["vla"].reshape(-1).tolist())
+                    acc.setdefault("_pw_gt", []).extend(rets["gt"].reshape(-1).tolist())
                 if b.teacher_states is not None:
                     _h = ro.states.shape[0] - 1
                     add(f"imag_state_{name}", _state_error(
@@ -585,7 +595,19 @@ def fixed_eval(
         if cuda_state is not None:
             torch.cuda.set_rng_state_all(cuda_state)
 
+    pw_v = acc.pop("_pw_vla", None)
+    pw_g = acc.pop("_pw_gt", None)
     out = {k: sum(v) / len(v) for k, v in acc.items()}
+    if pw_v and pw_g and len(pw_v) == len(pw_g):
+        import statistics as _st  # noqa: PLC0415
+        d = [a - b for a, b in zip(pw_v, pw_g)]
+        out["imag_return_vla_std"] = float(_st.pstdev(pw_v)) if len(pw_v) > 1 else 0.0
+        out["imag_return_gt_std"] = float(_st.pstdev(pw_g)) if len(pw_g) > 1 else 0.0
+        out["imag_delta_mean"] = float(_st.fmean(d))
+        out["imag_delta_std"] = float(_st.pstdev(d)) if len(d) > 1 else 0.0
+        out["imag_delta_win"] = float(sum(1 for x in d if x > 0) / len(d))
+        out["imag_delta_win_n"] = int(len(d))
+    out["eval_horizon"] = int(_h_eval)
     out["step"] = int(trainer.steps)
     out["n_windows"] = (
         int(len(eval_batches) * int(eval_batches[0].start_state.shape[0])) if eval_batches else 0

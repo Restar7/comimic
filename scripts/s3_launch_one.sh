@@ -44,7 +44,8 @@ CRITIC_REAL=${CRITIC_REAL:-$COMIMIC/runs/wm_real/real_returns_vs0.pt}
 BATCH=${BATCH:-4}
 ACCUM=${ACCUM:-8}
 EVAL_EVERY=${EVAL_EVERY:-100}
-EVAL_BATCHES=${EVAL_BATCHES:-4}
+EVAL_BATCHES=${EVAL_BATCHES:-16}          # ×batch = 窗口数（16×4 = 64）
+EVAL_HORIZON=${EVAL_HORIZON:-20}          # 部署口径；与训练视界解耦
 SAVE_EVERY=${SAVE_EVERY:-150}
 WM_REFRESH_EVERY=${WM_REFRESH_EVERY:-50}
 
@@ -70,5 +71,6 @@ EXTRA="--v3 --lambda-hand $LAMBDA_HAND --critic \
        --act-eps $ACT_EPS --act-weight $ACT_WEIGHT \
        --reward-mode $REWARD_MODE --reward-vel-scale $REWARD_VEL_SCALE \
        --critic-source $CRITIC_SOURCE --critic-real $CRITIC_REAL \
-       --grad-log-every 20 --clip-head 10" \
+       --grad-log-every 20 --clip-head 10 \
+       --eval-horizon $EVAL_HORIZON" \
   bash scripts/launch_joint_ha_v2.sh

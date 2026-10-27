@@ -222,6 +222,15 @@ def main() -> int:
                     help="先验锚定 λ_a：λ_a·‖token − 底模先验‖²（先验代理 = 标签 chunk；"
                          "底模输出与标签 MSE 只有 0.004，所以数值等价）。0 = 关。建议 0.05")
 
+    ap.add_argument("--lora-rank", type=int, default=0,
+                    help="动作头 LoRA 的秩（0=关，训全量 1.62B）。开 LoRA 后只有适配器可训，"
+                         "batch 才能开大（对齐 SuperMimic 的大 batch 前提）")
+    ap.add_argument("--lora-alpha", type=float, default=None, help="LoRA 缩放 alpha（默认=rank）")
+    ap.add_argument("--lora-targets", type=str, default="attn1,ff",
+                    help="逗号分隔的层名后缀，只给这些 nn.Linear 挂 LoRA（默认 attention+FFN）")
+    ap.add_argument("--lora-train-proj-out", action="store_true", default=True,
+                    help="同时解冻输出投影 proj_out_*（默认开）")
+
     ap.add_argument("--trust-eps", type=float, default=0.0,
                     help="token trust region 容差（相对先验的 RMSE，归一化 token 空间）。"
                          "只在 RMSE>eps 时给力；0=关。建议 0.15（≈底模自身偏差 0.10 的 1.5×）")
@@ -268,6 +277,9 @@ def main() -> int:
     # ---------------- 评测 / 存档 ----------------
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--eval-batches", type=int, default=16, help="固定评测批次（×batch = 窗口数，S3.7 要 64）")
+    ap.add_argument("--eval-horizon", type=int, default=0,
+                    help="评测用的想象步数（0 = 与 --horizon 相同）。**部署口径是 20**；"
+                         "训练可以在短视界求梯度（WM 更可信），但评估必须按部署视界")
     ap.add_argument("--eval-out", type=Path, default=None, help="评测曲线 JSONL")
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--save-vla-every", type=int, default=500)
@@ -361,6 +373,19 @@ def main() -> int:
         device=device, action_horizon=40, max_state_dim=132,
         freeze_vlm=True, attn_implementation="sdpa",
     )
+    if int(args.lora_rank) > 0:
+        from diff_vla_wbc.lora import apply_lora, lora_summary  # noqa: PLC0415
+
+        n = apply_lora(
+            vlm.action_head, rank=int(args.lora_rank), alpha=args.lora_alpha,
+            targets=tuple(s for s in args.lora_targets.split(",") if s),
+            also_train=(("proj_out",) if args.lora_train_proj_out else ()),
+        )
+        sm = lora_summary(vlm.action_head)
+        print(f"[AUDIT][lora] rank={args.lora_rank} alpha={args.lora_alpha or args.lora_rank} "
+              f"layers={n} trainable={sm['trainable']:,} / {sm['total']:,} "
+              f"({100*sm['trainable_frac']:.3f}%) targets={args.lora_targets} "
+              f"proj_out_train={args.lora_train_proj_out}", flush=True)
     head_dim = int(vlm.action_head.action_dim)
     if int(vlm.action_head.action_horizon) < int(args.horizon):
         raise SystemExit(f"action_horizon {vlm.action_head.action_horizon} < H {args.horizon}")
@@ -515,11 +540,14 @@ def main() -> int:
         perturb_xy=args.perturb_xy, perturb_yaw=args.perturb_yaw,
         perturb_dq=args.perturb_dq, perturb_dqd=args.perturb_dqd,
     )
+    # 评测 provider 的**参考帧数**要够评测视界用（训练 5 步、评测 20 步是常态）；
+    # 起点（burn-in 后的 state/history）与训练视界无关，所以两臂仍逐位可比。
+    _h_eval_req = max(int(args.horizon), int(getattr(args, "eval_horizon", 0) or 0))
     eval_provider = BurnInBatchProvider(
         bundle, lib, port_source=port_chunk, port_frame_source=port_frame,
         wbc_chunk_source=wbc_chunk, online_tokens=online_tokens,
         recorded_states=_recorded_states, dr=_dr_cfg,
-        batch_size=args.batch_size, horizon=args.horizon, token_horizon=40,
+        batch_size=args.batch_size, horizon=_h_eval_req, token_horizon=40,
         seed=20261026, hand_dir=args.motion[0],
         burnin_steps=int(args.burnin_steps), burnin=not args.no_burnin,
         perturb=not args.no_perturb,
@@ -577,6 +605,7 @@ def main() -> int:
         fm_truncated_tail=args.fm_truncated_tail,
         head_eval_mode=not args.head_train_mode,
         grad_accum=args.grad_accum, grad_ratio_every=args.grad_ratio_every,
+        eval_horizon=int(args.eval_horizon),
     )
     if args.v3:
         from diff_vla_wbc.v3_step import JointTrainerV3, V3Config  # noqa: PLC0415
@@ -627,6 +656,7 @@ def main() -> int:
             f"critic={args.critic}/{args.critic_source} lam={args.lam} gamma^H={args.gamma ** args.horizon:.4f} "
             f"act=({args.act_eps},{args.act_weight}) reward=({args.reward_mode},{args.reward_vel_scale}) "
             f"wm_refresh_every={args.wm_refresh_every} clip_head={args.clip_head} "
+            f"eval_H={int(args.eval_horizon) or int(args.horizon)} "
             f"H={args.horizon} K={args.fm_steps} batch={args.batch_size} accum={args.grad_accum}",
             flush=True,
         )
