@@ -13,6 +13,11 @@ venv/
 
 # Local scratch
 *.log
+MUJOCO_LOG.TXT
+
+# Core dumps left behind by crashed runs (multi-GB each; never commit)
+core.*
+vgcore.*
 # Large G1 mesh assets (163 MB). Fetch separately, then run scripts/setup_assets.sh.
 reproduce_scenes/g1/meshes/
 GR00T-WholeBodyControl/gear_sonic_deploy/g1/meshes
