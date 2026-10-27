@@ -75,6 +75,11 @@ class JointV2Config:
     # 评测视界与训练视界解耦：训练可以在短视界里求梯度（WM 更可信），
     # 但**评估必须按部署视界**（HA_VLA_EXEC_STEPS=20），否则测不到"会不会摔"。
     eval_horizon: int = 0        # 0 = 与 horizon 相同
+    # 混合精度：GR00T 的 ckpt 原生就是 bfloat16（config.json dtype=bfloat16,
+    # backbone_trainable_params_fp32=true），我们之前全程 fp32 既非原生口径又慢约 2×。
+    # 口径：backbone 前向 + head 的 FM 采样/损失走 bf16 autocast，主权重仍 fp32；
+    #      可微 rollout（WBC+WM）保持 fp32，token 出采样后立刻转 fp32。
+    amp: str = "off"             # off | bf16
     # --- 生成式 head ---
     fm_steps: int = 4
     fm_lr: float = 1e-5
@@ -154,10 +159,17 @@ class JointTrainerV2:
             self.vlm.action_head.train()
 
     # ------------------------------------------------------------------ 前向
+    def _amp_ctx(self):
+        """bf16 autocast（仅当配置要求且 CUDA 可用）。主权重仍是 fp32。"""
+        if str(getattr(self.cfg, "amp", "off")).lower() == "bf16" and self.device.type == "cuda":
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+        import contextlib  # noqa: PLC0415
+        return contextlib.nullcontext()
+
     def _backbone_output(self, model_inputs: dict):
         """冻结 backbone 前向（no_grad），返回 ``(act_in, bb_out_副本)``。"""
         _bb_in, act_in = self.vlm.prepare_input(dict(model_inputs))
-        with torch.no_grad():
+        with torch.no_grad(), self._amp_ctx():
             bb_out = self.vlm.backbone(_bb_in)
         # 浅拷贝：下游 ``process_backbone_output`` 会原地改写字典
         return act_in, copy_backbone_output(bb_out)
@@ -172,13 +184,16 @@ class JointTrainerV2:
             batch, horizon, dim, device=self.device, dtype=head.dtype,
             generator=generator,
         )
-        x_norm = sample_once_with_grad(
-            head, bb_out, act_in,
-            initial_noise=noise,
-            num_steps=self.cfg.fm_steps,
-            grad_backend=self.cfg.grad_backend,
-            truncated_tail=self.cfg.fm_truncated_tail,
-        )
+        with self._amp_ctx():
+            x_norm = sample_once_with_grad(
+                head, bb_out, act_in,
+                initial_noise=noise,
+                num_steps=self.cfg.fm_steps,
+                grad_backend=self.cfg.grad_backend,
+                truncated_tail=self.cfg.fm_truncated_tail,
+            )
+        # 采样结果回到 fp32：codec 与可微 rollout（WBC+WM）都在 fp32 里做，数值最稳
+        x_norm = x_norm.float()
         x_raw = self.codec.decode(x_norm)
         tokens = x_raw[..., :64]
         return x_norm, x_raw, tokens

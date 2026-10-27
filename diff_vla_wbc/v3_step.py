@@ -186,7 +186,9 @@ class JointTrainerV3(JointTrainerV2):
             )
             hand_mask = torch.zeros_like(mask_full)
             hand_mask[..., 64:78] = 1.0
-            loss_hand = fm_bc_loss(self.vlm.action_head, bb_out, act_in, tgt, hand_mask)
+            with self._amp_ctx():
+                loss_hand = fm_bc_loss(self.vlm.action_head, bb_out, act_in, tgt, hand_mask)
+            loss_hand = loss_hand.float()
 
         loss = v3.lambda_r * loss_r
         # ---- 先验锚定（A 方案）：把 token 按在一根弹簧上，堵掉"跑出流形骗 WM"的路 ----

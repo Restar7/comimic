@@ -40,6 +40,9 @@ REWARD_MODE=${REWARD_MODE:-saturating}
 REWARD_VEL_SCALE=${REWARD_VEL_SCALE:-0}      # 0 = 扣掉 WM 不可信的速度两项
 CRITIC_SOURCE=${CRITIC_SOURCE:-real}         # real = 真录制轨迹的 return-to-go（grounded）
 CRITIC_REAL=${CRITIC_REAL:-$COMIMIC/runs/wm_real/real_returns_vs0.pt}
+# --- 动作头 LoRA + 混合精度（对齐 SuperMimic 的"大 batch"前提）---
+LORA_RANK=${LORA_RANK:-32}                   # 0 = 训全量 1.62B（batch 只能 4）
+AMP=${AMP:-bf16}                             # GR00T ckpt 原生 dtype=bfloat16
 # --- 规模 ---
 BATCH=${BATCH:-4}
 ACCUM=${ACCUM:-8}
@@ -72,5 +75,6 @@ EXTRA="--v3 --lambda-hand $LAMBDA_HAND --critic \
        --reward-mode $REWARD_MODE --reward-vel-scale $REWARD_VEL_SCALE \
        --critic-source $CRITIC_SOURCE --critic-real $CRITIC_REAL \
        --grad-log-every 20 --clip-head 10 \
-       --eval-horizon $EVAL_HORIZON" \
+       --eval-horizon $EVAL_HORIZON \
+       --lora-rank $LORA_RANK --amp $AMP" \
   bash scripts/launch_joint_ha_v2.sh

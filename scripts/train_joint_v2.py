@@ -222,9 +222,12 @@ def main() -> int:
                     help="先验锚定 λ_a：λ_a·‖token − 底模先验‖²（先验代理 = 标签 chunk；"
                          "底模输出与标签 MSE 只有 0.004，所以数值等价）。0 = 关。建议 0.05")
 
-    ap.add_argument("--lora-rank", type=int, default=0,
+    ap.add_argument("--lora-rank", type=int, default=32,
                     help="动作头 LoRA 的秩（0=关，训全量 1.62B）。开 LoRA 后只有适配器可训，"
                          "batch 才能开大（对齐 SuperMimic 的大 batch 前提）")
+    ap.add_argument("--amp", choices=("off", "bf16"), default="bf16",
+                    help="混合精度：bf16 = GR00T ckpt 的原生 dtype（config.json dtype=bfloat16）；"
+                         "只作用于 backbone 前向与 head 的 FM 采样/损失，主权重与 rollout 仍 fp32")
     ap.add_argument("--lora-alpha", type=float, default=None, help="LoRA 缩放 alpha（默认=rank）")
     ap.add_argument("--lora-targets", type=str, default="attn1,ff",
                     help="逗号分隔的层名后缀，只给这些 nn.Linear 挂 LoRA（默认 attention+FFN）")
@@ -605,7 +608,7 @@ def main() -> int:
         fm_truncated_tail=args.fm_truncated_tail,
         head_eval_mode=not args.head_train_mode,
         grad_accum=args.grad_accum, grad_ratio_every=args.grad_ratio_every,
-        eval_horizon=int(args.eval_horizon),
+        eval_horizon=int(args.eval_horizon), amp=str(args.amp),
     )
     if args.v3:
         from diff_vla_wbc.v3_step import JointTrainerV3, V3Config  # noqa: PLC0415
@@ -656,7 +659,7 @@ def main() -> int:
             f"critic={args.critic}/{args.critic_source} lam={args.lam} gamma^H={args.gamma ** args.horizon:.4f} "
             f"act=({args.act_eps},{args.act_weight}) reward=({args.reward_mode},{args.reward_vel_scale}) "
             f"wm_refresh_every={args.wm_refresh_every} clip_head={args.clip_head} "
-            f"eval_H={int(args.eval_horizon) or int(args.horizon)} "
+            f"eval_H={int(args.eval_horizon) or int(args.horizon)} amp={args.amp} "
             f"H={args.horizon} K={args.fm_steps} batch={args.batch_size} accum={args.grad_accum}",
             flush=True,
         )
