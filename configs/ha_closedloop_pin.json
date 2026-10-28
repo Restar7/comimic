@@ -1,7 +1,7 @@
 {
   "version": 1,
   "purpose": "HA 闭环推理锁死契约：场景/资产/机器人初始位姿/仿真参数/编解码器",
-  "created_utc": "2026-10-27T03:30:03+00:00",
+  "created_utc": "2026-10-28T01:37:54+00:00",
   "ha_root": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1",
   "robot_type": "unitree_g1_refpose_v3_1",
   "protocol": {
@@ -25,7 +25,7 @@
   },
   "runtime": {
     "script": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/script/eval_scripts/sonic/sim_eval_vla.py",
-    "script_sha256": "87a29d51fcf3ed23c7335eec5ef2f11380c2011bed2ef791a6db5d73f794a9d1",
+    "script_sha256": "c4f065be367cf7dc80a69442c8618ec34d16e0c135840f371fd37d416b036dbd",
     "episode_batch_mode": "--episode_batch_json（单进程持久仿真，多集复用同一场景）"
   },
   "weights": {

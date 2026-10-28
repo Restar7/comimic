@@ -28,8 +28,10 @@ sys.path.insert(0, str(ROOT))
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="inp", type=Path, required=True)
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--in", dest="inp", type=Path, nargs="+", required=True,
+                    help="一个或多个 dump（bundle 只加载一次，批量补算）")
+    ap.add_argument("--out", type=Path, required=True,
+                    help="单个输入时是输出文件；多个输入时是输出**目录**")
     ap.add_argument("--wbc-ckpt", type=Path,
                     default=ROOT / "runs/S1_handover/WBC_A20000_wmvel_cmd.pt")
     ap.add_argument("--packed", type=Path, default=ROOT / "runs/isaac_motion/ha_cmd/packed.pt")
@@ -43,16 +45,37 @@ def main() -> int:
     from diff_vla_wbc.isaac_joint import FrameRef, load_isaac_bundle  # noqa: PLC0415
 
     dev = torch.device(a.device)
-    d = torch.load(str(a.inp), map_location="cpu", weights_only=False)
-    S, A, S2, F = d["states"], d["actions"], d["next_states"], d["frames"]
-    print(f"[reward] in={a.inp} n={S.shape[0]} clip={d.get('clip')} "
-          f"envs={d.get('num_envs')} steps={d.get('steps')}", flush=True)
-
     npz = sorted((ROOT / "data/npz/ha_tokens").glob("*.npz"))
     bundle = load_isaac_bundle(a.wbc_ckpt, device=dev, npz=npz, packed_motion=a.packed,
                                obs_mode=None, hist=None, token_dim=64)
     bundle.reward_mode = str(a.reward_mode)
     bundle.reward_vel_scale = float(a.reward_vel_scale)
+    multi = len(a.inp) > 1
+    if multi:
+        a.out.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for inp in a.inp:
+        out_path = (a.out / (inp.stem + "_r.pt")) if multi else a.out
+        rows.append(_one(inp, out_path, a, bundle, dev))
+    if multi:
+        print("\n[reward] ===== 汇总 =====", flush=True)
+        for k, v in rows:
+            print(f"[reward] {k:34s} r_mean={v:+.5f}", flush=True)
+    return 0
+
+
+def _one(inp: Path, out_path: Path, a, bundle, dev) -> tuple[str, float]:
+    from diff_vla_wbc.isaac_joint import FrameRef  # noqa: PLC0415
+
+    d = torch.load(str(inp), map_location="cpu", weights_only=False)
+    S, A, F = d["states"], d["actions"], d["frames"]
+    # 奖励只依赖 (state, action, prev_action, frame)；next_states 只是附带字段，
+    # 官方闭环的 state dump 没有它（也不需要它）⇒ 缺失时按帧位移补上，不影响奖励。
+    S2 = d.get("next_states")
+    if S2 is None:
+        S2 = torch.cat((S[1:], S[-1:]), dim=0)
+    print(f"[reward] in={inp} n={S.shape[0]} clip={d.get('clip')} "
+          f"envs={d.get('num_envs')} steps={d.get('steps')}", flush=True)
 
     n = int(S.shape[0])
     bs = 4096
@@ -91,13 +114,13 @@ def main() -> int:
                             "reward_vel_scale": float(a.reward_vel_scale),
                             "reward_fn": "trackerlab mdp.reward via bundle.reward (同一函数)",
                             "reward_computed_by": "scripts/compute_collect_reward.py"})
-    a.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, str(a.out))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, str(out_path))
     stats = {"n": n, "r_mean": float(out["rewards"].mean()),
              "r_std": float(out["rewards"].std()), "meta": payload["meta"]}
-    a.out.with_suffix(".json").write_text(json.dumps(stats, indent=1, default=str))
-    print(f"[reward] saved {a.out}", flush=True)
-    return 0
+    out_path.with_suffix(".json").write_text(json.dumps(stats, indent=1, default=str))
+    print(f"[reward] saved {out_path}", flush=True)
+    return (inp.stem, float(out["rewards"].mean()))
 
 
 if __name__ == "__main__":
