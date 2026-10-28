@@ -194,7 +194,7 @@
 |---|---|---|---|
 | **P1-1** | **B1+B2**：critic 梯度穿 `s_H` + 改相对形式 | `diff_vla_wbc/v3_step.py:172-176` | `critic/v_ev` 与策略改进同向；无 NaN |
 | **P1-2** | **B3**：critic 数据覆盖偏离状态 | `scripts/calibrate…` / batch 里加 `start_state` | `v_ev` 在扰动状态上不崩 |
-| **P1-3** | **B4**：critic 开/关 A/B | 两个 100 步 run | 差异是否显著；不显著 ⇒ 关掉 |
+| **P1-3** | **B4**：critic 开/关 A/B | 两然后个 100 步 run | 差异是否显著；不显著 ⇒ 关掉 |
 | **P1-4** | **D1**：hinge 中心换成底模输出 | `v3_step.py` 里 `roll_ref` 的 token 源 | `tok_mse ≤1.5×`、`frac_out ∈0.1–0.5` |
 | **P1-5** | **bf16 vs fp32 对拍** | 同 seed、64 窗口 | token 差 ≪0.004；`imag_return` 差 ≪1% |
 | **P1-6** | **A1**：把 burn-in 状态写回 VLA 的 state 输入 | `scripts/train_joint_v2.py` 的 `_processed` | 重测 oracle headroom（可观测区间）|

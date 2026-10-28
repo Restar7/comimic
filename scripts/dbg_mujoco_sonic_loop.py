@@ -59,6 +59,8 @@ def main() -> int:
     ap.add_argument("--scene", type=Path, default=SCENE)
     ap.add_argument("--decoder", type=Path, default=DECODER)
     ap.add_argument("--max-steps", type=int, default=300)
+    ap.add_argument("--init-history", default="recorded",
+                    choices=("recorded", "provider", "zeros", "legacy"))
     args = ap.parse_args()
 
     z = np.load(args.npz, allow_pickle=True)
@@ -73,14 +75,54 @@ def main() -> int:
     m = mujoco.MjModel.from_xml_path(str(args.scene))
     d = mujoco.MjData(m)
     mujoco.mj_resetData(m, d)
-    # 起始 root 用录制高度；贴在原点，避免场景里和其它物体初始重叠
-    d.qpos[0:3] = [0.0, 0.0, 0.80]
-    d.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
-    d.qpos[7:36] = q_mj0[0]
-    d.qpos[36:50] = 0.0
+    # 起始 root：**自动贴地**。录制里的 root z（Isaac 的 HA 资产）和这个 MuJoCo 模型差
+    # 3~5 cm；直接用录制的 0.80 会让机器人先自由落体一次，落地冲击足以毁掉闭环。
+    SM = G.SceneMap(m)                    # 按名字取索引：模型里手部关节/执行器插在中间，
+    d.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]    # 用 qpos[7:36] 会把左手指当成右臂
+    SM.set_q(d, q_mj0[0])
+    SM.set_hands(d, np.zeros(len(G.HAND_JOINT_NAMES)))
+    # 实测：该模型在录制首帧姿态下，root z ≈ 0.752 才刚接触地面（0.74 已穿地 1.7 cm，
+    # 0.76 还悬空）。这里用实测值，避免“先自由落体一次”。
+    z0 = 0.752
+    d.qpos[0:3] = [0.0, 0.0, z0]
     mujoco.mj_forward(m, d)
+    print(f"[init] root z = {z0:.4f} (录制 z={z['robot_root_position'][0,2]:.3f}, ncon={d.ncon})")
 
     ctrl = SonicController(str(args.decoder), init_q=q_mj0[0])
+
+    # ---- 历史缓冲初始化：这是“上层喂给下层”的第一个接口 -------------------------
+    # recorded : 用录制第 0 帧真实的 10 帧历史（ang_vel / q-delta / dq / last_action / gravity）
+    # provider : 复刻 Isaac provider `_setup_buffers()` 的初值
+    #            q-delta=0, dq=0, ang_vel=0, last_action=DEFAULT_ANGLES(错), gravity=0(错)
+    # zeros    : last_action 与 gravity 全零（更激进的反例）
+    if args.init_history in ("recorded", "provider", "zeros"):
+        if args.init_history == "recorded":
+            h_av = np.asarray(z["decoder_ang_vel_hist"][0], np.float64)[::-1]
+            h_qp = np.asarray(z["encoder_robot_joint_pos_hist"][0], np.float64)[::-1]
+            h_qv = np.asarray(z["encoder_robot_joint_vel_hist"][0], np.float64)[::-1]
+            h_la = np.asarray(z["decoder_last_action_hist"][0], np.float64)[::-1]
+            h_gv = np.asarray(z["decoder_gravity_dir_hist"][0], np.float64)[::-1]
+            assert h_av.shape == (10, 3) and h_qp.shape == (10, 29), (h_av.shape, h_qp.shape)
+        elif args.init_history == "provider":
+            h_av = np.zeros((10, 3))
+            h_qp = np.zeros((10, 29))
+            h_qv = np.zeros((10, 29))
+            h_la = np.tile(G.DEFAULT_ANGLES, (10, 1))     # ← Isaac provider 的初值
+            h_gv = np.zeros((10, 3))                      # ← Isaac provider 的初值
+        else:
+            h_av = np.zeros((10, 3))
+            h_qp = np.zeros((10, 29))
+            h_qv = np.zeros((10, 29))
+            h_la = np.zeros((10, 29))
+            h_gv = np.tile(np.array([0.0, 0.0, -1.0]), (10, 1))
+        ctrl.hist.clear()
+        for i in range(10):
+            ctrl.hist.append({"base_ang_vel": h_av[i], "q": h_qp[i], "dq": h_qv[i],
+                              "last_action": h_la[i], "gravity": h_gv[i]})
+        print(f"[init] history seeded: {args.init_history}")
+    else:
+        print("[init] SonicController default (absolute-angle history)")
+
     sub = int(round(CONTROL_DT / m.opt.timestep))
     n = int(min(args.steps, len(tokens)))
 
@@ -88,8 +130,8 @@ def main() -> int:
                            "root_pos", "root_quat", "tilt", "torque", "sat")}
     print(f"[mode] {args.mode}  steps={n}  sub={sub}  dt={m.opt.timestep}")
     for tick in range(n):
-        q = d.qpos[7:36].copy()
-        dq = d.qvel[6:35].copy()
+        q = SM.q(d).copy()
+        dq = SM.dq(d).copy()
         quat = d.qpos[3:7].copy()
         ang = d.qvel[3:6].copy()
 
@@ -117,8 +159,8 @@ def main() -> int:
         eff = np.array([G.EFFORT[m_] for m_ in G.MOTOR], np.float64)
         tau_c = np.clip(tau, -eff, eff)
         for _ in range(sub):
-            d.ctrl[:29] = tau_c
-            d.ctrl[29:] = 0.0
+            SM.set_ctrl(d, tau_c)
+            SM.set_hand_ctrl(d, np.zeros(len(G.HAND_JOINT_NAMES)))
             mujoco.mj_step(m, d)
 
         rec["t"].append(tick * CONTROL_DT)

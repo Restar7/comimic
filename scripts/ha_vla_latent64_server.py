@@ -85,24 +85,44 @@ SONIC_TAG = "unitree_g1_sonic"
 HAND_CLOSE_THRESHOLD = 1.70
 
 
-def rot6d_to_matrix(r6: np.ndarray) -> np.ndarray:
-    """HA uses the **row** layout (``rotation_6d_layout: row`` in the dataset info.json)."""
-    a1, a2 = r6[..., 0:3], r6[..., 3:6]
-    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-9)
-    b2 = a2 - (b1 * a2).sum(-1, keepdims=True) * b1
-    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-9)
-    b3 = np.cross(b1, b2)
-    return np.stack([b1, b2, b3], axis=-1)          # (...,3,3), row layout: rows are the bases
+def rot6d_to_matrix(r6: np.ndarray, layout: str = "ha_cols") -> np.ndarray:
+    """6 维姿态 -> 旋转矩阵。
+
+    **2026-10-26 更正**：HA 的 6 维姿态不是“两行/两列基向量”打包，而是
+    ``quat_to_rot6d_wxyz`` 里的 ``rot[:, :2].reshape(...)``，即
+    ``[R00, R01, R10, R11, R20, R21]``（前两列、row-major）。
+    单位姿态在录制里就是 ``[1,0,0,1,0,0]``；按“两行”解会退化成 0 向量。
+
+    证据：用录制 ``vla_state_root_rot6d`` 解出的重力与
+    ``decoder_gravity_dir_hist``（= 由机器人真实朝向算的 R^T·[0,0,-1]）
+    逐帧 **max|Δ| = 0.0**；旧写法在 tilt 帧上偏 0.5 rad。见
+    ``docs/DIAG_SONIC_CLOSEDLOOP_20261026.md`` B1b。
+    """
+    r6 = np.asarray(r6, dtype=np.float64)
+    if layout == "ha_cols":
+        c0 = r6[..., [0, 2, 4]]
+        c1 = r6[..., [1, 3, 5]]
+    elif layout == "rows":            # 旧（错误）假设，仅保留做 A/B
+        rows = np.stack([r6[..., 0:3], r6[..., 3:6]], axis=-2)
+        c0, c1 = rows[..., 0], rows[..., 1]
+    else:
+        raise ValueError(f"unknown rot6d layout {layout!r} (ha_cols|rows)")
+    c0 = c0 / (np.linalg.norm(c0, axis=-1, keepdims=True) + 1e-9)
+    c1 = c1 - (c0 * c1).sum(-1, keepdims=True) * c0
+    c1 = c1 / (np.linalg.norm(c1, axis=-1, keepdims=True) + 1e-9)
+    c2 = np.cross(c0, c1)
+    return np.stack([c0, c1, c2], axis=-1)          # 列 = 基向量
 
 
-def gravity_from_rot6d(r6: np.ndarray) -> np.ndarray:
+def gravity_from_rot6d(r6: np.ndarray, layout: str = "ha_cols") -> np.ndarray:
     """Body-frame gravity, i.e. ``R^T @ [0,0,-1]`` — the GR00T ``projected_gravity`` term."""
-    m = rot6d_to_matrix(np.asarray(r6, dtype=np.float64))
+    m = rot6d_to_matrix(np.asarray(r6, dtype=np.float64), layout=layout)
     return np.einsum("...ji,j->...i", m, np.array([0.0, 0.0, -1.0])).astype(np.float32)
 
 
 def state64_to_state46(state64: np.ndarray, hands14: np.ndarray,
-                       state_order: str = "ha_v31") -> np.ndarray:
+                       state_order: str = "ha_v31",
+                       layout: str = "train_v1") -> np.ndarray:
     """Their 64-d state + our 14-d hand feedback -> the 46-d state the checkpoint expects.
 
     ``state64[6:35]`` is HumanoidArena's ``vla_state_dof_pos_29``, i.e. the ``HA_V31_29``
@@ -115,15 +135,26 @@ def state64_to_state46(state64: np.ndarray, hands14: np.ndarray,
     if s.size != 64:
         raise ValueError(f"expected the 64-d HA state, got {s.size}")
     joints = s[6:35]
-    if state_order == "standard":
-        pass                      # already STANDARD_29
-    elif state_order == "ha_v31":
-        pass                      # HA_V31_29 is what the model was trained on; no reorder
-    else:
+    if state_order not in ("ha_v31", "standard"):
         raise ValueError(f"unknown --state-order {state_order!r} (ha_v31|standard)")
+    hands = np.asarray(hands14, dtype=np.float32).reshape(-1)
+    if hands.size != 14:
+        raise ValueError(f"expected 14 hand dims, got {hands.size}")
     gravity = gravity_from_rot6d(s[0:6])
-    return np.concatenate([joints.astype(np.float32), np.asarray(hands14, dtype=np.float32).reshape(-1),
-                           gravity]).astype(np.float32)
+    if layout == "train_v1":
+        # **训练数据真实的 46 维布局**（data/ha_sessions 的 observation.state 43 + gravity）：
+        #   [ jp[0:22] | left_hand(7) | jp[22:29] | right_hand(7) | gravity ]
+        # 见 data/ha_sessions/*/meta/modality.json：
+        #   left_leg 0:6  right_leg 6:12  waist 12:15  left_arm 15:22
+        #   left_hand 22:29  right_arm 29:36  right_hand 36:43
+        # 旧实现把 29 个关节整段放在前面，等价于把 left_hand 与 right_arm 两块互换
+        # （2026-10-26 用 parquet 逐帧对拍确认：旧布局 22:29 与训练差 1.74 rad）。
+        return np.concatenate([joints[:22].astype(np.float32), hands[:7],
+                               joints[22:].astype(np.float32), hands[7:],
+                               gravity]).astype(np.float32)
+    if layout == "legacy":
+        return np.concatenate([joints.astype(np.float32), hands, gravity]).astype(np.float32)
+    raise ValueError(f"unknown --state-layout {layout!r} (train_v1|legacy)")
 
 
 class Engine:
@@ -189,6 +220,13 @@ class Engine:
             print(self.codec.audit(), flush=True)
         print(f"[AUDIT][server] decode={getattr(self.args, 'decode', 'codec')} "
               f"fm_steps={self.args.fm_steps} train_fm_steps={self._train_fm_steps}", flush=True)
+        # LOCKED token space: the action head target is ``action.motion_token`` ==
+        # ``encoder_latent`` == SONIC encoder output computed from the **command stream**
+        # (``encoder_motion_joint_pos_hist``), NOT the executed trajectory.  See
+        # scripts/prepare_ha_sessions.py and scripts/build_ha_command_lib.py.
+        print("[AUDIT][token] action.motion_token = encoder_latent (COMMAND stream); "
+              "token_space=command_encoder_latent LOCKED", flush=True)
+        self.token_space = "command_encoder_latent"
         cfg = getattr(self.processor, "config", None)
         size = getattr(cfg, "image_target_size", None) if cfg is not None else None
         if isinstance(size, (list, tuple)) and len(size) == 2:
@@ -202,8 +240,11 @@ class Engine:
                 hands14 = self.last_hands14.copy()
             else:
                 hands14 = np.zeros(14, dtype=np.float32)
-            state46 = state64_to_state46(state64, hands14,
-                                         state_order=getattr(self.args, "state_order", "ha_v31"))
+            state46 = state64_to_state46(
+                state64, hands14,
+                state_order=getattr(self.args, "state_order", "ha_v31"),
+                layout=getattr(self.args, "state_layout", "train_v1"),
+            )
 
             if self.args.dry_run:
                 chunk64 = np.zeros((self.args.horizon, 64), dtype=np.float32)
@@ -275,7 +316,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self._json(200, {"ok": True, "service": "ha-latent64-vla"})
+        self._json(200, {"ok": True, "service": "ha-latent64-vla",
+                         "token_space": "command_encoder_latent"})
 
     def do_POST(self):
         path = self.path.rstrip("/")
@@ -349,6 +391,9 @@ def main() -> int:
                     help="order of the 29 joints inside the incoming 64-d vla_state "
                          "(ha_v31 = HumanoidArena asset order, which the current ckpt was "
                          "trained on; standard = trackerlab/MuJoCo order)")
+    ap.add_argument("--state-layout", choices=("train_v1", "legacy"), default="train_v1",
+                    help="46 维 state 的分块布局：train_v1 = 训练数据真实布局"
+                         "（left_hand 在 22:29、right_arm 在 29:36）；legacy = 旧实现（两块互换）")
     ap.add_argument("--hand-source", choices=("feedback", "zeros"), default="feedback",
                     help="where the 46-d state's hand entries come from (their state has none)")
     ap.add_argument("--dry-run", action="store_true", help="no model: answer zeros to test the wiring")

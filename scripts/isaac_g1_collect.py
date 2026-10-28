@@ -42,6 +42,7 @@ parser.add_argument("--steps", type=int, default=300)
 parser.add_argument("--exec-steps", type=int, default=20)
 parser.add_argument("--start-frame", type=int, default=0)
 parser.add_argument("--out", type=Path, default=ROOT / "runs/wm_real/onpolicy.pt")
+parser.add_argument("--warmup", type=int, default=20, help="记录前的 warm-up 步数（让观测历史自洽）")
 parser.add_argument("--log-every", type=int, default=25)
 args_cli = parser.parse_args()
 
@@ -64,12 +65,8 @@ HIST = 10
 class SceneCfg(InteractiveSceneCfg):
     # InteractiveScene 只认 AssetBaseCfg 风格的条目，裸 GroundPlaneCfg 会报 Unknown asset config
     ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
-    robot: ArticulationCfg = ArticulationCfg(
-        prim_path="/World/envs/env_.*/Robot",
-        spawn=sim_utils.UsdFileCfg(usd_path=USD),
-        init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.80)),
-        actuators={},
-    )
+    # robot 在 main() 里按 ckpt 的 robot_spec 动态构造（PD 增益必须显式给，见下）
+    robot: ArticulationCfg = None
 
 
 def main() -> int:
@@ -94,7 +91,31 @@ def main() -> int:
 
     sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=1.0 / 200.0, device=str(DEV)))
     # InteractiveSceneCfg 的 num_envs/env_spacing 是 MISSING 必填字段，必须在实例化时给
+    # ★ 执行器 PD 增益必须显式设：USD 自带的 drive 增益远低于训练时的 kp/kd，
+    #   不设的话关节几乎不动（实测根位移只有录制的 0.15×）。数值来自 ckpt 的 robot_spec。
+    from isaaclab.actuators import ImplicitActuatorCfg  # noqa: PLC0415
+
+    kp = torch.as_tensor(rs["kp"], dtype=torch.float32)
+    kd = torch.as_tensor(rs["kd"], dtype=torch.float32)
+    ef = torch.as_tensor(rs.get("effort_limit", [0.0] * nj), dtype=torch.float32)
+    acts = {
+        f"j{i}": ImplicitActuatorCfg(
+            joint_names_expr=[joint_names[i]],
+            stiffness=float(kp[i]), damping=float(kd[i]),
+            effort_limit=float(ef[i]) if float(ef[i]) > 0 else None,
+        )
+        for i in range(nj)
+    }
+    robot_cfg = ArticulationCfg(
+        prim_path="/World/envs/env_.*/Robot",
+        spawn=sim_utils.UsdFileCfg(usd_path=USD),
+        init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.80)),
+        actuators=acts,
+    )
     cfg = SceneCfg(num_envs=int(args_cli.num_envs), env_spacing=2.5)
+    cfg.robot = robot_cfg
+    print(f"[collect] 执行器增益: kp mean={float(kp.mean()):.1f} kd mean={float(kd.mean()):.2f} "
+          f"effort mean={float(ef.mean()):.1f}", flush=True)
     scene = InteractiveScene(cfg)
     robot: Articulation = scene["robot"]
     sim.reset()
@@ -142,10 +163,41 @@ def main() -> int:
     except Exception as _e:  # noqa: BLE001
         print(f"[collect] ⚠️ 根位姿对齐失败（奖励的 root 项会偏）: {_e}", flush=True)
 
+    # ★ 关节初值必须取**参考帧的关节角**（不是 default_q）：片段第 0 帧往往离默认姿态很远，
+    #   否则机器人一出生就在"追赶"，全程滞后（实测根位移只有录制的 1/3）。
+    q_init_ref = None
+    if ref is not None:
+        row0 = ref[int(starts[ci]) + int(args_cli.start_frame)]
+        q_init_ref = row0[13:13 + nj].to(DEV)
     q0 = torch.zeros(n, robot.num_joints, device=DEV)
-    q0[:, idx_t] = default_q.unsqueeze(0)
+    q0[:, idx_t] = (q_init_ref if q_init_ref is not None else default_q).unsqueeze(0)
     robot.write_joint_state_to_sim(q0, torch.zeros_like(q0))
     scene.update(sim.get_physics_dt())
+    print(f"[collect] 关节初值 = {'参考帧' if q_init_ref is not None else 'default_q'}", flush=True)
+
+    # ★ warm-up：让 WBC 的 10 帧观测历史与 token 自洽后再开始记录（否则前 ~10 步是垃圾输入）
+    warm = int(args_cli.warmup)
+    if warm > 0:
+        last_a = torch.zeros(n, nj, device=DEV)
+        hist = torch.zeros(n, HIST, 93, device=DEV)
+        for wstep in range(warm):
+            row = toks[min(int(args_cli.start_frame) + wstep, toks.shape[0] - 1)]
+            tok_w = torch.as_tensor(row, device=DEV, dtype=torch.float32).unsqueeze(0).expand(n, -1)
+            q_w = robot.data.joint_pos[:, idx_t]
+            dq_w = robot.data.joint_vel[:, idx_t]
+            obs_w = torch.cat((q_w - default_q, dq_w, robot.data.root_ang_vel_b,
+                               robot.data.projected_gravity_b, last_a), dim=-1)
+            hist = torch.cat((hist[:, 1:], obs_w.unsqueeze(1)), dim=1)
+            with torch.no_grad():
+                a_w = pol(hist, tok_w)
+            robot.set_joint_position_target(
+                default_q.unsqueeze(0) + a_w * scale.unsqueeze(0),
+                joint_ids=[int(i) for i in idx])
+            for _ in range(4):
+                sim.step()
+            scene.update(sim.get_physics_dt())
+            last_a = a_w.detach()
+        print(f"[collect] warm-up {warm} 步完成", flush=True)
 
     last_a = torch.zeros(n, nj, device=DEV)
     hist = torch.zeros(n, HIST, 93, device=DEV)

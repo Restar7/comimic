@@ -82,3 +82,6 @@ data/npz/
 
 # S2 fallback（端口 token 重标注树，5.7 GB，备而不发）
 data/ha_sessions_port/
+
+# Isaac 侧依赖软链视图（指向 third_party/gr00t_deps，纯 symlink，别人机器上无意义）
+third_party/gr00t_deps_nomujoco/

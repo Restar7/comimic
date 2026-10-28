@@ -37,6 +37,9 @@ MAX_STEPS=${MAX_STEPS:-300}
 SERVER_URL=${SERVER_URL:-http://127.0.0.1:18080}
 ISAAC_GPU=${ISAAC_GPU:-0}
 OUT_ROOT=${OUT_ROOT:-$COMIMIC/runs/ha_isaac_eval}
+# 1 = headless（默认；出视频/跑批量）；0 = 开 Isaac GUI（配合 DISPLAY=:N，NoVNC 可视化用）
+HEADLESS=${HEADLESS:-1}
+if [[ "$HEADLESS" == "1" ]]; then HEADLESS_FLAG="--headless"; else HEADLESS_FLAG=""; fi
 # 我们的 SuperMimic WBC（token-conditioned，trackerlab 训练产物，ckpt 里要有 "pi" 键）
 # LOCKED 2026-10-26：执行器必须与 S3 联合微调**同一个** ckpt —— C6h
 # （C2 策略 + 按 ha_cmd 命令流域重标的 WM；hold 窗口 + robot_spec）。
@@ -151,7 +154,14 @@ echo "[closedloop] instruction=${TASK_INSTRUCTION:-<none>}"
 echo "[closedloop] out=$RUN_DIR"
 
 cd "$PROJECT_ROOT"
-exec python -u script/eval_scripts/sonic/sim_eval_vla.py \
+# GUI over NoVNC: Xtigervnc has no hardware GLX, so the RTX viewport stays black unless
+# VirtualGL interposes.  VGLRUN=1 + HEADLESS=0 -> ``vglrun -d egl python ...``.
+if [[ "${VGLRUN:-0}" == "1" ]]; then
+  VGL_PREFIX="vglrun -d ${VGL_DISPLAY:-egl}"
+else
+  VGL_PREFIX=""
+fi
+exec ${VGL_PREFIX} python -u script/eval_scripts/sonic/sim_eval_vla.py \
   --task "$TASK_ID" \
   --env_config_yaml "$TASK_YAML" \
   --seed "$SEED" --repeat_idx "$REPEAT" \
@@ -166,7 +176,7 @@ exec python -u script/eval_scripts/sonic/sim_eval_vla.py \
   --lerobot_server_timeout 60 \
   --robot_type unitree_g1_refpose_v3_1 \
   --device "cuda:$ISAAC_GPU" \
-  --headless \
+  $HEADLESS_FLAG \
   --result_json "$RESULT_JSON" \
   --success_video_dir "$RUN_DIR/videos_success" \
   --failure_video_dir "$RUN_DIR/videos_failure" \

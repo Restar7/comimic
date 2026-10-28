@@ -24,7 +24,14 @@ cd "$COMIMIC" || exit 1
 
 export SUPERMIMIC_HA_ALIGN=1
 export SUPERMIMIC_ROBOT_USD=${SUPERMIMIC_ROBOT_USD:-$COMIMIC/trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd}
+# ---- 本机渲染三开关（见 patches/isaac_render_recipe.md）：缺一则 Isaac 起不来或相机不可用 ----
 unset CUDA_VISIBLE_DEVICES
+unset LD_PRELOAD
+export DISPLAY=${DISPLAY:-:99}
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/xdg}
+export TERM=xterm
+export MESA_GL_VERSION_OVERRIDE=4.6 MESA_GLSL_VERSION_OVERRIDE=460
+mkdir -p "$XDG_RUNTIME_DIR"
 
 TASKS=${TASKS:-"DoubleDesk PPBox"}
 SEEDS=${SEEDS:-"0 1 2"}
@@ -57,9 +64,11 @@ for task in $TASKS; do
       run="replay_${task}_${arm}_s${seed}"
       log="$OUT/$run.log"
       echo "[replay] $(date +%T) $task/$arm/seed=$seed"
+      mkdir -p "$OUT/dump"
       TASK=$task SEED=$seed MAX_STEPS=$MAX_STEPS ISAAC_GPU=$ISAAC_GPU \
       MODEL_LABEL=$arm OUT_ROOT=$OUT/runs \
       SM_TOKEN_SOURCE=npy SM_TOKEN_NPY="$tok" SM_HANDS_NPY="$hands" \
+      SM_DUMP_STATES="$OUT/dump/${task}_${arm}_s${seed}" \
       HA_VLA_EXEC_STEPS=${HA_VLA_EXEC_STEPS:-20} \
         bash scripts/ha_isaac_closedloop.sh > "$log" 2>&1
       rc=$?
