@@ -166,6 +166,17 @@ class JointTrainerV2:
         import contextlib  # noqa: PLC0415
         return contextlib.nullcontext()
 
+    def prepare_model_inputs(self, batch) -> dict:
+        """交给 VLA 的观测批次。
+
+        基类原样返回；``JointTrainerV3`` 覆写它来实现 A1（用 burn-in 末状态重写
+        ``state``）。训练与评测都必须走这个方法，否则 ``fixed_eval`` 量到的还是未覆写的
+        观测，A1 的效果会被评测漏掉。
+        """
+        if batch.model_inputs is None:
+            raise SystemExit("[train] batch 没有 model_inputs")
+        return batch.model_inputs
+
     def _backbone_output(self, model_inputs: dict):
         """冻结 backbone 前向（no_grad），返回 ``(act_in, bb_out_副本)``。"""
         _bb_in, act_in = self.vlm.prepare_input(dict(model_inputs))
@@ -221,9 +232,8 @@ class JointTrainerV2:
         self.bundle.wm.eval()
         self.head_mode()
 
-        model_inputs = batch.model_inputs
-        if model_inputs is None:
-            raise SystemExit("[v2] batch 没有 model_inputs：v2 只走真实观测（dataset）路径")
+        # 同样走 prepare_model_inputs：v2 基类原样返回，v3 的 A1 覆写在此生效
+        model_inputs = self.prepare_model_inputs(batch)
         act_in, bb_out = self._backbone_output(model_inputs)
         x_norm, x_raw, tokens = self._sample_tokens(act_in, bb_out)
         out_of_range = self.codec.out_of_range_frac(x_norm)
@@ -554,7 +564,7 @@ def fixed_eval(
 
     try:
         for b in eval_batches:
-            act_in, bb_out = trainer._backbone_output(b.model_inputs)
+            act_in, bb_out = trainer._backbone_output(trainer.prepare_model_inputs(b))
             with torch.enable_grad():
                 x_norm = sample_once_with_grad(
                     head, bb_out, act_in,

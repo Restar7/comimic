@@ -240,6 +240,12 @@ def main() -> int:
     ap.add_argument("--trust-weight", type=float, default=0.0,
                     help="trust region hinge 权重（无量纲）。1.0 ≈ 越界即与 lambda_r*|J| 同量级")
 
+    ap.add_argument("--critic-state-grad-scale", type=float, default=0.1,
+                    help="P1-1：只缩放\"经 s_H\"的梯度（数值不变，straight-through）")
+    ap.add_argument("--critic-rel-clip", type=float, default=5.0,
+                    help="P1-1：V 相对值 clamp（超界梯度为 0）")
+    ap.add_argument("--act-hinge-cap", type=float, default=2.0,
+                    help="P1-4：hinge 上界 min(excess,cap)^2，防止一次爆掉")
     ap.add_argument("--trust-center", choices=("label", "base"), default="label",
                     help="动作 hinge 的中心：label=标签 rollout（旧/稳定）；"
                          "base=底模自己的输出（P1-4，无标签，但当前会 NaN）")
@@ -257,6 +263,15 @@ def main() -> int:
                     help="critic 的监督来源：imagined=想象转移 GAE（旧）；real=真录制轨迹 return-to-go（grounded）")
     ap.add_argument("--critic-real", type=Path, default=ROOT / "runs/wm_real/real_returns.pt",
                     help="--critic-source real 用的真回报文件（scripts/build_real_returns.py 生成）")
+    ap.add_argument("--lambda-aref", type=float, default=0.0,
+                    help="主目标：参考执行动作误差权重（a_exec(θ) vs decoder_target_action）；"
+                         "打开时通常把 --lambda-bc 设 0（不做 token BC）")
+    ap.add_argument("--aref-hinge-eps", type=float, default=0.0,
+                    help=">0 = hinge(relu(RMS/eps−1)²)，0 = 纯 MSE（默认）")
+    ap.add_argument("--aref-no-rel", action="store_true",
+                    help="不做逐关节尺度归一化（默认做，更稳）")
+    ap.add_argument("--ref-action-lib", type=Path,
+                    default=None, help="默认 runs/wm_real/ref_action_lib.pt")
     ap.add_argument("--reward-mode", choices=("saturating", "linear"), default="saturating")
     ap.add_argument("--reward-vel-scale", type=float, default=1.0,
                     help="奖励里速度两项的系数（0=关）。WM 的速度通道最不准（qd_corr~0.64）")
@@ -631,11 +646,20 @@ def main() -> int:
             vla_state_from_burnin=bool(args.vla_state_from_burnin),
             critic_grad_through_state=bool(args.critic_grad_through_state),
             trust_center=str(args.trust_center),
+            critic_state_grad_scale=float(args.critic_state_grad_scale),
+            critic_rel_clip=float(args.critic_rel_clip),
+            act_hinge_cap=float(args.act_hinge_cap),
+            lambda_aref=float(args.lambda_aref),
+            aref_hinge_eps=float(args.aref_hinge_eps),
+            aref_rel=not bool(args.aref_no_rel),
+            ref_action_lib=str(args.ref_action_lib or ""),
             critic_source=args.critic_source,
             grad_log_every=args.grad_log_every,
             clip_head=args.clip_head,
         )
-        trainer = JointTrainerV3(bundle, vlm, codec, cfg=cfg, v3=v3cfg, device=device)
+        # processor 传给 trainer 是为了 A1（P1-6）：覆写 state 时要复用 ckpt 自己的归一化
+        trainer = JointTrainerV3(bundle, vlm, codec, cfg=cfg, v3=v3cfg, device=device,
+                                 processor=processor)
         if args.critic_source == "real":
             if _real is None or _recorded_states is None:
                 raise SystemExit("[fail] --critic-source real 需要 --start-source recorded 与真转移文件")
