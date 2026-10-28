@@ -75,19 +75,6 @@ class V3Config:
     act_hinge_cap: float = 2.0
     act_eps: float = 0.0              # 0 = 关；容差 = (a − a_ref) 的逐关节 RMS（归一化动作空间）
     act_weight: float = 0.0           # hinge 权重（无量纲）
-    # ---- 参考执行动作误差（2026-10-28 用户口径，**主目标**）------------------------
-    # 目标：`a_exec(θ) − a_ref`，其中
-    #   a_exec = **冻结执行器在想象里执行出来的 29 维动作**（rollout.actions，可微）；
-    #   a_ref  = 录制时**真正下发的动作**（`decoder_target_action`，asset→canonical，
-    #            见 scripts/build_ref_action_lib.py，覆盖 634016 帧 / 699 clip 100%）。
-    # 与 BC 的区别：BC 监督 token 标签（模仿"参考动作的编码"），这里监督**执行结果**，
-    # 允许 token 学出"预补偿执行器偏差"的解；路径 θ→token→执行器→动作，**不经过奖励项**。
-    lambda_aref: float = 0.0          # 0 = 关；建议做主目标时 1.0 且 lambda_bc_token=0
-    aref_hinge_eps: float = 0.0       # >0 = hinge(relu(RMS/eps−1)^2)，0 = 纯 MSE
-    aref_rel: bool = True             # True: 按参考动作尺度归一化（逐关节 std），更稳
-    #: 参考动作库路径；空 = ``runs/wm_real/ref_action_lib.pt``。
-    #: 缺这个字段会让 ``train_joint_v2.py`` 里的 ``V3Config(ref_action_lib=...)`` 直接 TypeError。
-    ref_action_lib: str = ""
     # ---- critic 的监督来源 ----
     # "imagined"（旧）= 想象转移上的 GAE；"real"（新）= 真录制轨迹的 return-to-go
     critic_source: str = "imagined"
@@ -257,37 +244,6 @@ class JointTrainerV3(JointTrainerV2):
         return out
 
     # ------------------------------------------------------------------ 参考状态
-    # ---- 参考执行动作（decoder_target_action）----------------------------------
-    def _aref_lib(self):
-        """懒加载参考动作库；返回 (actions(N,29), clip_end(N,), std(29,))。"""
-        from pathlib import Path as _P  # noqa: PLC0415
-        lib = getattr(self, "_aref_cache", None)
-        if lib is not None:
-            return lib
-        path = _P(getattr(self.v3, "ref_action_lib", "") or
-                  (_P(__file__).resolve().parents[1] / "runs/wm_real/ref_action_lib.pt"))
-        d = torch.load(str(path), map_location="cpu", weights_only=False)
-        acts = d["actions"].float().to(self.device)
-        starts, lengths = d["starts"].long(), d["lengths"].long()
-        clip_id = torch.zeros(acts.shape[0], dtype=torch.long)
-        for i, (st, ln) in enumerate(zip(starts.tolist(), lengths.tolist())):
-            clip_id[st:st + ln] = i
-        clip_end = (starts + lengths - 1)[clip_id].to(self.device)
-        _v = d["valid"].bool() if "valid" in d else torch.ones(acts.shape[0], dtype=torch.bool)
-        std = acts[_v.to(acts.device)].std(0).clamp_min(1e-3).to(self.device)
-        self._aref_cache = (acts, clip_end, std)
-        print(f"[aref] 参考执行动作库 {path.name}: rows={acts.shape[0]} "
-              f"逐关节 std 中位={float(std.median()):.3f}", flush=True)
-        return self._aref_cache
-
-    def _ref_actions(self, frames, H: int) -> torch.Tensor:
-        """``frames (B,)`` -> ``a_ref (H,B,29)``（canonical 序；越过 clip 尾就夹住）。"""
-        acts, clip_end, _ = self._aref_lib()
-        f = torch.as_tensor(frames, dtype=torch.long, device=self.device).reshape(-1)
-        offs = torch.arange(H, device=self.device).unsqueeze(0)
-        rows = torch.minimum(f.unsqueeze(1) + offs, clip_end[f].unsqueeze(1))
-        return acts[rows].permute(1, 0, 2)
-
     def _ref_states(self, batch) -> torch.Tensor:
         """每个想象步的参考状态 ``(H+1,B,71)``（critic 输入 / 诊断用）。"""
         motion = self.bundle.motion
@@ -436,22 +392,6 @@ class JointTrainerV3(JointTrainerV2):
             loss_act = float(v3.act_weight) * excess_a.pow(2).mean()
             if float(v3.act_weight) > 0:
                 loss = loss + loss_act
-        # ---- 参考执行动作误差（主目标，2026-10-28）：a_exec(θ) vs 真正下发的动作 ----
-        loss_aref = None
-        aref_rms = None
-        if float(getattr(v3, "lambda_aref", 0.0)) > 0.0:
-            _H = int(rollout.actions.shape[0])
-            a_ref = self._ref_actions(batch.frames, _H).to(rollout.actions.dtype)
-            diff = rollout.actions.float() - a_ref
-            if bool(getattr(v3, "aref_rel", True)):
-                diff = diff / self._aref_lib()[2].to(diff.device)
-            aref_rms = diff.pow(2).mean(-1).sqrt()
-            _eps = float(getattr(v3, "aref_hinge_eps", 0.0))
-            if _eps > 0:
-                loss_aref = float(v3.lambda_aref) * torch.relu(aref_rms / _eps - 1.0).pow(2).mean()
-            else:
-                loss_aref = float(v3.lambda_aref) * diff.pow(2).mean()
-            loss = loss + loss_aref
 
         if loss_hand is not None:
             loss = loss + v3.lambda_hand * loss_hand
@@ -470,9 +410,6 @@ class JointTrainerV3(JointTrainerV2):
 
         if loss_anchor is not None:
             metrics["loss/anchor"] = float(loss_anchor.detach())
-        if loss_aref is not None:
-            metrics["loss/aref"] = float(loss_aref.detach())
-            metrics["aref/rmse"] = float(aref_rms.mean().detach())
         if loss_act is not None:
             metrics["loss/act"] = float(loss_act.detach())
             metrics["act/rmse"] = float(act_rms.mean().detach())
