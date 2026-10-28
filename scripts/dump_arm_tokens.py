@@ -77,13 +77,15 @@ def _load_oracle(clip: str, t_expect: int) -> np.ndarray:
     raise SystemExit(f"[dump] {clip}: 没有 oracle token（先跑 scripts/build_oracle_tokens.py）")
 
 
-def _load_vla(clip: str, t_expect: int, *, vlm_ckpt: Path, head_ckpt: Path, device: str) -> np.ndarray:
+def _load_vla(clip: str, t_expect: int, *, vlm_ckpt: Path,
+              head_ckpt: Path | None, device: str) -> np.ndarray:
     """用录制帧离线跑一次 VLA，得到该 clip 每个录制帧的 64 维 token。"""
     import torch  # noqa: PLC0415
 
     from diff_vla_wbc.action_codec import ActionCodec  # noqa: PLC0415
     from diff_vla_wbc.g1_tasks import (  # noqa: PLC0415
         EgoViewImages, TaskFrameIndex, TaskObservationBuilder, load_gr00t_processor,
+        processed_batch,
     )
     from diff_vla_wbc.gr00t_vlm import Gr00tVLM  # noqa: PLC0415
 
@@ -91,12 +93,9 @@ def _load_vla(clip: str, t_expect: int, *, vlm_ckpt: Path, head_ckpt: Path, devi
     index = TaskFrameIndex(sorted(npz_dir.glob("*.npz")))
     builder = TaskObservationBuilder(index, images=EgoViewImages())
     # 该 clip 在全局帧序里的起点/长度
-    starts = np.asarray(index.file_starts, dtype=np.int64) if hasattr(index, "file_starts") else None
-    if starts is None:
-        raise SystemExit("[dump] TaskFrameIndex 没有 file_starts，先看 g1_tasks.py 的接口")
-    names = [Path(p).stem for p in index.files] if hasattr(index, "files") else None
-    if names is None:
-        raise SystemExit("[dump] TaskFrameIndex 没有 files，先看 g1_tasks.py 的接口")
+    # TaskFrameIndex 的公开属性：files / starts / num_frames（见 diff_vla_wbc/g1_tasks.py）
+    starts = np.asarray(getattr(index, "starts", getattr(index, "_starts", None)), dtype=np.int64)
+    names = [Path(p).stem for p in index.files]
     if clip not in names:
         raise SystemExit(f"[dump] {clip} 不在索引里（{len(names)} 个片段）")
     ci = names.index(clip)
@@ -109,9 +108,15 @@ def _load_vla(clip: str, t_expect: int, *, vlm_ckpt: Path, head_ckpt: Path, devi
         ROOT / "groot_repro/nvidia/Cosmos-Reason2-2B-weights", checkpoint=vlm_ckpt,
         select_layer=16, device=device, action_horizon=40, max_state_dim=132,
         freeze_vlm=True, attn_implementation="sdpa")
-    sd = torch.load(str(head_ckpt), map_location="cpu", weights_only=False)
-    missing, unexpected = vlm.action_head.load_state_dict(sd, strict=False)
-    print(f"[dump] head load: missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+    if head_ckpt is not None:
+        # 覆盖 action head 权重（S3 训练产出的 joint_*.pt）；None = 用底模自带的那份
+        _raw = torch.load(str(head_ckpt), map_location="cpu", weights_only=False)
+        sd = _raw.get("head", _raw.get("model", _raw)) if isinstance(_raw, dict) else _raw
+        missing, unexpected = vlm.action_head.load_state_dict(sd, strict=False)
+        print(f"[dump] head override {head_ckpt.name}: missing={len(missing)} "
+              f"unexpected={len(unexpected)}", flush=True)
+    else:
+        print("[dump] head = 底模自带（未覆盖）", flush=True)
     vlm.action_head.eval()
 
     from diff_vla_wbc.fm_bc import sample_once_with_grad  # noqa: PLC0415
@@ -119,17 +124,22 @@ def _load_vla(clip: str, t_expect: int, *, vlm_ckpt: Path, head_ckpt: Path, devi
     bs = 8
     for lo in range(0, len(frames), bs):
         chunk = frames[lo:lo + bs]
-        obs = builder.build(chunk)
-        proc = processor(obs)
+        proc = processed_batch(processor, builder, chunk)
+        for _k in list(proc.keys()):        # 原地搬设备，保持 BatchFeature/自定义类型
+            if torch.is_tensor(proc[_k]):
+                proc[_k] = proc[_k].to(device)
+        # 注意：不能包 torch.no_grad()——`sample_once_with_grad` 有显式守卫
+        # （"called under torch.no_grad() … the joint training graph would be cut"）。
+        # 这里是纯推理，梯度算完即丢；VLM backbone 是冻结的，显存开销可接受。
+        bb = vlm.backbone(proc)
+        x = sample_once_with_grad(
+            vlm.action_head, bb, proc,
+            initial_noise=torch.randn(len(chunk), vlm.action_head.action_horizon,
+                                      vlm.action_head.action_dim, device=device,
+                                      dtype=vlm.action_head.dtype),
+            num_steps=4, grad_backend="pathwise", truncated_tail=1)
         with torch.no_grad():
-            bb = vlm.backbone(proc)
-            x = sample_once_with_grad(
-                vlm.action_head, bb, proc,
-                initial_noise=torch.randn(len(chunk), vlm.action_head.action_horizon,
-                                          vlm.action_head.action_dim, device=device,
-                                          dtype=vlm.action_head.dtype),
-                num_steps=4, grad_backend="pathwise", truncated_tail=1)
-            raw = codec.decode(x)
+            raw = codec.decode(x.detach())
         tok = raw[..., :64]
         # 每个样本的 action chunk 取第 0 帧（与该录制帧对齐）
         out.append(tok[:, 0].detach().float().cpu().numpy())
@@ -167,8 +177,7 @@ def main() -> int:
             elif arm == "oracle":
                 arr, src = _load_oracle(clip, T), f"oracle_tokens/{clip}.npy"
             else:
-                if a.head_ckpt is None:
-                    raise SystemExit("[dump] --arms 含 vla 时必须给 --head-ckpt")
+                # head_ckpt = None 时用底模自带的 action head（P0-2 的"底模"对照臂）
                 arr, src = _load_vla(clip, T, vlm_ckpt=a.vla_ckpt, head_ckpt=a.head_ckpt,
                                      device=a.device), f"vla:{a.vla_ckpt}+{a.head_ckpt}"
             if arr.shape != (T, 64):
