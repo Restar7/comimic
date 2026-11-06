@@ -26,11 +26,15 @@ NUM_JOINTS = 29
 
 #: 哪些库是"命令流"库（q/qd 来自 encoder 的 command，而不是机器人执行轨迹）
 _CMD_LIB_HINTS = ("ha_cmd",)
+#: 2026-11-02：**执行参考 + 命令 token** 的库（参考 q/root 是执行量，token 仍由命令流算）
+_EXEC_REF_LIB_HINTS = ("ha_cmd_exec",)
 
 
 def library_kind(path: str | Path | None) -> str:
-    """``"command"`` / ``"executed"`` / ``"unknown"`` —— 只按文件名判断，够用且不会说谎。"""
+    """``"command"`` / ``"command_exec"`` / ``"executed"`` / ``"unknown"`` —— 只按文件名判断。"""
     text = str(path or "").lower()
+    if any(h in text for h in _EXEC_REF_LIB_HINTS):
+        return "command_exec"
     if any(h in text for h in _CMD_LIB_HINTS):
         return "command"
     if "ha_tokens" in text or not text:

@@ -41,7 +41,7 @@ def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, 
 
 
 @torch.no_grad()
-def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False) -> list[ClipResult]:
+def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False, tokens: str | Path | None = None) -> list[ClipResult]:
     num_envs = min(num_envs or 1024, len(npz_files))
     args = SuperMimicEnvCfgArgs(
         npz_files=npz_files,
@@ -63,9 +63,17 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         lib = cmd.library
         token_fn = None
         if int(getattr(policy, "token_dim", 0)) > 0:
-            from supermimic.envs.mdp.sonic_tokens import SonicTokenBuilder
+            if tokens is not None:
+                # Recorded dataset tokens (comimic, 2026-10-28): must match how the policy was
+                # trained, otherwise the benchmark measures a different token space.
+                from supermimic.envs.mdp.library_tokens import LibraryTokens
 
-            token_fn = SonicTokenBuilder(lib, device=torch.device(device), num_future=future_frames)
+                token_fn = LibraryTokens(tokens, device=torch.device(device))
+                print(f"[tokens] benchmark uses recorded tokens: {tokens}")
+            else:
+                from supermimic.envs.mdp.sonic_tokens import SonicTokenBuilder
+
+                token_fn = SonicTokenBuilder(lib, device=torch.device(device), num_future=future_frames)
         n_clips = lib.num_clips
         max_r = 0.1  # paper reward upper bound per step (dt * 5)
 

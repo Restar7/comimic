@@ -13,7 +13,9 @@ Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -67,6 +69,122 @@ ROOT_BODY = "pelvis"
 FOOT_GEOM_REGEX = r"^(left|right)_foot[1-7]_collision$"
 
 
+##
+# 43-dof（带手）资产：`SM_G1_ASSET=43dof` 时启用（2026-10-29 A 步）
+#
+# 为什么要它：W1 原来在 mjlab 的 29-dof `unitree_g1` 上训，闭环却在 44 关节（29 身体 + 14 指）
+# 的 `g1_29dof_with_hand.xml` 上跑 —— WBC 从没见过手指连杆的质量/惯量。这里把训练资产换成
+# 同一份 43 关节模型（`scripts/make_g1_43dof_asset.py` 生成，robot-only、无 actuator），
+# 29 个身体执行器沿用 mjlab 的四组 kp/kv，14 个手指执行器 kp=2/kv=0.05（与闭环手部 PD 同值）。
+##
+G1_43DOF_ASSET = os.environ.get("SM_G1_ASSET", "").strip()
+_G1_43DOF_XML_DEFAULT = (
+    "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/SONIC_DATA/deployment/"
+    "gear_sonic/data/robot_model/model_data/g1/g1_43dof_noact.xml"
+)
+# 注意用 `or`：launcher 会导出 SM_G1_XML="" （空串），`os.environ.get(..., default)` 会当成已设置，
+# 于是 MjSpec.from_file("") 报 `could not find decoder for resource ''`（2026-10-29 实测）。
+G1_43DOF_XML = os.environ.get("SM_G1_XML") or _G1_43DOF_XML_DEFAULT
+# 动作项只覆盖 29 个身体执行器 ⇒ 手指每步 ctrl 保持 0（kp=2 的位置伺服把它定在零位）。
+# 手不进观测、不进动作，但**质量和惯量进动力学** —— 这正是要补的那块。
+BODY_ACTUATOR_REGEX = r"^(?!.*_hand_).*"
+# 观测/奖励/库参考都只认这 29 个身体关节（手不进任何 policy 输入）
+BODY_JOINT_REGEX = r"^(?!.*_hand_).*"
+
+
+def get_g1_43dof_robot_cfg():
+    """带手 43 关节的 G1（训练侧；actuator 由 mjlab 现场建，xml 里没有 actuator）。"""
+    import mujoco
+    from mjlab.actuator import BuiltinPositionActuatorCfg
+    from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+        ACTUATOR_4010,
+        ACTUATOR_5020,
+        ACTUATOR_7520_14,
+        ACTUATOR_7520_22,
+        DAMPING_4010,
+        DAMPING_5020,
+        DAMPING_7520_14,
+        DAMPING_7520_22,
+        FULL_COLLISION,
+        KNEES_BENT_KEYFRAME,
+        STIFFNESS_4010,
+        STIFFNESS_5020,
+        STIFFNESS_7520_14,
+        STIFFNESS_7520_22,
+    )
+    from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+
+    def _pos(names, kp, kd, effort):
+        return BuiltinPositionActuatorCfg(
+            target_names_expr=names, stiffness=kp, damping=kd, effort_limit=effort
+        )
+
+    actuators = (
+        _pos((".*_elbow_joint", ".*_shoulder_pitch_joint", ".*_shoulder_roll_joint",
+              ".*_shoulder_yaw_joint", ".*_wrist_roll_joint"),
+             STIFFNESS_5020, DAMPING_5020, ACTUATOR_5020.effort_limit),
+        _pos((".*_hip_pitch_joint", ".*_hip_yaw_joint", "waist_yaw_joint"),
+             STIFFNESS_7520_14, DAMPING_7520_14, ACTUATOR_7520_14.effort_limit),
+        _pos((".*_hip_roll_joint", ".*_knee_joint"),
+             STIFFNESS_7520_22, DAMPING_7520_22, ACTUATOR_7520_22.effort_limit),
+        _pos((".*_wrist_pitch_joint", ".*_wrist_yaw_joint"),
+             STIFFNESS_4010, DAMPING_4010, ACTUATOR_4010.effort_limit),
+        # 腰 pitch/roll 与双踝是四连杆 ⇒ 两枚 5020 之和
+        _pos(("waist_pitch_joint", "waist_roll_joint",
+              ".*_ankle_pitch_joint", ".*_ankle_roll_joint"),
+             STIFFNESS_5020 * 2, DAMPING_5020 * 2, ACTUATOR_5020.effort_limit * 2),
+        # 14 根手指（与闭环手部 PD 完全同值）
+        _pos((r".*_hand_.*",), 2.0, 0.05, 2.4),
+    )
+    return EntityCfg(
+        init_state=KNEES_BENT_KEYFRAME,
+        collisions=(FULL_COLLISION,),
+        spec_fn=lambda: mujoco.MjSpec.from_file(G1_43DOF_XML),
+        articulation=EntityArticulationInfoCfg(
+            actuators=actuators, soft_joint_pos_limit_factor=0.9
+        ),
+    )
+
+
+##
+# 场景物体（B 方案）：把 SONIC 场景里的桌子/罐子/抽屉搬进 mjlab
+#
+# 为什么：WM 只在"平地、无物体"的数据上训过 ⇒ 学不到"接触让速度变小"，部署分布上
+# `qd_ratio` 高估 26%（见 docs/HANDOVER_TO_ISAACLAB_*§7.3）。有了物体，采集数据就包含接触。
+#
+# 资产由 `scripts/extract_scene_objects.py` 从原始场景 xml 里拆出（复用同一份 MJCF/几何/摩擦），
+# 放在 assets/scene_objs/<task>/ 下：
+#   static.xml            桌面/托盘等静态物件（无 joint）
+#   <obj>.xml             自由体（罐子/香蕉…）带 freejoint
+#   drawer.xml            抽屉（slide joint，1-dof articulation）
+##
+SCENE_OBJ_DIR = Path(__file__).resolve().parents[5] / "assets/scene_objs"
+SM_SCENE_TASK = os.environ.get("SM_SCENE_TASK", "").strip()   # "", task1..task4
+
+
+def _obj_entity(path: Path, *, z: float = 0.0):
+    """把一个物体 MJCF 包成 mjlab 的 EntityCfg（无 actuator，纯物理体）。"""
+    import mujoco
+    from mjlab.entity import EntityCfg
+
+    return EntityCfg(
+        init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, z)),
+        spec_fn=lambda p=path: mujoco.MjSpec.from_file(str(p)),
+        articulation=None,   # 物体不需要 actuator；free/slide 由 xml 自带
+    )
+
+
+def get_scene_object_entities(task: str) -> dict:
+    """``task1..4`` → {name: EntityCfg}（不含 robot）。没拆过就返回空。"""
+    d = SCENE_OBJ_DIR / task
+    if not d.is_dir():
+        return {}
+    out = {}
+    for f in sorted(d.glob("*.xml")):
+        out[f.stem] = _obj_entity(f)
+    return out
+
+
 @dataclass
 class SuperMimicEnvCfgArgs:
     npz_files: list[str]
@@ -78,7 +196,9 @@ class SuperMimicEnvCfgArgs:
     obs_noise: bool = True
     reset_noise: bool = True
     domain_randomization: bool = True
-    sampling_mode: str = "return"  # return | uniform | start
+    sampling_mode: str = "return"  # return | uniform | start | speed（按 clip 速度加权）
+    speed_weight_max: float = 2.5   # speed 模式：走路 clip 的最大权重
+    speed_threshold: float = 0.10   # speed 模式：超过该 clip 平均速度(m/s)才开始加权
     replay_capacity: int = 1000
     record_transitions: bool = True
     seed: int | None = 0
@@ -93,11 +213,24 @@ class SuperMimicEnvCfgArgs:
 
 
 def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
+    # 43dof 分支：所有"关节"类观测/奖励必须显式限定到 29 个身体关节，
+    # 否则 43 个关节会混进来（2026-10-29 实测：obs 会变宽、`ref(29) - default(43)` 直接炸）。
+    _body_cfg = (SceneEntityCfg("robot", joint_names=(BODY_JOINT_REGEX,))
+                 if G1_43DOF_ASSET == "43dof" else None)
+
     # ---------------------------------------------------------------- observations
     noise = (lambda lo, hi: Unoise(n_min=lo, n_max=hi)) if a.obs_noise else (lambda lo, hi: None)
     policy_terms = {
-        "joint_pos": ObservationTermCfg(func=base_mdp.joint_pos_rel, params={"biased": True}, noise=noise(-0.01, 0.01)),
-        "joint_vel": ObservationTermCfg(func=base_mdp.joint_vel_rel, noise=noise(-0.5, 0.5)),
+        "joint_pos": ObservationTermCfg(
+            func=base_mdp.joint_pos_rel,
+            params={"biased": True, **({"asset_cfg": _body_cfg} if _body_cfg else {})},
+            noise=noise(-0.01, 0.01),
+        ),
+        "joint_vel": ObservationTermCfg(
+            func=base_mdp.joint_vel_rel,
+            params=({"asset_cfg": _body_cfg} if _body_cfg else {}),
+            noise=noise(-0.5, 0.5),
+        ),
         "base_ang_vel": ObservationTermCfg(func=base_mdp.base_ang_vel, noise=noise(-0.2, 0.2)),
         "projected_gravity": ObservationTermCfg(func=base_mdp.projected_gravity, noise=noise(-0.05, 0.05)),
         "actions": ObservationTermCfg(func=base_mdp.last_action),
@@ -131,7 +264,8 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
     actions = {
         "joint_pos": NoisyJointPositionActionCfg(
             entity_name="robot",
-            actuator_names=(".*",),
+            actuator_names=((BODY_ACTUATOR_REGEX,)
+                            if G1_43DOF_ASSET == "43dof" else (".*",)),
             scale=G1_ACTION_SCALE,
             use_default_offset=True,
             noise_std=a.action_noise_std,
@@ -154,6 +288,8 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             velocity_range=vel_range if a.reset_noise else {},
             joint_position_range=(-0.1, 0.1) if a.reset_noise else (0.0, 0.0),
             sampling_mode=a.sampling_mode,  # type: ignore[arg-type]
+            speed_weight_max=a.speed_weight_max,
+            speed_threshold=a.speed_threshold,
             compact_library=a.compact_library,
             debug_vis=a.debug_vis,
             **a.extra_command_kwargs,
@@ -209,7 +345,11 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         "motion_body_lin_vel": RewardTermCfg(func=track_mdp.motion_global_body_linear_velocity_error_exp, weight=1.0, params={"command_name": "motion", "std": 1.0}),
         "motion_body_ang_vel": RewardTermCfg(func=track_mdp.motion_global_body_angular_velocity_error_exp, weight=1.0, params={"command_name": "motion", "std": 3.14}),
         "action_rate_l2": RewardTermCfg(func=base_mdp.action_rate_l2, weight=-0.1),
-        "joint_limit": RewardTermCfg(func=base_mdp.joint_pos_limits, weight=a.joint_limit_weight, params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))}),
+        "joint_limit": RewardTermCfg(
+            func=base_mdp.joint_pos_limits,
+            weight=a.joint_limit_weight,
+            params={"asset_cfg": _body_cfg or SceneEntityCfg("robot", joint_names=(".*",))},
+        ),
     }
 
     # ---------------------------------------------------------------- terminations
@@ -225,7 +365,8 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         recorders["replay"] = ReplayRecorderCfg(params={"capacity": a.replay_capacity, "foot_geom_regex": FOOT_GEOM_REGEX, "com_body_name": "torso_link"})
 
     cfg = ManagerBasedRlEnvCfg(
-        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": get_g1_robot_cfg()}),
+        scene=SceneCfg(terrain=TerrainEntityCfg(terrain_type="plane"), num_envs=a.num_envs, entities={"robot": (get_g1_43dof_robot_cfg() if G1_43DOF_ASSET == "43dof" else get_g1_robot_cfg()),
+                  **get_scene_object_entities(SM_SCENE_TASK)}),
         observations=observations,
         actions=actions,
         commands=commands,

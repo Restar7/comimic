@@ -13,13 +13,26 @@ import torch
 from supermimic.world_model.heads import ReferenceFrame, analytic_observation
 from supermimic.world_model.world_model import WorldModel
 
+# 必须是 ``tracking_reward_terms`` 返回的 key 全集（顺序无所谓，但**不能缺**）。
+# 2026-10-30 事故：奖励把 `motion_global_root_ori` 拆成 tilt/yaw/yaw_rate 并加了 4 个 hinge，
+# 这份写死的名单没跟着改 ⇒ 重新训 WBC 时 `terms[k]` 直接 KeyError，训练一启动就崩。
+# 以后改奖励项**必须**同步这个常量（已在 build 时校验名字集合，见 _self_check）。
 REWARD_TERM_NAMES = (
     "motion_global_root_pos",
     "motion_global_root_ori",
+    "motion_root_tilt",
+    "motion_root_yaw",
+    "motion_root_yaw_rate",
     "motion_body_pos",
     "motion_body_ori",
     "motion_body_lin_vel",
     "motion_body_ang_vel",
+    "motion_root_pos_tail",
+    "motion_root_ori_tail",
+    "motion_body_pos_tail_legs",
+    "motion_body_pos_tail_arms",
+    "motion_tilt_pen",
+    "motion_height_pen",
     "action_rate_l2",
     "joint_limit",
 )

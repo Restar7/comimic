@@ -76,10 +76,20 @@ class Gr00tVlaPolicy:
     """Real GR00T VLA: RGB + vla_state + instruction → ``(horizon, token_dim)`` motion tokens."""
 
     def __init__(self, ckpt: str, vlm_path: str | None, device: str, horizon: int = 40,
-                 token_dim: int = 64, num_steps: int = 2):
+                 token_dim: int = 64, num_steps: int = 2, token_quant: str = "none"):
         import torch  # noqa: PLC0415
 
         from diff_vla_wbc.gr00t_vlm import Gr00tVLM  # noqa: PLC0415
+        from diff_vla_wbc.quant import check_meta_mode, resolve_deploy_mode  # noqa: PLC0415
+
+        # 2026-11-04：训练/部署的 token 量化口径必须一致（见 docs/TOKEN_QUANT_STE_20261104.md）
+        self.token_quant = resolve_deploy_mode(token_quant)
+        self._train_token_quant = check_meta_mode(ckpt, self.token_quant,
+                                                 log=lambda m: print(m, flush=True))
+        self.quant_n = 0
+        self.quant_dist = float("nan")
+        print(f"[server] token_quant={self.token_quant} "
+              f"train_token_quant={self._train_token_quant}", flush=True)
 
         self.torch = torch
         self.device = torch.device(device)
@@ -121,7 +131,16 @@ class Gr00tVlaPolicy:
         with torch.enable_grad():
             tokens = sample_model_with_grad(self.vlm, inputs, initial_noise=noise,
                                             num_steps=self.num_steps)
-        return tokens.detach()[0, :, : self.token_dim].float().cpu().numpy()
+        chunk = tokens.detach()[0, :, : self.token_dim].float().cpu().numpy()
+        if self.token_quant != "none":
+            from diff_vla_wbc.quant import quantize_np  # noqa: PLC0415
+            # 量化前的偏离度 = 训练侧 STE 偏差在部署侧的镜像（半格 = 0.03125）
+            chunk, self.quant_dist = quantize_np(chunk, self.token_quant)
+            self.quant_n += 1
+            if self.quant_n % 20 == 1:
+                print(f"[token-quant] {self.token_quant} req#{self.quant_n} "
+                      f"pre_dist={self.quant_dist:.5f}", flush=True)
+        return chunk
 
 
 # --------------------------------------------------------------------------- HTTP server
@@ -186,7 +205,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.rstrip("/").endswith("/health"):
-            self._send(200, {"ok": True, **self.stats})
+            _p = getattr(type(self), "policy", None)   # serve() 把 policy 挂在类上
+            self._send(200, {"ok": True, **self.stats,
+                             # 采/评测侧必须看到同一个量化口径
+                             "token_quant": str(getattr(_p, "token_quant", "none")),
+                             "token_quant_pre_dist": (None if not np.isfinite(
+                                 float(getattr(_p, "quant_dist", float("nan"))))
+                                 else round(float(_p.quant_dist), 6))})
         else:
             self._send(404, {"error": "use POST /infer, POST /reset, GET /health"})
 
@@ -234,6 +259,12 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=40, help="VLA token horizon (HA expects 40)")
     ap.add_argument("--token-dim", type=int, default=64)
     ap.add_argument("--num-steps", type=int, default=2, help="FM Euler steps")
+    # 2026-11-04：与 ha_vla_latent64_server 同口径。默认读环境变量，launcher 不用逐个改。
+    ap.add_argument("--token-quant", default=os.environ.get("TOKEN_QUANT", "none"),
+                    choices=["none", "ste", "hard"],
+                    help="部署侧 token 量化（见 diff_vla_wbc/quant.py）；推理无梯度，ste≡hard。"
+                         "由 vla_meta.json 的 token_quant 校验，放行开关 "
+                         "ALLOW_TOKEN_QUANT_MISMATCH=1")
     ap.add_argument("--dry-run", action="store_true", help="no model, synthetic chunk (protocol only)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -250,7 +281,7 @@ def main() -> None:
             raise SystemExit("--ckpt is required (or use --dry-run / --self-test)")
         policy = Gr00tVlaPolicy(str(args.ckpt), str(args.vlm_path) if args.vlm_path else None,
                                 args.device, horizon=args.horizon, token_dim=args.token_dim,
-                                num_steps=args.num_steps)
+                                num_steps=args.num_steps, token_quant=args.token_quant)
         print(f"[server] GR00T VLA loaded from {args.ckpt} on {args.device}", flush=True)
 
     httpd = serve(policy, args.host, args.port)

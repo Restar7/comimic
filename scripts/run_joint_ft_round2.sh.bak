@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# 联合微调第 2 轮：修掉 act hinge 的量级问题（H=20 的轨迹差 eps 不能按单步 0.10）
+set -uo pipefail
+C=/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic
+DIR=${DIR:-$C/runs/a_prime_seg20}
+cd "$C" || exit 1
+export V3=1 H=20
+export REWARD_DELTA_POS=${REWARD_DELTA_POS:-0.10}
+export CRITIC_ON=1 CRITIC_REAL="$DIR/critic_real.pt"
+export EXTRA="${EXTRA:---real-transitions $DIR/filtered.pt}"
+export ACT_EPS=${ACT_EPS:-0.40}     # H=20 轨迹差的合理量级（原 0.10 → 100% 出界）
+export ACT_WEIGHT=${ACT_WEIGHT:-0.30}
+export DDP=1 NPROC=${NPROC:-4} DDP_GPUS=${DDP_GPUS:-0,1,2,3}
+export RUN=${RUN:-joint_v3_round2} STEPS=${STEPS:-300}
+export EVAL_EVERY=${EVAL_EVERY:-100} SAVE_EVERY=${SAVE_EVERY:-100}
+echo "[joint-r2] ACT_EPS=$ACT_EPS ACT_WEIGHT=$ACT_WEIGHT RUN=$RUN STEPS=$STEPS"
+exec bash scripts/launch_joint_ha_v2.sh

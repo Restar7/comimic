@@ -14,6 +14,7 @@ from supermimic.config import TrainConfig
 from supermimic.data.motion_convert import load_g1_model
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
+from supermimic.envs.mdp.rewards import official_tracking_reward_cfg
 from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES
 from supermimic.imagination.policy_trainer import PolicyTrainer
 from supermimic.kinematics.g1_fk import G1Kinematics
@@ -79,7 +80,19 @@ class Trainer:
         robot = env.scene["robot"]
 
         fk = G1Kinematics(load_g1_model(), device=self.device)
-        heads = AnalyticHeads(fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
+        # 43dof（带手）资产：soft limits / default 都是 43 维，而 WM 的 state 是 71 维（只含 29 身体关节）
+        # ⇒ 这里按 `_hand_` 过滤，否则 reward 里 `joint_pos(29) - lo(43)` 会 broadcast 失败（2026-10-29 实测）。
+        _lim = robot.data.soft_joint_pos_limits[0].clone()
+        _def = robot.data.default_joint_pos[0].clone()
+        if _lim.shape[0] != 29:
+            _m = torch.tensor(["_hand_" not in n for n in robot.joint_names], dtype=torch.bool, device=_lim.device)
+            _lim, _def = _lim[_m], _def[_m]
+        # 2026-10-30：WBC 训练走**官方口径**的奖励（与联合微调那份分开）。
+        # `official_tracking_reward_cfg()` = GEAR-SONIC tracking/base.yaml：
+        # anchor_pos 0.5/σ0.30 + anchor_ori 0.5/σ0.40（单一四元数）+ 四肢 1.0/1.0/1.0/1.0
+        # + action_rate −0.1 + joint_limit −10.0，无铰链、无 tilt/yaw 拆分。
+        heads = AnalyticHeads(fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, _lim, _def,
+                              reward_cfg=official_tracking_reward_cfg())
         self.wm = WorldModel(cfg.world_model, heads, self.device)
         self.policy = Policy(cfg.policy).to(self.device)
         self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)
@@ -89,11 +102,20 @@ class Trainer:
         token_fn = None
         self.token_builder = None
         if int(getattr(cfg.policy, "token_dim", 0)) > 0:
-            from supermimic.envs.mdp.sonic_tokens import SonicTokenBuilder
+            if getattr(cfg.data, "tokens", None) is not None:
+                # Recorded dataset tokens (comimic, 2026-10-28): exact deployment space, no
+                # online re-derivation. Same call signature as SonicTokenBuilder.
+                from supermimic.envs.mdp.library_tokens import LibraryTokens
 
-            self.token_builder = SonicTokenBuilder(self.lib, device=self.device, num_future=cfg.env.future_frames)
-            token_fn = self.token_builder
-            print(f"[sonic] token conditioning enabled (dim={cfg.policy.token_dim})")
+                self.token_builder = LibraryTokens(cfg.data.tokens, device=self.device)
+                token_fn = self.token_builder
+                print(self.token_builder.audit())
+            else:
+                from supermimic.envs.mdp.sonic_tokens import SonicTokenBuilder
+
+                self.token_builder = SonicTokenBuilder(self.lib, device=self.device, num_future=cfg.env.future_frames)
+                token_fn = self.token_builder
+                print(f"[sonic] token conditioning enabled (dim={cfg.policy.token_dim})")
         self.policy_trainer = PolicyTrainer(
             self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer, token_fn=token_fn
         )
@@ -196,7 +218,9 @@ class Trainer:
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
-                    lr = cosine_lr(self.iteration, sch.total_iterations, cfg.wm_trainer.lr, sch.lr_final_ratio, sch.lr_decay_fraction)
+                    lr = cosine_lr(self.iteration,
+                                   sch.lr_total_iterations or sch.total_iterations,
+                                   cfg.wm_trainer.lr, sch.lr_final_ratio, sch.lr_decay_fraction)
                     self.wm_trainer.set_lr(lr)
                     self.policy_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
                     t0 = time.perf_counter()

@@ -338,6 +338,14 @@ class Gr00tVLM(nn.Module):
         source, origin = resolve_vlm_source(model_name)
         config = Gr00tN1d7Config.from_pretrained(str(checkpoint), local_files_only=True)
         config.model_name = source
+        # 2026-11-03: ckpt 里 use_flash_attention=True 且 VLM 以 fp32 载入 -> 前向抛
+        # "FlashAttention only support fp16 and bf16 data type"。关掉它走 sdpa。
+        try:
+            if getattr(config, "use_flash_attention", False):
+                config.use_flash_attention = False
+                print("[gr00t_vlm] use_flash_attention -> False (sdpa)")
+        except Exception:  # noqa: BLE001
+            pass
         if freeze_vlm:
             config.tune_llm = False
             config.tune_visual = False
@@ -349,6 +357,7 @@ class Gr00tVLM(nn.Module):
                 "trust_remote_code": True,
             },
         )
+
         if freeze_vlm:
             model.backbone.requires_grad_(False)
             model.backbone.eval()

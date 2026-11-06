@@ -432,7 +432,15 @@ class JointTrainer:
 
         ck = torch.load(path, map_location=assets.device, weights_only=False)
         if "policy_config" not in ck or "world_model_config" not in ck:
-            raise ValueError("checkpoint lacks policy/world-model config; pass --supermimic-ckpt instead")
+            # B1 布局（`sm-train` 产物）：config = {"policy": ..., "world_model": {...state_spec...}}
+            cfg = ck.get("config") or {}
+            if isinstance(cfg, dict) and "policy" in cfg and "world_model" in cfg:
+                ck["policy_config"] = cfg["policy"]
+                ck["world_model_config"] = cfg["world_model"]
+            else:
+                raise ValueError(
+                    "checkpoint lacks policy/world-model config; pass --supermimic-ckpt instead"
+                )
         policy_cfg = _coerce_cfg(PolicyCfg, ck["policy_config"])
         wm_cfg = _coerce_cfg(WorldModelCfg, ck["world_model_config"])
         bundle = SuperMimicBundle.from_configs(assets, policy_cfg, wm_cfg)

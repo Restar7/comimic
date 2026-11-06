@@ -46,11 +46,23 @@ def frame_aligned(states: torch.Tensor, actions: torch.Tensor, frames: torch.Ten
     """转移行 → 帧对齐（每个 clip 末帧没有后继转移，用同 clip 上一帧顶替）。"""
     m = torch.full((n_frames,), -1, dtype=torch.long)
     m[frames.long()] = torch.arange(frames.numel())
-    miss = (m < 0).nonzero(as_tuple=False).flatten()
-    if miss.numel():
-        m[miss] = m[(miss - 1).clamp(min=0)]
     if int((m < 0).sum()):
-        raise SystemExit(f"[fail] {int((m < 0).sum())} 帧无法对齐")
+        # ★ 2026-11-03：原来只做**一步**前向填充，遇到"连续缺失"（本 checkout 没有
+        #   GrapCup 那 99 条 clip ⇒ 100–198 是一整块空洞）就填不上，直接报
+        #   "N 帧无法对齐"。改成真正的**前向填充**（nearest valid ≤ i，前导段用首个有效帧）。
+        valid = m >= 0
+        if not bool(valid.any()):
+            raise SystemExit("[fail] 转移里没有任何有效帧")
+        idx = torch.arange(n_frames, dtype=torch.long)
+        last_valid = torch.where(valid, idx, torch.full_like(idx, -1)).cummax(0).values
+        first_valid = int(valid.nonzero(as_tuple=False)[0].item())
+        src = torch.where(last_valid >= 0, last_valid, torch.full_like(last_valid, first_valid))
+        m = m[src]
+        filled = int((m < 0).sum())
+        if filled:
+            raise SystemExit(f"[fail] {filled} 帧无法对齐")
+        print(f"[rr] 前向填充了 {int(n_frames - int(valid.sum()))} 帧"
+              f"（其中前导 {first_valid} 帧用首个有效帧顶替）", flush=True)
     return states[m], actions[m]
 
 
@@ -61,7 +73,17 @@ def main() -> int:
     ap.add_argument("--motion-packed", type=Path, default=ROOT / "runs/isaac_motion/ha_cmd/packed.pt")
     ap.add_argument("--out", type=Path, default=ROOT / "runs/wm_real/real_returns.pt")
     ap.add_argument("--gamma", type=float, default=0.99)
-    ap.add_argument("--reward-mode", default="saturating", choices=("saturating", "linear"))
+    ap.add_argument("--reward-mode", default="saturating",
+                    choices=("saturating", "linear", "huber", "huber_err"),
+                    help="必须与训练**逐项一致**（2026-11-04 起检查写进 meta）")
+    ap.add_argument("--reward-d-max", type=float, default=0.30,
+                    help="huber_err 死区（与训练同口径；0=关闭）")
+    ap.add_argument("--reward-delta-pos", type=float, default=0.05,
+                    help="huber_err 的位置 δ（米）；只对 --reward-mode huber_err 生效")
+    ap.add_argument("--reward-delta-ori", type=float, default=0.05,
+                    help="huber_err 的朝向 δ（弧度）")
+    ap.add_argument("--root-ori-mode", default="split",
+                    choices=("mono", "split", "split_huber"))
     ap.add_argument("--reward-vel-scale", type=float, default=1.0)
     ap.add_argument("--posture-weight", type=float, default=0.0)
     ap.add_argument("--chunk", type=int, default=8192)
@@ -80,12 +102,18 @@ def main() -> int:
     bundle.reward_mode = str(a.reward_mode)
     bundle.reward_vel_scale = float(a.reward_vel_scale)
     bundle.posture_weight = float(a.posture_weight)
+    # 2026-11-04：huber_err 口径必须一并设，否则 bundle.reward 会走别的分支
+    bundle.huber_err_d_max = float(getattr(a, "reward_d_max", 0.0) or 0.0)
+    bundle.huber_err_delta_pos = float(a.reward_delta_pos)
+    bundle.huber_err_delta_ori = float(a.reward_delta_ori)
+    bundle.root_ori_mode = str(a.root_ori_mode)
     lib = bundle.library
     n_frames = int(lib.num_frames)
     starts = lib.clip_start.detach().cpu().long()
     lengths = lib.clip_len.detach().cpu().long()
     print(f"[rr] library 帧数={n_frames} clip 数={len(lengths)} "
-          f"mode={a.reward_mode} vel_scale={a.reward_vel_scale} posture={a.posture_weight}", flush=True)
+          f"mode={a.reward_mode} vel_scale={a.reward_vel_scale} posture={a.posture_weight} "
+          f"δ_pos={a.reward_delta_pos} δ_ori={a.reward_delta_ori} ori={a.root_ori_mode}", flush=True)
 
     d = torch.load(str(a.transitions), map_location="cpu", weights_only=False)
     S, A = frame_aligned(d["states"], d["actions"], d["frames"], n_frames)
@@ -143,6 +171,10 @@ def main() -> int:
         "meta": {
             "gamma": a.gamma, "reward_mode": a.reward_mode,
             "reward_vel_scale": a.reward_vel_scale, "posture_weight": a.posture_weight,
+            # 2026-11-04：训练侧据此**逐项比对**，口径不符直接退出（见 train_joint_v2）
+            "reward_delta_pos": a.reward_delta_pos,
+            "reward_delta_ori": a.reward_delta_ori,
+            "root_ori_mode": a.root_ori_mode,
             "transitions": str(a.transitions), "wbc_ckpt": str(a.wbc_ckpt),
             "note": "ret[f] = Σ_{t>=f} γ^(t−f) r_t 沿**真录制轨迹**（奖励只依赖真状态，不经 WM）",
         },

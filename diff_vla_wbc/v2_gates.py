@@ -123,7 +123,7 @@ def gate_burnin(trainer, provider, ref_provider, *, n_batches: int = 4) -> dict:
         acc["start_err"].append(
             float((b_burn.start_state[:, :3] - b_ref.start_state[:, :3]).norm(dim=-1).mean())
         )
-        if b_burn.burnin.burnin_reward is not None:
+        if getattr(b_burn, "burnin", None) is not None and b_burn.burnin.burnin_reward is not None:
             acc["burnin_reward"].append(float(b_burn.burnin.burnin_reward.mean()))
     mean = {k: float(np.mean(v)) if v else 0.0 for k, v in acc.items()}
     reward_drop = mean["ref_reward"] - mean["burn_reward"]
@@ -284,23 +284,57 @@ def run_gates(
     *,
     n_batches: int = 4,
     log: Callable = print,
+    only: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    """跑门禁。``only`` 只跑其中几道（用于**一道门一个进程**）。
+
+    2026-10-28 实测（4090，46 GB）：freeze 门做完一次完整反传后 PyTorch 仍占 45 GB，
+    下一道 burn-in 直接 OOM —— 即使中间做了 gc + empty_cache（图和显存都被别处引用着）。
+    因此本仓的 launcher 改成**每道门单独起一个进程**；这里保留``only`` 以便筛选。
+    """
     t0 = time.time()
     gates: dict[str, Any] = {}
-    gates["A_codec"] = gate_codec(codec, processor)
-    batch = provider.sample()
-    batch.model_inputs = _processed_batch_for(batch, args, processor)
-    gates["B_freeze"] = gate_freeze(bundle, args.wbc_ckpt, trainer, batch, log=log)
-    gates["C_burnin"] = gate_burnin(trainer, provider, ref_provider, n_batches=n_batches)
-    gates["C2_token_contrast"] = gate_token_contrast(trainer, provider, n_batches=n_batches)
-    batch2 = provider.sample()
-    batch2.model_inputs = _processed_batch_for(batch2, args, processor)
-    gates["D_fm_bc"] = gate_fm_bc(trainer, batch2, log=log)
+
+    def _want(name: str) -> bool:
+        return only is None or name in only
+
+    def _free() -> None:
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if _want("A_codec"):
+        gates["A_codec"] = gate_codec(codec, processor)
+        _free()
+
+    if _want("B_freeze"):
+        batch = provider.sample()
+        batch.model_inputs = _processed_batch_for(batch, args, processor)
+        gates["B_freeze"] = gate_freeze(bundle, args.wbc_ckpt, trainer, batch, log=log)
+        _free()
+
+    if _want("C_burnin"):
+        gates["C_burnin"] = gate_burnin(trainer, provider, ref_provider, n_batches=n_batches)
+        _free()
+
+    if _want("C2_token_contrast"):
+        gates["C2_token_contrast"] = gate_token_contrast(trainer, provider, n_batches=n_batches)
+        _free()
+
+    if _want("D_fm_bc"):
+        batch2 = provider.sample()
+        batch2.model_inputs = _processed_batch_for(batch2, args, processor)
+        gates["D_fm_bc"] = gate_fm_bc(trainer, batch2, log=log)
+        _free()
+
     gates["_meta"] = {
         "wbc_ckpt": str(args.wbc_ckpt), "vlm_ckpt": str(args.vlm_ckpt),
         "H": int(trainer.cfg.horizon), "fm_steps": int(trainer.cfg.fm_steps),
         "lambda_r": float(trainer.cfg.lambda_r), "lambda_bc": float(trainer.cfg.lambda_bc),
         "grad_accum": int(trainer.cfg.grad_accum), "backend": trainer.cfg.grad_backend,
+        "only": (list(only) if only is not None else None),
         "wall_s": time.time() - t0,
     }
     out_path = Path(out_path)

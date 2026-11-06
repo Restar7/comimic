@@ -75,7 +75,9 @@ ROBOT_TYPE = "unitree_g1_refpose_v3_1"
 ROBOT_USD_DIR = "assets/robots/g1-29dof-dex3-base-fix-usd"
 SONIC_RELEASE = ROOT / "../GR00T-WholeBodyControl/gear_sonic_deploy/policy/release"
 DEFAULT_VLA = ROOT / "runs/groot_sonic_vla_ha_b64_lr1e-5/checkpoint-8000"
-DEFAULT_WBC = ROOT / "trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint.pt"
+# 2026-11-03：原路径 trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint.pt
+# 已不存在（契约校验必然失败）。改为与 ha_isaac_closedloop.sh 的 SM_CKPT 默认值一致。
+DEFAULT_WBC = ROOT / "runs/S1_handover/WBC_A24000_wmvel_cmd.pt"
 PROTOCOL = {"seeds": list(range(10)), "repeats_per_seed": 1, "max_steps": 300, "video_fps": 30,
             "headless": True, "episode_seed": "seed 直通（seed i -> episode_seed i）"}
 

@@ -177,13 +177,18 @@ def state64(q: np.ndarray, dq: np.ndarray, quat: np.ndarray) -> np.ndarray:
 
 
 def post_infer(url: str, rgb: np.ndarray, state: np.ndarray, prompt: str,
-               timeout: float = 180.0) -> tuple[np.ndarray, np.ndarray, float]:
+               timeout: float = 180.0,
+               state_extra6: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, float]:
+    _obs = {
+        "images": {"front": {"shape": list(rgb.shape), "dtype": "uint8",
+                             "data_b64": base64.b64encode(np.ascontiguousarray(rgb).tobytes()).decode()}},
+        "state": state.tolist(),
+    }
+    if state_extra6 is not None:
+        # e1：模型是 52 维口径时必须带这 6 个数，否则 server 侧会拒绝（不能用 0 顶替）
+        _obs["state_extra6"] = np.asarray(state_extra6, np.float32).reshape(-1).tolist()
     body = json.dumps({
-        "observation": {
-            "images": {"front": {"shape": list(rgb.shape), "dtype": "uint8",
-                                 "data_b64": base64.b64encode(np.ascontiguousarray(rgb).tobytes()).decode()}},
-            "state": state.tolist(),
-        },
+        "observation": _obs,
         "robot_type": "unitree_g1_refpose_v3_1",
         "return_chunk": True,
         "task": prompt,
@@ -198,6 +203,29 @@ def post_infer(url: str, rgb: np.ndarray, state: np.ndarray, prompt: str,
     hands = np.asarray(payload.get("hands14_chunk", np.zeros((len(chunk), 14), np.float32)),
                        dtype=np.float32)
     return chunk, hands, dt
+
+
+def vel6_body(qvel6: np.ndarray, quat: np.ndarray) -> np.ndarray:
+    """体坐标 [Rᵀv, Rᵀw]（与 ``diff_vla_wbc.state_extra.vel6_body`` **同一公式**）。
+
+    MuJoCo 自由关节的 ``qvel[0:3]``/``qvel[3:6]`` 是**世界系**线/角速度；dump 里 71 维状态的
+    ``v``/``w`` 同样是世界系（见 ``isaac_joint.flat_state_tuple`` 与 WM 积分 ``v1 = v + R dv``），
+    所以两边都做同一个 ``Rᵀ`` 变换，口径不会漂。
+    """
+    w, x, y, z = quat
+    r = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+    v_w = np.asarray(qvel6[0:3], np.float64)
+    w_w = np.asarray(qvel6[3:6], np.float64)
+    return np.concatenate([r.T @ v_w, r.T @ w_w]).astype(np.float32)
+
+
+def yaw_of(quat: np.ndarray) -> float:
+    w, x, y, z = quat
+    return float(np.arctan2(2 * (x * y + z * w), 1 - 2 * (y * y + z * z)))
 
 
 def gravity_body(quat: np.ndarray) -> np.ndarray:
@@ -217,6 +245,9 @@ def main() -> int:
     ap.add_argument("--vla-ckpt", type=Path, default=DEFAULT_VLA, help="(provenance only)")
     ap.add_argument("--wbc-ckpt", type=Path, default=DEFAULT_WBC)
     ap.add_argument("--packed-motion", type=Path, default=DEFAULT_PACKED)
+    ap.add_argument("--expect-state-extra", default="",
+                    choices=("", "none", "vel6"),
+                    help="e1：期望 server 的口径；与 / 返回不一致就中止（防空喂）")
     ap.add_argument("--server-url", default="http://127.0.0.1:18090")
     ap.add_argument("--scene", type=Path, default=None, help="override the task's MJCF")
     ap.add_argument("--scenes-dir", type=Path, default=DEFAULT_SCENES)
@@ -332,6 +363,17 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"VLA server not reachable at {args.server_url}: {exc}")
 
+    # ---- e1 握手：模型是几维口径，就必须按几维喂；不一致直接中止（禁止静默错配）----
+    se_mode = str(info.get("state_extra", "none") or "none").lower()
+    _expect = str(getattr(args, "expect_state_extra", "") or "").lower()
+    if _expect and _expect != se_mode:
+        raise SystemExit(
+            f"[state-extra] 口径不一致：server={se_mode!r}，本进程期望 {_expect!r}。"
+            f"（训练用了 --state-extra {_expect} 就必须让 server 载入同一个 head）")
+    if se_mode not in ("none", "vel6"):
+        raise SystemExit(f"[state-extra] 采集器只支持 none|vel6，server 报的是 {se_mode!r}")
+    print(f"[state-extra] mode={se_mode} scale={info.get('state_extra_scale')}", flush=True)
+
     writer = VideoWriter(args.out_video, 1280, 480, 50.0 / args.video_every)
     xi = torch.zeros(1, 33, device=args.device)
     dummy_ref = FrameRef(torch.zeros(1, dtype=torch.long, device=args.device))
@@ -386,6 +428,8 @@ def main() -> int:
     tokens = np.zeros((1, 64), np.float32)
     hands = np.zeros((1, 14), np.float32)
     last_act = np.zeros(29, np.float32)
+    _frame_ok = False
+    _prev_yaw: float | None = None
     t_start = time.time()
 
     with torch.no_grad():
@@ -396,7 +440,17 @@ def main() -> int:
                 s64 = state64(np.asarray(smap.q(data), np.float32),
                               np.asarray(smap.dq(data), np.float32),
                               np.asarray(data.qpos[3:7], np.float64))
-                tokens, hands, dt = post_infer(args.server_url, ego, s64, prompt)
+                _e6 = None
+                if se_mode != "none":
+                    _q = np.asarray(data.qpos[3:7], np.float64)
+                    _qv = np.asarray(data.qvel[0:6], np.float64)
+                    _e6 = vel6_body(_qv, _q)
+                    if not np.isfinite(_e6).all():
+                        raise SystemExit(f"[state-extra] vel6 出现非有限值: {_e6}")
+                    if plans == 0:      # 首次打印，便于事后审计口径
+                        print(f"[state-extra] vel6(first)={np.round(_e6, 4).tolist()}", flush=True)
+                tokens, hands, dt = post_infer(args.server_url, ego, s64, prompt,
+                                               state_extra6=_e6)
                 latencies.append(dt)
                 plans += 1
                 consumed = 0
@@ -404,6 +458,19 @@ def main() -> int:
                       f"tok_absmean={np.abs(tokens[0]).mean():.4f} "
                       f"hand_max={np.abs(hands[0]).max():.2f}", flush=True)
 
+            # ---- 坐标系自检（只做一次）：yaw 的差分必须与体坐标 yaw 角速度同号 ----
+            if (not _frame_ok) and tick >= 3 and _prev_yaw is not None:
+                _y = yaw_of(np.asarray(data.qpos[3:7], np.float64))
+                _dyaw = float(np.arctan2(np.sin(_y - _prev_yaw), np.cos(_y - _prev_yaw)))
+                _wz = float(vel6_body(np.asarray(data.qvel[0:6], np.float64),
+                                      np.asarray(data.qpos[3:7], np.float64))[5])
+                if abs(_dyaw) > 5e-4 and abs(_wz) > 0.05 and _dyaw * _wz < 0:
+                    raise SystemExit(
+                        f"[state-extra] 坐标系自检失败：Δyaw={_dyaw:+.5f} 与 w_body_z={_wz:+.4f} 不同号 "
+                        f"⇒ qvel 的世界系/体坐标约定与训练侧不一致，不能继续")
+                _frame_ok = True
+                print(f"[state-extra] 坐标系自检通过：Δyaw={_dyaw:+.5f} w_body_z={_wz:+.4f}", flush=True)
+            _prev_yaw = yaw_of(np.asarray(data.qpos[3:7], np.float64))
             idx = min(consumed, len(tokens) - 1)
             token = torch.as_tensor(tokens[idx], dtype=torch.float32,
                                     device=args.device).reshape(1, 64)

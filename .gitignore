@@ -85,3 +85,15 @@ data/ha_sessions_port/
 
 # Isaac 侧依赖软链视图（指向 third_party/gr00t_deps，纯 symlink，别人机器上无意义）
 third_party/gr00t_deps_nomujoco/
+
+# 本地 pip 装到源码树里的第三方包快照（av 117 MB / skimage 66 MB，按需 pip install）
+third_party/av_py311/
+third_party/skimage_py311/
+third_party/py312_shims/
+
+# SuperMimic 冒烟日志树（175 MB 的 rollout 日志，可重跑）
+third_party/SuperMimic-Reproduced/logs_smoke_ft318/
+
+# 冒烟/调试日志目录（只有 *.log）
+logs_smoke/
+recording_data/

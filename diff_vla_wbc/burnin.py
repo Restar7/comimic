@@ -161,13 +161,12 @@ def sample_burnin(
     b = int(frames.shape[0])
     device = frames.device
     if xi is None:
-        from .isaac_joint import default_xi  # noqa: PLC0415
-
-        xi = default_xi(b, device)
+        # 后端无关：Isaac/trackerlab 和 mjlab 都提供同名方法（`[0]=0.75` 摩擦 + 29 偏置 + 3 CoM）
+        xi = bundle.default_xi(b, device)
 
     state_device = frames.device
     # 1) f 往前退 K 帧（夹到 clip 起点）
-    clip_first = motion.clip_start[motion.clip_id[frames]].to(device)
+    clip_first = bundle.clip_start_of(frames).to(device)
     f0 = torch.clamp(frames - int(k), min=clip_first)
 
     # 2) 参考状态 + 参考历史（在 f0 处），然后加扰动
@@ -181,17 +180,17 @@ def sample_burnin(
                 "它必须按**帧**索引。用 transitions 的 `frames` 字段建 帧→行 映射后再传"
             )
         # ★ v3：起点用**真录制机器人状态**（部署口径），历史也用真状态 + 命令推出的 a_prev 重建
-        clip_first64 = motion.clip_start[motion.clip_id[f0]].to(f0.device)
+        clip_first64 = bundle.clip_start_of(f0).to(f0.device)
         hrows = torch.clamp(
             f0[:, None] + (torch.arange(HISTORY, device=f0.device) - (HISTORY - 1)),
             min=clip_first64[:, None],
         )
         st_hist = recorded_states[hrows.reshape(-1)].float().to(state_device).reshape(b, HISTORY, -1)
-        q_cmd = motion.ref[hrows.reshape(-1).to(motion.ref.device), 13:13 + NUM_JOINTS].float()
+        q_cmd = bundle.ref_joint_pos(hrows.reshape(-1))
         a_hist = (q_cmd - bundle.default_joint_pos) / bundle.action_scale
         xi_rep = xi[:, None].expand(b, HISTORY, XI_DIM).reshape(-1, XI_DIM)
-        obs = bundle.mdp.obs(
-            _flat_tuple(st_hist.reshape(-1, 71)), a_hist, xi_rep, hrows.reshape(-1)
+        obs = bundle.obs_from_states(
+            st_hist.reshape(-1, 71), a_hist, xi_rep, hrows.reshape(-1)
         ).reshape(b, HISTORY, -1)
         state = recorded_states[f0].float().to(state_device)
         history = obs.permute(1, 0, 2).contiguous()          # (H_in,B,W)

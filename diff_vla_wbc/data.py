@@ -215,6 +215,8 @@ class MotionBatch:
     teacher_goal_sequence: torch.Tensor | None = None
     model_inputs: dict | None = None
     hand_ref: torch.Tensor | None = None   # (B, T, 14) 录制手部标签（左右各 7），用于辅助监督
+    # rotlocal6 用：每个样本所属回合的**起始根姿态**（wxyz, (B,4)）
+    start_quat0: torch.Tensor | None = None
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
@@ -366,6 +368,8 @@ class MotionBatchProvider:
         token_horizon: int = 40,
         seed: int | None = None,
         hand_dir: str | Path | None = None,
+        start_weights: torch.Tensor | None = None,
+        start_audit: bool = False,
     ):
         self.bundle = bundle
         self.library = library
@@ -381,6 +385,10 @@ class MotionBatchProvider:
         self.token_source = token_source
         self.token_dim = token_dim
         self.token_horizon = token_horizon
+        # 2026-11-02：加权参考起点（phase/task）+ 覆盖审计
+        self.start_weights = None if start_weights is None else start_weights.detach().float().cpu()
+        self.start_audit = bool(start_audit)
+        self._audit: list[torch.Tensor] = []
         self.rng = torch.Generator(device="cpu")
         if seed is not None:
             self.rng.manual_seed(seed)
@@ -391,9 +399,23 @@ class MotionBatchProvider:
         if max_start <= HISTORY:
             raise ValueError("motion library is shorter than the observation/rollout horizon")
         if frames is None:
-            frames = torch.randint(
-                HISTORY, max_start, (self.batch_size,), generator=self.rng, dtype=torch.long
-            )
+            if self.start_weights is not None:
+                w = self.start_weights
+                if int(w.numel()) != int(self.library.num_frames):
+                    raise ValueError(
+                        f"start_weights 有 {int(w.numel())} 项，但库有 {int(self.library.num_frames)} 帧"
+                    )
+                if not torch.isfinite(w).all() or float(w.sum()) <= 0:
+                    raise ValueError("start_weights 必须有限且和 > 0")
+                frames = torch.multinomial(
+                    w, self.batch_size, replacement=True, generator=self.rng
+                ).clamp(HISTORY, max_start - 1)
+            else:
+                frames = torch.randint(
+                    HISTORY, max_start, (self.batch_size,), generator=self.rng, dtype=torch.long
+                )
+            if self.start_audit:
+                self._audit.append(frames.detach().cpu().clone())
         frames = torch.as_tensor(frames, dtype=torch.long).to(self.bundle.device)
         bs = int(frames.shape[0])
         start = self.bundle.reference_start(self.library, frames)
@@ -472,7 +494,27 @@ class MotionBatchProvider:
             frames=frames,
             references=refs,
             teacher_goal_sequence=teacher_goal_sequence,
+            start_quat0=_start_quat0(self.bundle, frames),
         )
+
+
+    def audit_frames(self) -> torch.Tensor:
+        """已采样过的参考帧（start_audit=True 时）。"""
+        return torch.cat(self._audit, 0) if self._audit else torch.empty(0, dtype=torch.long)
+
+def _start_quat0(bundle: Any, frames: torch.Tensor) -> torch.Tensor | None:
+    """回合起始根姿态 = 该 clip **第一帧**的参考朝向（rotlocal6 的 q0）。
+
+    与线上协议一致：HA 的 state64[:6] = rot6d(conj(heading(q0))·q_now)，q0 是回合开始时的
+    机器人朝向。训练侧用参考库里的"clip 首帧朝向"作为 q0——只要回合是从首帧开始的，
+    两者就是同一个量。
+    """
+    try:
+        first = bundle.clip_start_of(frames)
+        quat = bundle.motion.ref[first.to(bundle.motion.ref.device)][:, 3:7].float()
+        return quat
+    except Exception:
+        return None
 
 
 def _reference_state_at(bundle: Any, library, frames: torch.Tensor) -> torch.Tensor:

@@ -24,7 +24,11 @@ export PROJECT_ROOT=$COMIMIC/third_party/HumanoidArena/isaaclab_twist2_g1
 # 缺这两个变量 -> action_scale 退回 BeyondMimic（hip_pitch 放大 2.85x、腕缩小 10x）-> 必摔。
 # 见 docs/HANDOVER_CLOSEDLOOP_ACTION_SCALE_20261025.md；A/B 才允许 SM_ALLOW_SCALE_MISMATCH=1。
 export SUPERMIMIC_HA_ALIGN=1
-export SUPERMIMIC_ROBOT_USD=${SUPERMIMIC_ROBOT_USD:-$COMIMIC/trackerlab-supermimic/data/assetslib/unitree/unitree_g1/usd/g1_29dof_rev_1_0.usd}
+# LOCKED 2026-10-28：闭环必须用 **WBC 训练时那一个 plant**。
+# A24000 的 robot_spec.usd = HumanoidArena 的 g1_29dof_with_dex3（43 DoF，手指锁 0）。
+# 以前默认是 trackerlab 的 g1_29dof_rev_1_0（另一个资产）⇒ plant 不一致（文档 §12.6 实测：
+# 换 plant 掉 0.062 NR、多 4 次摔）。要 A/B 别的资产请显式覆盖这个变量。
+export SUPERMIMIC_ROBOT_USD=${SUPERMIMIC_ROBOT_USD:-$COMIMIC/third_party/HumanoidArena/isaaclab_twist2_g1/assets/robots/g1-29dof_wholebody_dex3/g1_29dof_with_dex3_rev_1_0.usd}
 export HF_HOME=${HF_HOME:-/inspire/hdd/global_user/liumengfan-253108110079/cache/huggingface}
 export NO_ALBUMENTATIONS_UPDATE=1
 export TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1
@@ -39,12 +43,14 @@ ISAAC_GPU=${ISAAC_GPU:-0}
 OUT_ROOT=${OUT_ROOT:-$COMIMIC/runs/ha_isaac_eval}
 # 1 = headless（默认；出视频/跑批量）；0 = 开 Isaac GUI（配合 DISPLAY=:N，NoVNC 可视化用）
 HEADLESS=${HEADLESS:-1}
+# 采集时关录像（--record_video_every_n 0）：纯开销，且不影响 dump。
+RECORD_VIDEO=${RECORD_VIDEO:-1}
 if [[ "$HEADLESS" == "1" ]]; then HEADLESS_FLAG="--headless"; else HEADLESS_FLAG=""; fi
 # 我们的 SuperMimic WBC（token-conditioned，trackerlab 训练产物，ckpt 里要有 "pi" 键）
 # LOCKED 2026-10-26：执行器必须与 S3 联合微调**同一个** ckpt —— C6h
 # （C2 策略 + 按 ha_cmd 命令流域重标的 WM；hold 窗口 + robot_spec）。
 # 旧默认 bones_seed_token_2x8192（future 窗口、旧库）会让闭环与训练各说各话。
-SM_CKPT=${SM_CKPT:-$COMIMIC/runs/S1_handover/WBC_A20000_wmvel_cmd.pt}
+SM_CKPT=${SM_CKPT:-$COMIMIC/runs/S1_handover/WBC_A24000_wmvel_cmd.pt}
 # 回放模式（SM_TOKEN_SOURCE=npy）：不需要 VLA 服务/端口/相机，SM_TOKEN_NPY 指向 (T,64) token 流。
 # receding horizon：部署每 20 步重规划（= 训练 H=20 的口径来源）。
 # supermimic provider 默认 0（旧行为：全消费 40 帧），闭环必须显式打开。
@@ -151,7 +157,9 @@ echo "[closedloop] yaml=$TASK_YAML"
 echo "[closedloop] server=$SERVER_URL  isaac_gpu=cuda:$ISAAC_GPU"
 echo "[closedloop] sm_ckpt=$SM_CKPT"
 echo "[closedloop] instruction=${TASK_INSTRUCTION:-<none>}"
-echo "[closedloop] out=$RUN_DIR"
+echo "[closedloop] usd=$SUPERMIMIC_ROBOT_USD"
+echo "[closedloop] out=$RUN_DIR  record_video_every_n=$RECORD_VIDEO"
+echo "[closedloop] start_frame=${SM_START_FRAME:-${SM_TOKEN_START:-0}} init_from_lib=${SM_INIT_FROM_LIB:-0}"
 
 cd "$PROJECT_ROOT"
 # GUI over NoVNC: Xtigervnc has no hardware GLX, so the RTX viewport stays black unless
@@ -181,4 +189,5 @@ exec ${VGL_PREFIX} python -u script/eval_scripts/sonic/sim_eval_vla.py \
   --success_video_dir "$RUN_DIR/videos_success" \
   --failure_video_dir "$RUN_DIR/videos_failure" \
   --recording_save_dir "$RUN_DIR" \
+  --record_video_every_n "$RECORD_VIDEO" \
   ${EXTRA_ARGS:-}

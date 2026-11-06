@@ -45,6 +45,9 @@ class Rollout:
     goal_sequence: torch.Tensor          # (B, 10, 680)
     references: list[Any] = field(default_factory=list)
     history: torch.Tensor | None = None  # final (H, B, 93|99)
+    # ★ 2026-11-01（Path B）：起点 WBC 在同一状态/token 下的动作，用作 action KL 锚。
+    #   None = 不启用（Path A / 普通 joint 的行为完全不变）。
+    anchor_actions: torch.Tensor | None = None  # (H, B, 29)
 
 
 def _obs_terms_from_flat(flat: torch.Tensor, hist: int = HISTORY,
@@ -210,11 +213,19 @@ def imagine_with_goals(
         g = goal_window_at(t)
         obs_flat = _flat_history(bundle, history)
         action = _call_act(bundle, obs_flat, g, ref)
-        next_state = bundle.step(current, action, xi)
+        next_state = bundle.step(current, action, xi, step_idx=t + 1)
         bodies = _call_robot_bodies(bundle, next_state)
         terms = bundle.reward(next_state, action, a_prev, ref, bodies)
-        logits = bundle.termination_logits(next_state, ref)
-        prob = torch.sigmoid(logits)
+        # ★ 2026-11-05：终止/存活的开关（`bundle.no_termination=1` ⇒ survival≡1）。
+        #   原因：`soft_termination` 是**启发式**（|ref_z-pred_z|>0.25 m 或 |ΔR22|>0.8），
+        #   而我们从零训的 WM 在**朝向**通道最弱（通道探针：quat 误差÷单步变化=1.84），
+        #   于是想象轨迹被误判"要摔"：实测 survival 0.25–0.49（旧 WM 0.999）⇒ 回报被砍掉一半。
+        #   关掉它不影响"压漂移"这个目标（真摔倒本身就是巨大漂移），却去掉一个调得很脆的 shaping 项。
+        if float(getattr(bundle, "no_termination", 0.0) or 0.0) > 0:
+            prob = torch.zeros_like(survival)
+        else:
+            logits = bundle.termination_logits(next_state, ref)
+            prob = torch.sigmoid(logits)
         survival = survival * (1.0 - prob)
         clean_obs = _call_observation(bundle, next_state, action, xi, ref)
         if obs_noise > 0:
@@ -264,26 +275,44 @@ class LossWeights:
     state_vel: float = 1.0
 
 
-def _state_error(pred: torch.Tensor, target: torch.Tensor, vel_weight: float = 1.0) -> torch.Tensor:
-    """Position / orientation / velocity error with a geodesic quaternion term."""
+def _state_error(pred: torch.Tensor, target: torch.Tensor, vel_weight: float = 1.0,
+                 root_vel_weight: float | None = None) -> torch.Tensor:
+    """Position / orientation / velocity error with a geodesic quaternion term.
+
+    2026-10-30：把**根速度**（36:42）与**关节速度**（42:71）分开加权。
+    原因：318 库的根速度恒为 0（`prepare_g1_tasks_npz.py:215` 的已知缺陷），
+    用同一个 `vel_weight` 会连"关节速度"这项好信号一起丢掉 —— 这正是 `--lambda-s`
+    被整项关掉的唯一理由。分开后可以 `root_vel_weight=0` 只留位置/朝向/关节角/关节速度。
+    """
     from .compat import quat_error_magnitude
 
     pos = F.mse_loss(pred[..., 0:3], target[..., 0:3])
     ori = quat_error_magnitude(pred[..., 3:7], target[..., 3:7]).square().mean()
     q = F.mse_loss(pred[..., 7:36], target[..., 7:36])
-    vel = F.mse_loss(pred[..., 36:], target[..., 36:])
-    return pos + ori + q + float(vel_weight) * vel
+    vel_joint = F.mse_loss(pred[..., 42:], target[..., 42:])       # 关节速度（可用）
+    vel_root = F.mse_loss(pred[..., 36:42], target[..., 36:42])     # 根线速度+角速度（库里有缺陷）
+    rw = float(vel_weight) if root_vel_weight is None else float(root_vel_weight)
+    return pos + ori + q + float(vel_weight) * vel_joint + rw * vel_root
 
 
 def discounted_return(
     rollout: Rollout,
     gamma: float = 0.99,
     bootstrap: torch.Tensor | None = None,
+    steps: int = 0,
 ) -> torch.Tensor:
-    """Differentiable discounted tracking return (per batch element)."""
+    """Differentiable discounted tracking return (per batch element).
+
+    ``steps=k``（2026-11-05）：只积前 k 步。想象照旧滚满 H（部署周期不变），
+    但**奖励只信前 k 步** —— 因为 WM 是 `s'=f(s,a)` 的 MLP，**单步**准（SNR 3.1、增益 0.98），
+    而步态的关键是落脚接触（间断事件，结构上表达不了），误差随视界累积。
+    实测锚点：20 步端点误差 0.89 cm、20 步 ratio 0.98；单步增益比 0.98。
+    """
     h = rollout.rewards.shape[0]
+    if steps and int(steps) > 0:
+        h = min(h, int(steps))
     disc = gamma ** torch.arange(h, device=rollout.rewards.device, dtype=rollout.rewards.dtype)
-    out = (disc[:, None] * rollout.survival[:h] * rollout.rewards).sum(0)
+    out = (disc[:, None] * rollout.survival[:h] * rollout.rewards[:h]).sum(0)
     if bootstrap is not None:
         out = out + (gamma**h) * rollout.survival[h] * bootstrap
     return out
@@ -303,6 +332,7 @@ def imagine_with_tokens(
     obs_noise: float = 0.0,
     push_std: float = 0.0,
     push_ang: float = 0.0,
+    anchor_policy=None,
 ) -> Rollout:
     """Token route: the conditioning is the VLA's own 64-d motion token.
 
@@ -343,6 +373,7 @@ def imagine_with_tokens(
     all_probs = [torch.zeros(batch, device=device)]
     all_survival = [torch.ones(batch, device=device)]
     all_tokens = [token_at(0)]
+    all_anchor: list[torch.Tensor] = []
     term_names = None
     survival = torch.ones(batch, device=device)
 
@@ -353,7 +384,17 @@ def imagine_with_tokens(
         cond = token_at(t)
         obs_flat = _flat_history(bundle, history)
         action = _call_act(bundle, obs_flat, cond, ref)
-        next_state = bundle.step(current, action, xi)
+        if anchor_policy is not None:
+            # 起点 WBC 在**同一状态、同一 token**下的动作；只做锚，不参与反传。
+            _live_pol = bundle.policy
+            bundle.policy = anchor_policy
+            try:
+                with torch.no_grad():
+                    _a0 = _call_act(bundle, obs_flat, cond, ref)
+            finally:
+                bundle.policy = _live_pol
+            all_anchor.append(_a0.detach())
+        next_state = bundle.step(current, action, xi, step_idx=t + 1)
         if (push_std and push_std > 0) or (push_ang and push_ang > 0):
             # 过程扰动：root 线速度（36:39）/角速度（39:42）加噪，制造中段偏离，
             # 让 token 的好坏真正有差别（标称条件下区分度只有 ~6%）。
@@ -370,8 +411,16 @@ def imagine_with_tokens(
             )
         bodies = _call_robot_bodies(bundle, next_state)
         terms = bundle.reward(next_state, action, a_prev, ref, bodies)
-        logits = bundle.termination_logits(next_state, ref)
-        prob = torch.sigmoid(logits)
+        # ★ 2026-11-05：终止/存活的开关（`bundle.no_termination=1` ⇒ survival≡1）。
+        #   原因：`soft_termination` 是**启发式**（|ref_z-pred_z|>0.25 m 或 |ΔR22|>0.8），
+        #   而我们从零训的 WM 在**朝向**通道最弱（通道探针：quat 误差÷单步变化=1.84），
+        #   于是想象轨迹被误判"要摔"：实测 survival 0.25–0.49（旧 WM 0.999）⇒ 回报被砍掉一半。
+        #   关掉它不影响"压漂移"这个目标（真摔倒本身就是巨大漂移），却去掉一个调得很脆的 shaping 项。
+        if float(getattr(bundle, "no_termination", 0.0) or 0.0) > 0:
+            prob = torch.zeros_like(survival)
+        else:
+            logits = bundle.termination_logits(next_state, ref)
+            prob = torch.sigmoid(logits)
         survival = survival * (1.0 - prob)
         clean_obs = _call_observation(bundle, next_state, action, xi, ref)
         if obs_noise > 0:
@@ -402,6 +451,7 @@ def imagine_with_tokens(
         goal_sequence=tokens,
         references=list(references) if references is not None else [],
         history=history,
+        anchor_actions=torch.stack(all_anchor, dim=0) if all_anchor else None,
     )
 
 

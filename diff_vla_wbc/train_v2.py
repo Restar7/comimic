@@ -52,6 +52,7 @@ from .rollout import (
     freeze_world_model,
     imagine_with_tokens,
 )
+from .quant import apply_token_quant
 
 #: 与 trackerlab MDP 的 ``MAX_STEP_REWARD`` 一致（每步奖励上界，归一化分母）
 try:  # pragma: no cover - only importable with the trackerlab tree
@@ -88,8 +89,25 @@ class JointV2Config:
     grad_backend: str = "pathwise"
     fm_truncated_tail: int = 1
     head_eval_mode: bool = True
+    # --- token 空间的 FSQ 网格量化（2026-11-04）--------------------------------
+    # 背景见 `diff_vla_wbc/quant.py`：执行器只在 `q = n/16` 的格点上训练过，而 VLA 输出
+    # 是格点之间的连续值 ⇒ `∂a/∂token` 是外推。三种口径：
+    #   "none"  旧行为，连续喂（执行器可重训 + dither 时用这个）
+    #   "ste"   前向格点 + 反向恒等（推荐；部署必须同步量化）
+    #   "hard"  硬量化、梯度归零（消融：应当"训不动"）
+    token_quant: str = "none"
+    # --- 执行器（WBC）是否解冻：默认冻结；解冻 = "直接学动作"的对照臂 ---
+    # 为什么默认冻结：WM 看不见接触、奖励只有跟踪项，解冻后的 4.8M 直接输出动作，
+    # hack WM 的能力比 token 强得多。解冻必须配动作信任域（中心 = π_k 的 WBC）。
+    train_wbc: bool = False
+    wbc_lr: float = 1e-5
+    #: 解冻范围：all = 全部 WBC；dec = 只解冻 `dec.*`（Path B 用，降低漂移风险）。
+    wbc_unfreeze: str = "all"
     # --- 优化 ---
     grad_accum: int = 4
+    #: 多卡梯度同步（torchrun 起多进程时打开）：backward 之后、step 之前做一次
+    #: 扁平 all_reduce(AVG)，与 `diff_vla_wbc/train.py` 的 JointTrainer 同口径。
+    sync_gradients: bool = False
     # --- 诊断 ---
     grad_ratio_every: int = 50
 
@@ -112,6 +130,7 @@ class JointTrainerV2:
         self.vlm = vlm
         self.codec = codec
         self.cfg = cfg or JointV2Config()
+        self.sync_gradients = bool(getattr(cfg or JointV2Config(), "sync_gradients", False))
         self.device = torch.device(device or bundle.device)
         self.log = log
         self.steps = 0
@@ -122,15 +141,18 @@ class JointTrainerV2:
         self.fm_parameters = [p for p in vlm.action_head.parameters() if p.requires_grad]
         if not self.fm_parameters:
             raise SystemExit("[v2] action head 没有可训练参数（tune_* 全 False？）")
-        self.optimizer = torch.optim.AdamW(
-            [{"params": self.fm_parameters, "lr": self.cfg.fm_lr}],
-            weight_decay=self.cfg.weight_decay,
-        )
+        self.wbc_parameters = [p for p in bundle.policy.parameters() if p.requires_grad]
+        _groups = [{"params": self.fm_parameters, "lr": self.cfg.fm_lr}]
+        if self.wbc_parameters:
+            _groups.append({"params": self.wbc_parameters, "lr": float(self.cfg.wbc_lr)})
+        self.optimizer = torch.optim.AdamW(_groups, weight_decay=self.cfg.weight_decay)
         self._ratio_params = grad_ratio_parameters(vlm.action_head)
         self._accum_count = 0
         self.last_metrics: dict[str, float] = {}
         log(
-            f"[AUDIT][v2] trainable=head_only params={sum(p.numel() for p in self.fm_parameters):,} "
+            f"[AUDIT][v2] trainable={'head+wbc' if self.wbc_parameters else 'head_only'} "
+            f"params={sum(p.numel() for p in self.fm_parameters):,} "
+            f"wbc_params={sum(p.numel() for p in self.wbc_parameters):,} "
             f"wbc_trainable={sum(p.numel() for p in bundle.policy.parameters() if p.requires_grad)} "
             f"wm_trainable={sum(p.numel() for p in bundle.wm.parameters() if p.requires_grad)} "
             f"H={self.cfg.horizon} K={self.cfg.fm_steps} lam_bc={self.cfg.lambda_bc} "
@@ -140,11 +162,62 @@ class JointTrainerV2:
             flush=True,
         )
 
+    # ------------------------------------------------------------------ distributed
+    def _sync_param_grads(self) -> None:
+        """把所有可训参数的梯度**扁平化成一次 all_reduce**（chunk 太大就分块）。
+
+        为什么要扁平：LoRA 是 216 个 `nn.Linear` × 2（A/B）≈ 400+ 个小张量，
+        逐个 `all_reduce` 的启动开销会把训练拖死；压成 1~2 个 buffer 只走一两次集合通信。
+        """
+        if not self.sync_gradients:
+            return
+        import torch.distributed as dist  # noqa: PLC0415
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        grads = [p.grad for p in self.fm_parameters if p is not None and p.grad is not None]
+        if self.wbc_parameters:
+            grads += [p.grad for p in self.wbc_parameters if p is not None and p.grad is not None]
+        # ★ 2026-11-01（8 卡 DDP）：v3 的 `state_extra_scale` 是**单独**加的 optimizer
+        #   param group（不在 self.fm_parameters 里），原来没被同步 ⇒ 每个 rank 各走各的，
+        #   连 rank0 存出来的 scale 也只是本 rank 的值。这里一起压进 buffer。
+        _se = getattr(self, "state_extra_scale", None)
+        if _se is not None and _se.grad is not None:
+            grads.append(_se.grad)
+        if not grads:
+            return
+        import os as _os
+        buf = torch.cat([g.reshape(-1) for g in grads])
+        _b0 = float(buf.norm())
+        dist.all_reduce(buf, op=dist.ReduceOp.AVG)
+        if _os.environ.get("J1_DEBUG_SYNC") == "1":
+            print(f"[sync] rank={dist.get_rank()}/{dist.get_world_size()} n={len(grads)} "
+                  f"norm_before={_b0:.4f} norm_after={float(buf.norm()):.4f}", flush=True)
+        off = 0
+        for g in grads:
+            n = g.numel()
+            g.copy_(buf[off : off + n].view_as(g))
+            off += n
+
     # ------------------------------------------------------------------ freeze
     def _freeze_executor(self) -> None:
-        for p in self.bundle.policy.parameters():
-            p.requires_grad_(False)
-        self.bundle.policy.eval()
+        if bool(self.cfg.train_wbc):
+            # 对照臂：只解冻执行器（WBC），WM 仍冻结（裁判不训练，避免"自己改规则"）
+            # ★ 2026-11-01（Path B）：支持只解冻 decoder（`dec.*`），其余 WBC 参数保持冻结。
+            _mode = str(getattr(self.cfg, "wbc_unfreeze", "all") or "all").lower()
+            if _mode not in ("all", "dec"):
+                raise SystemExit(f"[v2] 未知 wbc_unfreeze={_mode!r}（只支持 all|dec）")
+            for _name, p in self.bundle.policy.named_parameters():
+                p.requires_grad_(True if _mode == "all" else _name.startswith("dec."))
+            self.log(
+                f"[AUDIT][wbc] unfreeze={_mode} "
+                f"trainable={sum(p.numel() for p in self.bundle.policy.parameters() if p.requires_grad):,}"
+                f"/{sum(p.numel() for p in self.bundle.policy.parameters()):,}"
+            )
+        else:
+            for p in self.bundle.policy.parameters():
+                p.requires_grad_(False)
+        self.bundle.policy.eval()                   # 确定性 MLP：eval 不影响行为
         freeze_world_model(self.bundle.wm)          # 同时 .eval()
         if self.adapter is not None:
             for p in self.adapter.parameters():
@@ -209,7 +282,17 @@ class JointTrainerV2:
         x_norm = x_norm.float()
         x_raw = self.codec.decode(x_norm)
         tokens = x_raw[..., :64]
+        # token 空间的 FSQ 网格量化（口径与坑见 `diff_vla_wbc/quant.py`）：
+        #   none = 连续喂（旧行为）/ ste = 前向格点 + 反向恒等（推荐）/ hard = 硬量化（消融）。
+        # `x_raw` 保持连续：78 维里的手部通道（64:78）不经过 FSQ，BC 目标也要在连续空间里。
+        tokens, qstats = apply_token_quant(tokens, getattr(self.cfg, "token_quant", "none"))
+        self._quant_stats = qstats
         return x_norm, x_raw, tokens
+
+    def quant_metrics(self) -> dict[str, float]:
+        """最近一次采样后的量化诊断（``quant/*``）；``token_quant=none`` 时为空。"""
+        stats = getattr(self, "_quant_stats", None) or {}
+        return {f"quant/{k}": float(v) for k, v in stats.items()}
 
     def _rollout(self, batch, tokens, horizon: int | None = None):
         return imagine_with_tokens(
@@ -236,6 +319,8 @@ class JointTrainerV2:
         model_inputs = self.prepare_model_inputs(batch)
         act_in, bb_out = self._backbone_output(model_inputs)
         x_norm, x_raw, tokens = self._sample_tokens(act_in, bb_out)
+        # 冻结主采样点的量化诊断（后面 trust/BC 分支还会再采样，别被它们覆盖）
+        self._quant_main = self.quant_metrics()
         out_of_range = self.codec.out_of_range_frac(x_norm)
 
         # ---------- (1) 奖励项（§3.5 归一化回报）----------
@@ -257,7 +342,10 @@ class JointTrainerV2:
                 self.optimizer.zero_grad(set_to_none=True)
             (cfg.lambda_bc * loss_bc_only / accum0).backward()
             if self._accum_count >= accum0:
+                self._sync_param_grads()
                 torch.nn.utils.clip_grad_norm_(self.fm_parameters, cfg.fm_clip)
+                if self.wbc_parameters:
+                    torch.nn.utils.clip_grad_norm_(self.wbc_parameters, cfg.fm_clip)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self._accum_count = 0
@@ -267,6 +355,7 @@ class JointTrainerV2:
                 "loss/fm_bc": float(loss_bc_only.detach()),
                 "codec/out_of_range": float(out_of_range),
                 "rollout/skipped": 1.0,
+                **getattr(self, "_quant_main", {}),
             }
         rollout = self._rollout(batch, tokens)
         ret = discounted_return(rollout, cfg.gamma)
@@ -278,6 +367,7 @@ class JointTrainerV2:
             "rollout/reward": float(rollout.rewards.mean().detach()),
             "rollout/survival": float(rollout.survival[-1].mean().detach()),
             "rollout/action_abs": float(rollout.actions.abs().mean().detach()),
+            **getattr(self, "_quant_main", {}),
         }
 
         # ---------- (2) FM-BC（J4：GR00T 原生损失，单一主项）----------
@@ -328,7 +418,10 @@ class JointTrainerV2:
             self.optimizer.zero_grad(set_to_none=True)
         (loss / accum).backward()
         if self._accum_count >= accum:
+            self._sync_param_grads()
             torch.nn.utils.clip_grad_norm_(self.fm_parameters, cfg.fm_clip)
+            if self.wbc_parameters:
+                torch.nn.utils.clip_grad_norm_(self.wbc_parameters, cfg.fm_clip)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self._accum_count = 0
@@ -386,9 +479,10 @@ class JointTrainerV2:
 def assert_wbc_frozen(bundle, source_ckpt: str | Path, log: Callable[[str], None] = print) -> bool:
     """S3.2 门禁：``bundle.policy`` 与源 WBC ckpt 的 ``pi`` 逐张量相等（``torch.equal``）。"""
     ck = torch.load(str(source_ckpt), map_location="cpu", weights_only=False)
-    src = ck.get("pi")
+    # Isaac/trackerlab 用 ``pi``；mjlab/MuJoCo 用 ``policy``（两种布局都要能过门禁）
+    src = ck.get("pi", ck.get("policy"))
     if src is None:
-        log(f"[GATE][freeze] SKIP: {source_ckpt} 没有 'pi'")
+        log(f"[GATE][freeze] SKIP: {source_ckpt} 既没有 'pi' 也没有 'policy'")
         return False
     cur = {k: v.detach().cpu() for k, v in bundle.policy.state_dict().items()}
     bad = [
@@ -420,6 +514,7 @@ class BurnInBatchProvider:
         wbc_chunk_source: Callable[[torch.Tensor], torch.Tensor] | None = None,
         online_tokens=None,
         recorded_states: torch.Tensor | None = None,
+        b_starts=None,               # diff_vla_wbc.b_start.BStartSource：B 线重规划起点
         dr=None,                     # diff_vla_wbc.dr.DRConfig：域随机化（分桶）
         batch_size: int = 4,
         horizon: int = 16,
@@ -433,6 +528,8 @@ class BurnInBatchProvider:
         perturb_yaw: float = 0.10,
         perturb_dq: float = 0.05,
         perturb_dqd: float = 0.30,
+        start_weights: torch.Tensor | None = None,
+        start_audit: bool = False,
     ) -> None:
         self.bundle = bundle
         self.library = library
@@ -446,6 +543,9 @@ class BurnInBatchProvider:
         self.online_tokens = online_tokens
         # v3：真录制机器人状态（起点用它，而不是参考帧）
         self.recorded_states = recorded_states
+        # B 线重规划起点（评审 §3）：非 None 时起点直接用 B 线真实状态，**不做 burn-in**
+        self.b_starts = b_starts
+        self._b_warned = False
         self.dr = dr
         self.batch_size = int(batch_size)
         self.horizon = int(horizon)
@@ -463,7 +563,12 @@ class BurnInBatchProvider:
             batch_size=self.batch_size, horizon=self.horizon,
             token_source=None, token_dim=64, token_horizon=self.token_horizon,
             seed=seed, hand_dir=hand_dir,
+            start_weights=start_weights, start_audit=start_audit,
         )
+
+    def audit_frames(self) -> torch.Tensor:
+        """已采样的参考帧（仅参考起点路径；B 起点路径为空）。"""
+        return self.inner.audit_frames()
 
     def port_tokens_at(self, frames: torch.Tensor) -> torch.Tensor:
         """帧级端口 GT token ``(B,64)``（burn-in 的 conditioning）。"""
@@ -471,6 +576,8 @@ class BurnInBatchProvider:
 
     def sample(self, frames: torch.Tensor | None = None) -> MotionBatch:
         """采一个 batch；``frames`` 给定时在**同一批帧**上重建起点（门禁对拍用）。"""
+        if self.b_starts is not None and frames is None:
+            return self._sample_from_b()
         base = self.inner.sample(frames)
         frames = base.frames
         port_chunk = self.port_source(frames)
@@ -515,6 +622,41 @@ class BurnInBatchProvider:
         base.burnin = bi
         base.bucket = (_dr_bucket.to(self.bundle.device) if _dr_bucket is not None
                        else torch.zeros(frames.numel(), dtype=torch.long, device=self.bundle.device))
+        return base
+
+    def _sample_from_b(self):
+        """起点 = B 线真实重规划状态（评审 §3）：不 burn-in、不加 DR 扰动。"""
+        if self.dr is not None and not self._b_warned:
+            print("[b-start] 起点来自 B 线真实状态：DR 扰动**不叠加**（漂移已经是真的）",
+                  flush=True)
+            self._b_warned = True
+        bs = self.b_starts.sample(self.batch_size, self.rng)
+        base = self.inner.sample(bs.frames)
+        frames = base.frames
+        base.start_state = bs.state.to(self.bundle.device)
+        base.history = bs.history.to(self.bundle.device)
+        base.obs_hist = bs.obs_hist.to(self.bundle.device)
+        base.prev_action = bs.prev_action.to(self.bundle.device)
+        base.references = bs.references
+        base.teacher_states = bs.teacher_states
+        base.xi = bs.xi.to(self.bundle.device)
+        base.port_tokens = self.port_source(frames)
+        # 2026-10-29：采集时的真值（策略自己下发的 token + 实际漂移）
+        base.self_tokens = getattr(bs, "self_tokens", None)
+        base.realized_err = getattr(bs, "realized_err", None)
+        if self.online_tokens is not None:
+            _last = self.library.clip_end[self.library.clip_id[frames]].to(frames.device)
+            _idx = torch.minimum(
+                frames[:, None] + torch.arange(self.token_horizon, device=frames.device)[None, :],
+                _last[:, None],
+            )
+            base.wbc_tokens = self.online_tokens.chunk(_idx, robot_quat=base.start_state[:, 3:7])
+        else:
+            base.wbc_tokens = self.wbc_chunk_source(frames)
+        base.burnin = None
+        base.b_frames = frames
+        base.b_source = getattr(bs, "source_rows", None)
+        base.bucket = torch.zeros(frames.numel(), dtype=torch.long, device=self.bundle.device)
         return base
 
     def _reference_start(self, frames: torch.Tensor) -> BurnInResult:

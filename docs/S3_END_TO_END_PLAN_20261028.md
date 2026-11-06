@@ -196,22 +196,26 @@ superMIMIC_HA_ALIGN=1 PYTHONPATH=.:third_party/SuperMimic-Reproduced/src \
 验收：`v_ev > 0.3`（达不到就不启用）。
 
 ### Stage 4｜联合微调（约 10 分钟）
+> **2026-10-28 补丁（以 `docs/RUNBOOK_S3_HANDOFF_20261028.md` 为准）**：
+> ① 启动器默认**不传 `--v3`**，必须加 `V3=1`，否则 `--trust-center/--act-*/--lambda-hand` 全是空转；
+> ② 中心改用 `TRUST_CENTER=prev`（π_k 冻结快照，同噪声、无标签），`--trust-center base` 只在对照臂用；
+> ③ 起点改用 `START_FROM_B='runs/B_*/dump/*.pt'`（B 线真实重规划状态，不 burn-in、不叠 DR）；
+> ④ `--lambda-aref` 已从代码移除，别再加。
 ```bash
-GPU=0 STEPS=300 LAMBDA_R=0.3 LAMBDA_BC=0 LAMBDA_HAND=0.2 \
+GPU=0 STEPS=300 V3=1 TRUST_CENTER=prev START_FROM_B='runs/B_r1_*/dump/*.pt' \
+LAMBDA_R=0.3 LAMBDA_BC=0 ACT_EPS=0.6 ACT_WEIGHT=1.0 \
 RUN=s3_r1 BATCH=4 ACCUM=8 H=20 K=4 EVAL_EVERY=100 EVAL_BATCHES=8 SAVE_EVERY=100 \
 WBC_CKPT=$PWD/runs/S1_handover/WBC_A24000_wmvel_v2.pt \
 EXTRA="--amp bf16 --lora-rank 32 --fm-lr 1e-4 --no-dr \
-       --vla-state-from-burnin --no-critic \
-       --trust-center base --act-hinge-cap 2 --act-eps 0 \
-       --lambda-aref 0" \
+       --vla-state-from-burnin --no-critic --act-hinge-cap 2 --lambda-hand 0.2" \
 bash scripts/launch_joint_ha_v2.sh
 ```
 说明：
 - `--lambda-bc 0`：**不做 token BC**（按用户口径）
 - `--lambda-hand 0.2`：手部保留 hand-only BC（唯一例外，否则手无监督）
 - `--no-critic`：第 1 轮关（v_ev 为负）；第 2 轮若达标再开
-- `--no-dr`：DR 对 VLA 不可见，只注入噪声
-- `--lambda-aref 0`：动作误差项暂不作为主/辅目标（代码在，默认关）
+- `--no-dr`：DR 对 VLA 不可见，只注入噪声；B 起点下本来也不叠 DR
+
 
 **训练验收（三条，缺一不可）**
 1. 无 NaN；`codec/out_of_range` 不随步数单调上升

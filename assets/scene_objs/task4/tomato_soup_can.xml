@@ -1,0 +1,75 @@
+<mujoco model="g1_43dof floor-to-table-lift scene">
+  <!--
+    ============================================================
+    T3 — FLOOR-TO-TABLE LIFT  (stationary: deep sagittal trunk bend)
+    ============================================================
+    ACTIVE task scene (config ROBOT_SCENE points here, original path).
+    Stationary task, everything in FRONT so the motion stays sagittal (no turning):
+      - Object sits on the FLOOR in front of the robot
+      - A tall TABLE in front is the placement target (top ~0.87 m)
+    Coupling axis: deep trunk flexion in the sagittal plane (bend/squat down, stand up).
+
+    Layout (robot spawns at origin (0,0,0.78), facing +X):
+      - Floor object  at (0.70, 0, ~0.05)  -> forward on the floor, inside the head-camera FOV
+      - Table (wood)  center (1.00, 0), top 0.87 m, 0.44(X) x 0.90(Y)
+                      front edge at x = 0.78 (robot well back from it)
+
+    Phases (stationary):
+      1. bend / squat down to the floor object (deep sagittal trunk flexion)
+      2. grasp it
+      3. stand back up
+      4. place it on the table top (z ~ 0.87)
+
+    Success (see tasks/T3_floor_to_table/check_floor_to_table_success.py):
+      - object resting ON the table top (z above ~0.87, xy within the table)
+      - object stable / static, robot not fallen
+
+    YCB objects (google_16k, must exist under meshes/ycb/):
+      005_tomato_soup_can  ~6.6 cm dia x 10 cm, ~349 g -> easy to grasp off the floor
+    Covered by install_scripts/download_ycb_objects.sh.
+  -->
+  <!-- Note that the hand model in g1_29dof_with_hand.xml is not stable for simulation. -->
+  <compiler meshdir="/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/SONIC_DATA/deployment/gear_sonic/data/robot_model/model_data/g1/meshes" texturedir="/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/SONIC_DATA/deployment/gear_sonic/data/robot_model/model_data/g1/meshes"/>
+
+  <statistic center="0.4 0 0.5" extent="3.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-20" offwidth="1280" offheight="960"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <material name="table_wood" rgba="0.55 0.35 0.20 1"/>
+
+    <!-- YCB object -->
+    <texture name="can_tex" type="2d" file="ycb/005_tomato_soup_can/texture_map.png"/>
+    <material name="can_mat" texture="can_tex" specular="0.2" shininess="0.3"/>
+    <mesh name="can_mesh" file="ycb/005_tomato_soup_can/textured.obj"/>
+  </asset>
+
+  <worldbody>
+<body name="tomato_soup_can" pos="0.59466 0 0.48665">
+      <freejoint name="can_freejoint"/>
+      <inertial pos="0 0 0" mass="0.349" diaginertia="4.0e-4 4.0e-4 2.0e-4"/>
+      <!-- Convex collision proxy keeps the visual YCB mesh stable on box surfaces -->
+      <geom name="can_collision" type="cylinder" pos="-0.0001637 -0.0000444 -0.0007469" size="0.0345 0.050903"
+            rgba="0 0 0 0" friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+      <geom name="can_geom" type="mesh" mesh="can_mesh" material="can_mat"
+            pos="-0.0845080153 -0.0066493937 -0.0516600436"
+            quat="0.6955552576 -0.0008874447 -0.0002679897 -0.7184720065"
+            contype="0" conaffinity="0"
+            friction="2.0 0.05 0.001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+    </body>
+</worldbody>
+
+
+  <default>
+    <geom friction="1.0"/>
+  </default>
+</mujoco>

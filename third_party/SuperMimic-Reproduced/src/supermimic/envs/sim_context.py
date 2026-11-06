@@ -17,6 +17,13 @@ class SimContext:
             raise ValueError(f"no geoms match {foot_geom_regex}")
         self.foot_geom_global = int(self.robot.indexing.geom_ids[local_ids[0]].item())
         self.com_body_global = int(self.robot.indexing.body_ids[self.robot.body_names.index(com_body_name)].item())
+        # 43dof（带手）资产的 encoder_bias 是 43 维，而 xi 契约固定 33 = 1 + 29 + 3
+        # ⇒ 只取 29 个身体关节（2026-10-29 实测：不切就 AssertionError）。
+        _jn = list(self.robot.joint_names)
+        self._body_mask = torch.tensor(
+            ["_hand_" not in n for n in _jn], dtype=torch.bool, device=env.device
+        )
+        self._n_body = int(self._body_mask.sum())
         self.com_nominal = torch.as_tensor(
             np.array(env.sim.mj_model.body_ipos[self.com_body_global]), dtype=torch.float32, device=env.device
         )
@@ -35,6 +42,8 @@ class SimContext:
         else:
             com = (ipos[self.com_body_global] - self.com_nominal).expand(n, 3)
         bias = self.robot.data.encoder_bias
+        if bias.shape[-1] != self._n_body:
+            bias = bias[:, self._body_mask]
         xi = torch.cat([friction.reshape(n, 1), bias, com], dim=-1)
         assert xi.shape == (n, XI_DIM)
         return xi.clone()

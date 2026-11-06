@@ -50,7 +50,17 @@ class MultiClipMotionCommand(CommandTerm):
         )
         self.robot_root_body_index = self.robot.body_names.index(cfg.root_body_name)
 
+        # 43dof 资产的手 14 关节不参与参考/观测 ⇒ 只把 29 个身体关节的默认角交给库。
+        # 不滤就会在 `ref.joint_pos(29) - default_joint_pos(43)` 上炸（2026-10-29 实测）。
         default_joint_pos = self.robot.data.default_joint_pos[0].detach()
+        _mask = torch.tensor(
+            ["_hand_" not in n for n in self.robot.joint_names],
+            dtype=torch.bool, device=default_joint_pos.device,
+        )
+        self._body_joint_mask = _mask          # True = 身体关节（29），False = 手（14）
+        self._n_robot_joints = int(_mask.numel())
+        if int(_mask.sum()) < default_joint_pos.numel():
+            default_joint_pos = default_joint_pos[_mask]
         self.library = MotionLibrary(
             cfg.npz_files, cfg.body_names, default_joint_pos, device=self.device, bin_frames=cfg.bin_frames,
             compact=cfg.compact_library, store_dtype=torch.float16 if cfg.library_fp16 else torch.float32,
@@ -141,11 +151,13 @@ class MultiClipMotionCommand(CommandTerm):
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
-        return self.robot.data.joint_pos
+        q = self.robot.data.joint_pos
+        return q[:, self._body_joint_mask] if q.shape[-1] == self._n_robot_joints else q
 
     @property
     def robot_joint_vel(self) -> torch.Tensor:
-        return self.robot.data.joint_vel
+        dq = self.robot.data.joint_vel
+        return dq[:, self._body_joint_mask] if dq.shape[-1] == self._n_robot_joints else dq
 
     @property
     def robot_body_pos_w(self) -> torch.Tensor:
@@ -246,12 +258,48 @@ class MultiClipMotionCommand(CommandTerm):
 
     # ------------------------------------------------------------------ sampling
 
+    def _clip_speed_weights(self) -> torch.Tensor:
+        """每个 clip 的平均速度权重：`clamp(mean_speed/threshold, 1, max)`。
+
+        动机（2026-10-30）：318 语料 72% 的 clip 平均速度 <0.1 m/s，均匀采样会让"站着"
+        主导梯度；实测把 bones_seed 基座（路径比 1.51）微调到 0.34（走不动）。
+        按速度加权后"该走"的采样占比从 28% 提到约 50%，**不动奖励公式**。
+        """
+        try:
+            lib = self.library
+            nc = int(lib.num_clips)
+            starts = lib.clip_start[:nc].long()
+            lens = lib.clip_len[:nc].long()
+            k = 20                                  # 每 clip 均匀抽 20 帧估路径长
+            idx = torch.stack([torch.clamp(starts + (lens * j // k), max=int(lib.num_frames) - 1)
+                               for j in range(k)], 1)                       # (nc, k)
+            pos = lib.ref(idx.reshape(-1)).root_pos_w.reshape(nc, k, 3)
+            step = (pos[:, 1:] - pos[:, :-1]).norm(dim=-1).sum(-1)           # (nc,)
+            dur = (lens.float() / 50.0).clamp_min(1e-3)
+            spd = (step / dur).clamp(0.0, 3.0)                               # m/s
+            w = (spd / max(float(self.cfg.speed_threshold), 1e-6)).clamp(1.0,
+                                                                        float(self.cfg.speed_weight_max))
+            print(f"[sampling] speed-weighted: clip 平均速度 p50={float(spd.median()):.3f} "
+                  f"p90={float(spd.quantile(0.9)):.3f} m/s；权重均值={float(w.mean()):.2f}", flush=True)
+            return w
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sampling][warn] 速度权重计算失败（{type(exc).__name__}: {exc}）⇒ 退化为均匀",
+                  flush=True)
+            return torch.ones(int(self.library.num_clips))
+
     def _sample_frames(self, n: int) -> torch.Tensor:
         lib = self.library
         cfg = self.cfg
         if cfg.sampling_mode == "start":
             clips = torch.randint(0, lib.num_clips, (n,), device=self.device)
             return lib.clip_start[clips]
+        if cfg.sampling_mode == "speed":
+            if getattr(self, "_clip_w", None) is None:
+                self._clip_w = self._clip_speed_weights().to(self.device)
+            c = torch.multinomial(self._clip_w, n, replacement=True)
+            u = torch.rand(n, device=self.device)
+            f = lib.clip_start[c] + (u * (lib.clip_len[c] - 2).clamp_min(1).float()).long()
+            return torch.minimum(f, lib.last_frame_of(f) - 2).clamp_min(0)
         if cfg.sampling_mode == "uniform":
             # Uniform over frames (long clips get proportionally more starts), leaving >= 2 steps.
             f = torch.randint(0, lib.num_frames, (n,), device=self.device)
@@ -275,6 +323,14 @@ class MultiClipMotionCommand(CommandTerm):
 
     def _write_reference_state_to_sim(self, env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel):
         soft_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+        # 43dof：库只给 29 个身体关节 ⇒ 手 14 关节补默认角/零速，凑成 43 再写
+        if joint_pos.shape[-1] != soft_limits.shape[1]:
+            m = self._body_joint_mask.to(joint_pos.device)
+            full_q = self.robot.data.default_joint_pos[env_ids].clone()
+            full_dq = torch.zeros_like(full_q)
+            full_q[:, m] = joint_pos
+            full_dq[:, m] = joint_vel
+            joint_pos, joint_vel = full_q, full_dq
         joint_pos = torch.clip(joint_pos, soft_limits[:, :, 0], soft_limits[:, :, 1])
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
@@ -406,7 +462,11 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
     velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
     joint_position_range: tuple[float, float] = (0.0, 0.0)
-    sampling_mode: Literal["return", "uniform", "start"] = "return"
+    sampling_mode: Literal["return", "uniform", "start", "speed"] = "return"
+    # 2026-10-30：`speed` = 按 clip 平均速度加权采样（318 里 72% 是原地片段，
+    # 均匀/return 模式会让"站着"主导梯度，走路能力被微调抹掉：实测 1.51 → 0.34）。
+    speed_weight_max: float = 2.5     # 走路 clip 的最大权重（相对静止 clip 的 1.0）
+    speed_threshold: float = 0.10     # clip 平均速度超过它就按比例加权（m/s）
     # Return-based sampling (plan D14).
     uniform_ratio: float = 0.5
     hard_ratio: float = 0.4

@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Iterable, Sequence
 
@@ -141,3 +142,54 @@ class lora_disabled:
                 m.delta_scale = self._saved[i]
                 i += 1
         return False
+
+
+class LoRASnapshot:
+    """冻结一份 LoRA 权重（= 本轮起点 π_k），采样时临时换回来。
+
+    为什么需要（S3 信任域中心 = π_k）：
+        ``trust_center="prev"`` 的参照必须是"采集这一轮 B 数据时用的那个策略"。那一轮开始时
+        的 head 就是 π_k，所以只需在训练启动时**拷一份 LoRA**（A/B ≈ 33.6 M ≈ 0.13 GB），
+        之后每次取参照时临时换回、用完再换走。base 权重全程冻结、逐位不变，所以
+        "π_k = 底模 + 这份 LoRA" 严格成立。
+
+    为什么不用 ``deepcopy(head)``：
+        head 是 1.62 B（fp32 ≈ 6.5 GB），再拷一份直接把 48 GB 的卡吃穿；本轮可训的只有
+        LoRA。没有 LoRA（rank=0 全量训）时这里**明确报错**，不静默降级。
+    """
+
+    def __init__(self, root: nn.Module):
+        self.params: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for name, m in root.named_modules():
+            if isinstance(m, LoRALinear):
+                self.params[name] = (m.lora_A.detach().clone(), m.lora_B.detach().clone())
+        if not self.params:
+            raise RuntimeError(
+                "trust_center='prev' 需要 LoRA：没找到 LoRALinear。全量训 head 时没法只拷一份 "
+                "π_k（1.62 B ≈ 6.5 GB），请用 --lora-rank > 0，或改用 --trust-center label/base。"
+            )
+        self.layers = len(self.params)
+        self.numel = sum(t.numel() for ab in self.params.values() for t in ab)
+
+    @contextlib.contextmanager
+    def applied(self, root: nn.Module):
+        """上下文内把 ``root`` 的 LoRA 换成快照（= π_k），退出时逐位恢复。"""
+        saved: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for name, m in root.named_modules():
+            if name in self.params:
+                saved[name] = (m.lora_A.detach().clone(), m.lora_B.detach().clone())
+                a, b = self.params[name]
+                m.lora_A.data.copy_(a)
+                m.lora_B.data.copy_(b)
+        try:
+            yield self
+        finally:
+            for name, m in root.named_modules():
+                if name in saved:
+                    a, b = saved[name]
+                    m.lora_A.data.copy_(a)
+                    m.lora_B.data.copy_(b)
+
+    def summary(self) -> dict:
+        return {"layers": self.layers, "params": self.numel,
+                "mb": round(self.numel * 4 / 1e6, 1)}

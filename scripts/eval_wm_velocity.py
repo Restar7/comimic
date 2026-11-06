@@ -141,6 +141,9 @@ def main() -> int:
                 roll.setdefault(k, []).append(v)
 
     out = {
+        # A12：**必须**标数据源，防止把 OOD 的数当 in-dist 用（我在对话里就混淆过一次）
+        "data_source": f"recorded_npz(OOD): {a.npz_dir}",
+        "horizon_instrument": "one-step",
         "tag": a.tag or a.ckpt.name,
         "ckpt": str(a.ckpt),
         "wm_integration": getattr(bundle.wm, "explicit_integration", None) and "explicit_dt%g" % bundle.wm.dt or "residual",

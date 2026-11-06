@@ -1,7 +1,7 @@
 {
   "version": 1,
   "purpose": "HA 闭环推理锁死契约：场景/资产/机器人初始位姿/仿真参数/编解码器",
-  "created_utc": "2026-10-28T01:37:54+00:00",
+  "created_utc": "2026-11-03T19:46:00+00:00",
   "ha_root": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1",
   "robot_type": "unitree_g1_refpose_v3_1",
   "protocol": {
@@ -25,7 +25,7 @@
   },
   "runtime": {
     "script": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1/script/eval_scripts/sonic/sim_eval_vla.py",
-    "script_sha256": "c4f065be367cf7dc80a69442c8618ec34d16e0c135840f371fd37d416b036dbd",
+    "script_sha256": "9c2ee4a93fc3f751de09c1f5867bb0bc9e78b9c38c8cd29f32f35b00f2bae94d",
     "episode_batch_mode": "--episode_batch_json（单进程持久仿真，多集复用同一场景）"
   },
   "weights": {
@@ -43,9 +43,9 @@
       "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/runs/groot_sonic_vla_ha_b64_lr1e-5/checkpoint-8000"
     },
     "wbc_default": {
-      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/trackerlab-supermimic/logs/bones_seed_token_ha_v2/ckpt_010500_physint.pt",
-      "size": 54997012,
-      "sha256": "49f351f003b36fcd773093a4d3040c3c77b3df89beaecc43eeea1ef68632184b"
+      "path": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/runs/S1_handover/WBC_A24000_wmvel_cmd.pt",
+      "size": 54508539,
+      "sha256": "2390dc295b03f14429a63d6ea1ff78d2997a1419ee45a127977877a9ea2eadc7"
     }
   },
   "robot_usd": [

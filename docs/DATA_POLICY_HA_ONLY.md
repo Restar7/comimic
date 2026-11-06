@@ -126,3 +126,38 @@ ls data/npz/ha_tokens/*.npz | wc -l     # 期望 699
 | 自动接力 | `TRAIN_PID=1326602 bash scripts/a1_pipeline_after_train.sh`，日志 `logs/a1_after_train.log` |
 | 起点校验 | 重启后 `eval 0` 与第 1 轮逐位相同（token_mse 0.069364 / state_term 21.861635 / rollout_reward 0.014182 / hand_mse 0.756083）；step 100 loss -0.119617 vs 第 1 轮 -0.119618 |
 | 预计 | 4000 步 ≈ 2 h（≈1.8 s/step），随后自动 merge → `run_a1_ha_isaac.sh`（6 任务 × seeds 0/1/2） |
+
+---
+
+## 7. 例外：MuJoCo 路线（2026-10-28 经用户批准）
+
+> 本节**只对 MuJoCo/mjlab 后端生效**。§0 的两条铁律对 Isaac 主线继续原样有效。
+
+### 7.1 放开什么
+
+| 项 | 放开范围 | 边界 |
+|---|---|---|
+| WBC 权重 | `third_party/SuperMimic-Reproduced/logs/**/ckpt_*.pt`（mjlab 训练产物） | 只能在 mjlab 后端加载；**不得**喂给 `isaac_joint.load_isaac_bundle` |
+| 数据 | `data/npz/g1_tasks`（318 clips / 473,876 帧）及其派生 `data/library/ft318_*.pt` | 仍**禁止** `data/npz/mixed_ha_ft318`（混合库口径不可归因） |
+| 评测 | MuJoCo 闭环（`diff_vla_wbc/mujoco_env.py`、`closed_loop/`） | 结果必须标 `backend=mujoco`，**不得**与 Isaac 数字同表比较 |
+| 训练器 | `sm-train`（mjlab），条件 token 直读数据集标签 | 不改 upstream 语义（仅 `--data.tokens` 分流） |
+
+### 7.2 三条新铁律
+
+1. **两条线不许交叉喂 token**：MuJoCo 线的 token = 数据集录制标签（hold 空间），
+   Isaac 线 = 在线 hold builder + 实时 anchor。任何跨线加载权重/数据都必须先做接口对齐探针
+   （`docs/MUJOCO_MIGRATION_93OBS_20261028.md` §9 M0）。
+2. **产物必须带 `backend` 字段**：`runs/OFFICIAL_SUPERMIMIC_MJLAB.json` 记录 mjlab 底模，
+   Isaac 的 `runs/OFFICIAL_SUPERMIMIC.json` 保持不变。
+3. **`mixed_ha_ft318` 永久禁止**：混合库无法把收益归因到某一份数据。
+
+### 7.3 代码门禁的对应改动（M1 落地）
+
+| 入口 | 现状 | 例外后 |
+|---|---|---|
+| `scripts/train_joint.py` | `is_isaac_checkpoint` 硬拒 mjlab ckpt | 新增 `--backend {isaac,mjlab}`（默认 `isaac`）；`mjlab` 时走 `load_mjlab_bundle` |
+| `scripts/train_joint.py:60` | `_forbid_legacy_dataset` 禁 `g1_tasks` | `--backend mjlab` 时允许 `g1_tasks`，仍禁 `mixed*` |
+| `scripts/launch_joint_ha.sh` | 路径含 `ft318/g1_tasks` 直接 fail | Isaac 主线**不变**；mjlab 走新 launcher |
+
+> 本节由用户于 2026-10-28 口头批准（"解除"）。任何扩大范围（例如把 mjlab 权重接进 Isaac 评测）
+> 需要重新批准。

@@ -36,6 +36,7 @@ Isaac env, so the world model and the MDP consume it without any extra conversio
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import json
 import os
 from pathlib import Path
 import sys
@@ -67,6 +68,30 @@ ACTION_DIM = 29
 XI_DIM = 33
 STATE_DIM = 71
 HISTORY = 10
+
+
+def _huber_on_error(d: torch.Tensor, delta: float, d_max: float = 0.0) -> torch.Tensor:
+    """2026-11-03：对**误差距离** d（米/弧度）做 Huber，远端线性。
+
+    注意：``e_*`` 是平方误差，调用前先 ``sqrt``；不要对平方误差直接用 Huber
+    （那会把 delta 变成 m²，量级差一次方）。
+
+    ★ 2026-11-04 **奖励死区**（`d_max > 0` 时生效）：
+    把 d 夹到 ``d_max`` 之后再算 Huber ⇒ 超过死区后惩罚**恒为常数、梯度为 0**。
+    为什么需要（用户口径）：VLA 的状态里**没有 root 位置**（state46 = 29 关节 +
+    14 手 + 3 维重力），所以大范围的位置漂移它根本**看不见**，硬用"贴参考"的梯度
+    把它拉回来等于让它拟合噪声。小漂移（姿态级，0.01–0.05 rad）该拉，大漂移
+    （root 平移 >10–30 cm）不该硬拉 —— 那就是这条死区。
+    """
+    dd = float(delta)
+    if dd <= 0:
+        return d
+    dm = float(d_max or 0.0)
+    if dm > 0.0:
+        d = torch.clamp(d, max=dm)
+    return torch.where(d <= dd, 0.5 * d * d / dd, d - 0.5 * dd)
+
+
 OBS_TERM_DIMS_93 = (29, 29, 3, 3, 29)
 OBS_TERM_DIMS_99 = OBS_TERM_DIMS_93 + (6,)
 MAX_STEP_REWARD = float(MAX_STEP_REWARD)
@@ -338,9 +363,16 @@ class IsaacJointBundle:
         obs_dim = self.obs_width
         self.policy = Policy(obs_dim, self.token_dim, hist=self.hist,
                              num_joints=NUM_JOINTS, token_dim=self.token_dim)
-        self.wm = WorldModel(num_joints=NUM_JOINTS)
+        # ★ 2026-11-01：WM 结构由 ckpt 决定（``wm_arch`` 键 / 权重键名），不在这里写死 MLP。
+        #   否则训练出的 GRU ckpt（``gru.*/head.*``）在评估侧 load 会直接 Unexpected key(s)，
+        #   更糟的是有人用 strict=False 把它"糊"过去 —— 那样等于拿一个随机初始化的 WM 当裁判。
+        from diff_vla_wbc.wm_arch import build_wm_arch, detect_wm_arch  # noqa: PLC0415
+
+        self.wm_arch = detect_wm_arch(ck)
+        self.wm = build_wm_arch(self.wm_arch, num_joints=NUM_JOINTS)
         self.policy.load_state_dict(ck["pi"], strict=strict)
         self.wm.load_state_dict(ck["wm"], strict=strict)
+        print(f"[bundle] wm arch = {self.wm_arch}", flush=True)
         # 积分结构（2026-10-25）：官方 ckpt 是在"无 dt 耦合"的结构下训的，必须保持旧语义；
         # 校准过的 ckpt 带 ``wm_integration="explicit_dt0.02"`` → 打开显式物理积分
         # （位置/朝向/关节由 dt×速度推进，速度通道因此被位置误差隐式监督）。
@@ -420,6 +452,8 @@ class IsaacJointBundle:
                 # 结构开关必须一起存：否则下游从 joint_*.pt 加载时会静默退回残差结构
                 # （权重按显式积分训的，读成残差结构 = 静默跑偏）。
                 "wm_integration": str(getattr(self, "wm_integration", "residual")),
+                # WM 结构（只有非 mlp 才写，保持旧 ckpt 的键集合不变）
+                **({"wm_arch": str(self.wm_arch)} if str(getattr(self, "wm_arch", "mlp")) != "mlp" else {}),
                 **extra,
             },
             path,
@@ -430,10 +464,62 @@ class IsaacJointBundle:
         obs = split_flat_obs(obs_hist_flat, self.hist, self.term_dims)
         return self.policy(obs, cond)
 
-    def step(self, state: torch.Tensor, action: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
-        """One world-model step; ``state`` is in our flat layout ``(B, 71)``."""
+    def _w_calib_alpha(self, step_idx):
+        """逐视界的 root 角速度幅度标定 α_k（可选，默认关闭 = 1.0）。
+
+        为什么需要：L2 训练出的确定性 WM 会回归条件均值 ⇒ 角速度幅度系统性偏大
+        （实测 in-dist k=5 `root_w_ratio` **1.40**，即想象转速比真实快 40%）。
+        奖励里的 `yaw_rate` 项吃这个量，幅度偏 40% 就会把策略往"少转"推。
+
+        为什么不能"每步乘一个常数"：那会指数复利（α=1.10 时 k=20 放大 6.7 倍）。
+        所以用一张**按视界**的标定表 α_k，由 ``scripts/fit_wm_w_calib.py`` 在**独立标定集**上拟合，
+        通过环境变量 ``HA_WM_W_CALIB=<json>`` 挂载；未设置时完全不动（向后兼容）。
+        """
+        if step_idx is None:
+            return None
+        if not hasattr(self, "_wcal"):
+            self._wcal = None
+            _p = os.environ.get("HA_WM_W_CALIB", "")
+            if _p and Path(_p).exists():
+                try:
+                    _d = json.loads(Path(_p).read_text())
+                    _a = _d.get("gamma_w") or _d.get("alpha_w") or []
+                    self._wcal = [float(x) for x in _a] if _a else None
+                    if self._wcal:
+                        print(f"[wcalib] 已挂载 {_p}: α_1={self._wcal[1]:.3f} "
+                              f"α_5={self._wcal[min(5, len(self._wcal)-1)]:.3f} "
+                              f"α_H={self._wcal[-1]:.3f}", flush=True)
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[wcalib][warn] 读取 {_p} 失败: {_e}", flush=True)
+        if not self._wcal:
+            return None
+        k = min(int(step_idx), len(self._wcal) - 1)
+        return self._wcal[k]
+
+    def step(self, state: torch.Tensor, action: torch.Tensor, xi: torch.Tensor,
+             step_idx: int | None = None) -> torch.Tensor:
+        """One world-model step; ``state`` is in our flat layout ``(B, 71)``。
+
+        ``step_idx``（从 1 开始）用于可选的 root 角速度幅度标定（见 ``_w_calib_alpha``）。
+
+        ★ 2026-11-01（GRU 版）：``step_idx`` 同时是**隐状态的生命周期信号**——
+          * ``step_idx == 1`` ⇒ 新 rollout 开始，把隐状态清零（和训练窗口的 h=0 一致）；
+          * ``step_idx > 1``  ⇒ 延续上一步的隐状态（记忆）；
+          * ``step_idx is None`` ⇒ 单步调用，无记忆（与 MLP 行为完全一致，防串味）。
+        这样 ``imagine_with_tokens`` / ``eval_wm_multistep`` / 闭环 rollout 全都自动带记忆，
+        不需要每个调用点记得手动开合；而任何**不传** step_idx 的旧代码行为不变。
+        """
+        if str(getattr(self.wm, "arch", "mlp")) == "gru":
+            if step_idx is None:
+                self.wm.end_unroll()
+            elif int(step_idx) <= 1:
+                self.wm.begin_unroll(int(state.shape[0]), device=state.device,
+                                     dtype=state.dtype)
         S = flat_state_tuple(state)
         p1, R1, v1, w1, q1, qd1 = self.wm.step(S, action, normalize_xi(xi))
+        _al = self._w_calib_alpha(step_idx)
+        if _al is not None and abs(_al - 1.0) > 1e-9:
+            w1 = w1 * float(_al)
         return torch.cat((p1, mat_to_quat(R1), q1, v1, w1, qd1), dim=-1)
 
     # ------------------------------------------------------------------ analytic layer
@@ -459,46 +545,166 @@ class IsaacJointBundle:
         # ---- 2026-10-25 新增（默认关闭，SM/CLI 开关控制）-------------------------
         # reward_mode="linear"：把 6 个 exp(-e/std^2) 跟踪核换成线性的 -(e/std^2)，
         # 避免"误差小的时候核已经饱和到 1 -> reward 对 token 不敏感"（0.083/0.10）。
-        # posture_weight>0：加连续的姿态惩罚 -w*(relu(tilt-0.5)^2 + relu(0.6-height)^2)，
-        # 让"歪/快倒"在想象里也有梯度（世界模型的终止头几乎不触发）。
+        # ★ posture(tilt/height) 惩罚已按用户口径**删除**（见下）。
         _mode = str(getattr(self, "reward_mode", "saturating")).lower()
-        _pw = float(getattr(self, "posture_weight", 0.0) or 0.0)
+        _pw = 0.0        # 保留变量仅为兼容旧调用方；恒为 0，永不启用
         # reward_vel_scale（2026-10-26）：WM 的**速度通道**最不准（refresh 后 qd_corr≈0.64，
         # 位置/姿态是 7e-4）。速度项贡献给优化器的基本就是"模型误差方向"，可设 0 精确扣掉。
         # 注意：这里从 saturating 核里**精确减去**那两项（e_* 是原始误差，核 = w·exp(-e/std²)·dt），
         # 所以 _vs 在两种 reward_mode 下语义一致，且不会改评估口径以外的任何项。
         _vs = float(getattr(self, "reward_vel_scale", 1.0))
-        if _mode == "linear" or _pw > 0:
+        if _mode in ("linear", "huber", "huber_err") or _pw > 0:
             c = self.mdp.cfg
             dt = 0.02  # CONTROL_DT；与 mdp.reward 内部的乘数一致
             if _mode == "linear":
                 r_lin = -(
                     c.w_body_pos * terms["e_body_pos"] / (c.body_pos_std ** 2)
                     + c.w_body_ori * terms["e_body_ori"] / (c.body_ori_std ** 2)
-                    + c.w_body_linvel * terms["e_body_linvel"] / (c.body_linvel_std ** 2)
-                    + c.w_body_angvel * terms["e_body_angvel"] / (c.body_angvel_std ** 2)
+                    + _vs * c.w_body_linvel * terms["e_body_linvel"] / (c.body_linvel_std ** 2)
+                    + _vs * c.w_body_angvel * terms["e_body_angvel"] / (c.body_angvel_std ** 2)
                     + c.w_root_pos * terms["e_root_pos"] / (c.root_pos_std ** 2)
                     + c.w_root_ori * terms["e_root_ori"] / (c.root_ori_std ** 2)
                 ) * dt
-                r = r_lin + (r - terms["track"] * dt)   # 保留 action_rate / joint_limit 惩罚
-            if _pw > 0:
-                # state 平铺：p(3) + quat wxyz(4) + q(29) + v(3) + w(3) + qd(29)
-                p_z = state[..., 2]
-                quat = state[..., 3:7]
-                import torch as _t
-                # up_alignment = R[2,2] = 1 - 2(x^2 + y^2)
-                x, y = quat[..., 1], quat[..., 2]
-                up = 1 - 2 * (x * x + y * y)
-                tilt = _t.acos(up.clamp(-1.0, 1.0))
-                posture = (_t.relu(tilt - 0.5) ** 2 + _t.relu(0.6 - p_z) ** 2).mean()
-                r = r - _pw * posture * dt
-                out["posture_penalty"] = posture.detach()
-        if _vs != 1.0:
+                r = r_lin + (r - terms["track"] * dt)
+            elif _mode == "huber":
+                # 2026-11-02：cm 级 Huber 主项（用实测漂移定尺度）
+                #   h(e) = 0.5 e^2/δ (e<=δ) | e-0.5δ (e>δ)，e 先按 cap 截断
+                #   根位置项用 Huber，其余项沿用线性口径；δ/cap 由 HUBER_DELTA/HUBER_CAP 控制
+                _hd = float(getattr(self, "huber_delta", 0.02))
+                _hc = float(getattr(self, "huber_cap", 0.15))
+                _er = terms["e_root_pos"].clamp(max=_hc)
+                _h = torch.where(_er <= _hd, 0.5 * _er * _er / _hd, _er - 0.5 * _hd)
+                r_hub = -(
+                    c.w_body_pos * terms["e_body_pos"] / (c.body_pos_std ** 2)
+                    + c.w_body_ori * terms["e_body_ori"] / (c.body_ori_std ** 2)
+                    + _vs * c.w_body_linvel * terms["e_body_linvel"] / (c.body_linvel_std ** 2)
+                    + _vs * c.w_body_angvel * terms["e_body_angvel"] / (c.body_angvel_std ** 2)
+                    + c.w_root_pos * _h / (c.root_pos_std ** 2)
+                    + c.w_root_ori * terms["e_root_ori"] / (c.root_ori_std ** 2)
+                ) * dt
+                r = r_hub + (r - terms["track"] * dt)
+                out["huber_root"] = _h.detach()
+            elif _mode == "huber_err":
+                # 2026-11-03：对**误差距离** d=sqrt(e) 做 Huber（远端线性）
+                #   目标 mm 级；大误差梯度=1（不随误差增长），小误差二次。
+                #   速度项不在此分支（新线 REWARD_VEL_SCALE=0）。
+                _dp = float(getattr(self, "huber_err_delta_pos", 0.05))
+                _do = float(getattr(self, "huber_err_delta_ori", 0.05))
+                _d_bp = torch.sqrt(terms["e_body_pos"].clamp_min(0.0))
+                _d_bo = torch.sqrt(terms["e_body_ori"].clamp_min(0.0))
+                _d_rp = torch.sqrt(terms["e_root_pos"].clamp_min(0.0))
+                _d_ro = torch.sqrt(terms["e_root_ori"].clamp_min(0.0))
+                _dmx = float(getattr(self, "huber_err_d_max", 0.0) or 0.0)
+                r_he = -(
+                    c.w_body_pos * _huber_on_error(_d_bp, _dp, _dmx)
+                    + c.w_body_ori * _huber_on_error(_d_bo, _do, _dmx)
+                    + c.w_root_pos * _huber_on_error(_d_rp, _dp, _dmx)
+                    + c.w_root_ori * _huber_on_error(_d_ro, _do, _dmx)
+                ) * dt
+                # ★★ 2026-11-05 真缺口：`huber_err` 分支**完全没有速度项**（旧注释写着
+                #   "速度项不在此分支"）⇒ 奖励只看得见"偏了多少"，看不见"走得多快"。
+                #   而 base 的症结恰恰是**平均速度只有录制的 1/2**（0.050 vs 0.102 m/s）：
+                #   这个亏欠在 H=20（0.4 s）里只积累 2.1 cm（≈ WM 自身误差），速度却是**即时**可见的。
+                #   ⇒ 打开 `REWARD_VEL_SCALE`（默认 0，行为不变）即可给"走快些"供梯度，
+                #   而且**不需要拉长视界**（因此不会与部署 2.5 Hz / 每 20 步重规划的口径冲突）。
+                if _vs != 0.0:
+                    _dv = float(getattr(self, "huber_err_delta_vel", 0.05))
+                    _d_bv = torch.sqrt(terms["e_body_linvel"].clamp_min(0.0))
+                    _d_bw = torch.sqrt(terms["e_body_angvel"].clamp_min(0.0))
+                    r_vel = -(
+                        c.w_body_linvel * _huber_on_error(_d_bv, _dv, _dmx)
+                        + c.w_body_angvel * _huber_on_error(_d_bw, _dv, _dmx)
+                    ) * dt
+                    r_he = r_he + _vs * r_vel
+                    out["huber_err_linvel"] = _huber_on_error(_d_bv, _dv).detach()
+                    out["huber_err_angvel"] = _huber_on_error(_d_bw, _dv).detach()
+                r = r_he + (r - terms["track"] * dt)
+                out["huber_err_root"] = _huber_on_error(_d_rp, _dp).detach()
+            # ★ 2026-10-30 用户口径：**tilt / height 惩罚一律不要**（这里原来有一段
+            #   `-w*(relu(tilt-0.5)^2 + relu(0.6-height)^2)` 的 posture 惩罚，已删除）。
+            #   理由（用户侧实测）：它惩罚的是"绝对歪/绝对低"，会与参考动作本身的倾身/下蹲打架，
+            #   而且 `acos` 在完美跟踪处导数发散（NaN 源）。摔倒这件事由
+            #   `mdp.soft_termination` 的终止头和 root_pos/tilt 的**相对跟踪**尾部承担。
+        if _vs != 1.0 and _mode == "saturating":
             c = self.mdp.cfg
             _sub = (c.w_body_linvel * torch.exp(-terms["e_body_linvel"] / c.body_linvel_std ** 2)
                     + c.w_body_angvel * torch.exp(-terms["e_body_angvel"] / c.body_angvel_std ** 2)) * 0.02
             r = r - (1.0 - _vs) * _sub
             out["vel_dropped"] = _sub.detach()
+
+        # ---- 2026-10-30：对标 mjlab FULL_ARCH §6.4/§6.5 的奖励形状 ----------------
+        # (a) root_ori_mode="split"：把单块 root 朝向拆成 tilt / yaw / yaw_rate。
+        #     原因：SONIC token 按定义 yaw-相对，官方 VLA 路径没有 anchor 输入 ⇒ 绝对 yaw
+        #     只能从相机猜（token→yaw R²=0.226）。实测 ori 误差 10.24° 里约 7.5° 是 yaw
+        #     —— **架构上拿不到**，满权重喂给优化器只会制造一个不可学的常数项。
+        #     拆分后按可观测性配权重：tilt 1.0 / yaw 0.2 / yaw_rate 0.3（合计 1.5）。
+        # (b) tail_weight>0：加 hinge 尾部（位置 0.35 m / 倾斜 20°，cap 见 reward_shape）。
+        #     原因：exp 核两端梯度都趋 0（>0.4 m 的 21.2% 时刻只提供 0.22% 的位置梯度）
+        #     ⇒ 纯 exp 目标会"拿尾部换中位"：中位变好、p90 翻 2.4 倍。
+        _orimode = str(getattr(self, "root_ori_mode", "mono")).lower()
+        _lam_tail = float(getattr(self, "tail_weight", 0.0) or 0.0)
+        if _orimode != "mono" or _lam_tail > 0.0:
+            from .reward_shape import ROOT_POS_CAP, ROOT_POS_THR, hinge_tail, ori_split_reward  # noqa: PLC0415
+
+            _dt = 0.02
+            _ref = self.ref_state_at(reference.f)
+            if _orimode == "split":
+                c = self.mdp.cfg
+                _old_ori = c.w_root_ori * torch.exp(-terms["e_root_ori"] / c.root_ori_std ** 2) * _dt
+                # ★ 2026-10-31：yaw_rate 权重允许**按轮覆盖**（bundle.yawrate_weight）。
+                #   为什么可以"gate 之后再决定"：奖励只在 stage7(joint) 的**想象 rollout** 里
+                #   使用，而 gate 在 stage6 ⇒ 时间上完全来得及（见 s3_pipeline 的 joint 前置判定）。
+                _wyr = getattr(self, "yawrate_weight", None)
+                # ★ 2026-10-31（AB6）：远场 hinge 的 λ 也可按轮覆盖（0 = 关掉远场补偿）。
+                _yl = getattr(self, "yaw_hinge_lambda", None)
+                _kw = {}
+                if _wyr is not None:
+                    _kw["w_yawrate"] = float(_wyr)
+                if _yl is not None:
+                    _kw["hinge_lambda"] = float(_yl)
+                _r_ori, _oterms = ori_split_reward(state, _ref, **_kw)
+                r = r - _old_ori + _r_ori * _dt
+                out.update(_oterms)
+                out["root_ori_removed"] = _old_ori.detach()
+            elif _orimode == "split_huber":
+                # 2026-11-03：split 的 Huber 版（tilt 1.0 / yaw 0.2 / yaw_rate 0.3）
+                #   只支持 reward_mode=huber_err（_old_ori 必须与 mono 项一致）
+                from .reward_shape import tilt_yaw_yawrate_err  # noqa: PLC0415
+                if _mode != "huber_err":
+                    raise ValueError("root_ori_mode=split_huber 只支持 reward_mode=huber_err")
+                c = self.mdp.cfg
+                _do = float(getattr(self, "huber_err_delta_ori", 0.05))
+                _e = tilt_yaw_yawrate_err(state, _ref)
+                _d_tilt = torch.sqrt(_e["tilt2"].clamp_min(0.0))
+                _d_yaw = _e["dyaw"].abs()
+                _d_yawrate = torch.sqrt(_e["yawrate2"].clamp_min(0.0))
+                _w_t, _w_y, _w_r = 1.0, 0.2, 0.3
+                _dmx_o = float(getattr(self, "huber_err_d_max", 0.0) or 0.0)
+                _r_ori = -(_w_t * _huber_on_error(_d_tilt, _do, _dmx_o)
+                           + _w_y * _huber_on_error(_d_yaw, _do, _dmx_o)
+                           + _w_r * _huber_on_error(_d_yawrate, _do, _dmx_o))
+                _old_ori = c.w_root_ori * _huber_on_error(
+                    torch.sqrt(terms["e_root_ori"].clamp_min(0.0)), _do, _dmx_o) * _dt
+                r = r - _old_ori + _r_ori * _dt
+                out["root_ori_removed"] = _old_ori.detach()
+                out["ori_split_huber"] = _r_ori.detach()
+            if _lam_tail > 0.0:
+                # ★ 2026-10-31（e2）：`clamp(max=cap)` 越过上限后惩罚是常数、梯度恰为 0，
+                #   等于把"烂到没边"的远场整段扔掉（B 线 52% 的时刻在 0.5 m 以外）。
+                #   tail_cap_slope>0 时越过 cap 仍保留该斜率；0 保持旧行为（与 d1–d2b 对拍）。
+                _slope = float(getattr(self, "tail_cap_slope", 0.0) or 0.0)
+                # ★ 2026-11-01（E=1.0 标定）：根位置 hinge 的阈值/上限必须能按轮覆盖；
+                #   旧版写死 reward_shape.ROOT_POS_THR/CAP，5 轮共用一个 e_h，课程无法联动。
+                _tpt = getattr(self, "tail_pos_thr", None)
+                _tpc = getattr(self, "tail_pos_cap", None)
+                _tail, _tterms = hinge_tail(
+                    state, _ref,
+                    pos_thr=float(_tpt) if _tpt is not None else ROOT_POS_THR,
+                    pos_cap=float(_tpc) if _tpc is not None else ROOT_POS_CAP,
+                    cap_slope=_slope,
+                )
+                r = r - _lam_tail * _tail * _dt
+                out.update(_tterms)
         out["total"] = r
         return out
 
@@ -510,6 +716,33 @@ class IsaacJointBundle:
 
     def flatten_history(self, history: torch.Tensor) -> torch.Tensor:
         return flatten_term_major(history, self.term_dims)
+
+    # ------------------------------------------------------------------ backend-agnostic hooks
+    # 下面 4 个方法是给 `burnin` / `data` 用的**后端无关**接口（mjlab 版同名实现见
+    # `diff_vla_wbc.mjlab_joint`）。加它们是为了让 burnin 不再写死 trackerlab 的库布局。
+    def default_xi(self, batch: int, device) -> torch.Tensor:
+        return default_xi(batch, device)
+
+    def clip_start_of(self, frames: torch.Tensor) -> torch.Tensor:
+        motion = self.motion
+        return motion.clip_start[motion.clip_id[frames]].to(frames.device)
+
+    def ref_state_at(self, frames: torch.Tensor) -> torch.Tensor:
+        """库帧 → 扁平 71 状态（trackerlab canonical 布局）。v3 的 ``_ref_states`` 用它。"""
+        motion = self.motion
+        return canonical_to_flat(motion.ref[frames.to(motion.ref.device)].float())
+
+    def ref_joint_pos(self, frames: torch.Tensor) -> torch.Tensor:
+        """库里的 29 维关节位置（trackerlab canonical 布局里从 13 开始）。"""
+        motion = self.motion
+        return motion.ref[frames.to(motion.ref.device), 13 : 13 + NUM_JOINTS].float()
+
+    def obs_from_states(self, states_flat: torch.Tensor, actions: torch.Tensor,
+                        xi: torch.Tensor, frames: torch.Tensor | None = None) -> torch.Tensor:
+        """扁平 71 状态 + 动作 + xi → 每帧观测（99 维）；``frames`` 供 relative_ori99 用。"""
+        if frames is None:
+            raise ValueError("the Isaac observation needs `frames` (relative_ori99 reads the ref)")
+        return self.mdp.obs(flat_state_tuple(states_flat), actions, xi, frames)
 
     # ------------------------------------------------------------------ data helpers
     def reference_start(self, library, frames: torch.Tensor, *, history: int = HISTORY, xi=None):

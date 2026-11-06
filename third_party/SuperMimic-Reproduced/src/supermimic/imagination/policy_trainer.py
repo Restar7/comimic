@@ -35,6 +35,12 @@ class PolicyTrainerCfg:
     obs_noise: bool = True
     compile: str | None = "default"
     anchor_obs: bool = False  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
+    # 2026-10-30：**锚到基座策略**（防灾难性遗忘）。实测从干净基座微调到 318 时，
+    # 路径比在 **500 步内**从 1.51 塌到 0.35 并再也不恢复 —— 走路能力被"站着"这个
+    # 局部最优直接吃掉。这里加一个参数空间的 L2 锚（proximal 正则）：
+    #   loss += anchor_l2 * Σ‖θ − θ_base‖²
+    # 它不改变奖励公式、也不改变参考，只阻止策略跑离基座太远。
+    anchor_l2: float = 0.0
 
 
 class PolicyTrainer:
@@ -46,6 +52,9 @@ class PolicyTrainer:
         from supermimic.imagination.compiled import ImagStep
 
         self.step_fn = ImagStep(wm, lib.default_joint_pos, compile_mode=cfg.compile)
+        # 锚到"训练开始时"的策略参数（= resume 的基座）
+        self._base_params = ([p.detach().clone() for p in policy.parameters()]
+                             if float(getattr(cfg, "anchor_l2", 0.0)) > 0 else None)
 
     def set_lr(self, lr: float) -> None:
         for g in self.opt.param_groups:
@@ -74,6 +83,11 @@ class PolicyTrainer:
             v_H = None
         J = policy_objective(ro, v_H, cfg.gamma)
         loss = -J / cfg.horizon
+        _anchor = 0.0
+        if getattr(cfg, "anchor_l2", 0.0) > 0 and self._base_params is not None:
+            _reg = sum(((p - q) ** 2).sum() for p, q in zip(self.policy.parameters(), self._base_params))
+            loss = loss + cfg.anchor_l2 * _reg
+            _anchor = float(_reg.detach())
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         allreduce_grads(self.policy)
@@ -91,6 +105,7 @@ class PolicyTrainer:
             "imag_dhat_mean": float(ro.dhat[1:].mean().detach()),
             "policy_grad_norm": float(gn),
             "action_abs_mean": float(ro.actions.abs().mean().detach()),
+            "anchor_l2_reg": _anchor,
         }
         for k, v in ro.reward_terms.items():
             metrics[f"imag_r/{k}"] = v
