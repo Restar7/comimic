@@ -80,7 +80,7 @@ export HA_VLA_EXEC_STEPS=20          # receding horizon = 训练 H=20
 export SONIC_DEBUG_DUMP=$DUMP
 T0=$SECONDS
 TASK=$TASK MAX_STEPS=$MAX_STEPS SEED=$SEED REPEAT=0 ISAAC_GPU=$GPU \
-  SERVER_URL=http://127.0.0.1:$PORT OUT_ROOT=$OUT RECORD_VIDEO=0 \
+  SERVER_URL=http://127.0.0.1:$PORT OUT_ROOT=$OUT RECORD_VIDEO=${RECORD_VIDEO:-0} \
   EXTRA_ARGS="--step_log_every_n 20" \
   bash scripts/ha_isaac_closedloop.sh > "$DLOG" 2>&1
 RC=$?
