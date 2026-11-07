@@ -150,4 +150,43 @@ class TemporalDeltaActorV5(nn.Module):
                 dict(params=head, lr=float(head_lr), name="head")]
 
 
-__all__ = ["TemporalActorCfg", "TemporalDeltaActorV5", "HIST_DIM"]
+class PositionTemplateActor(nn.Module):
+    """**逐帧位置常量模板** `c_t (T,64)`（不看任何输入）——规范里的"防伪对照" A2。
+
+    用途：v5 的验收要求"条件化 Actor 必须打赢逐帧常量模板"（§11 "学成常量 ⇒ FAIL"）。
+    这个臂与 `TemporalDeltaActorV5` **共享同一套 cap/mask/优化器/数据**，唯一区别是
+    `u_t` 完全不依赖输入。
+    """
+
+    def __init__(self, chunk_len: int = 40, tok_dim: int = TOKEN_DIM, cap: float = 0.08,
+                 init_std: float = 4e-4):
+        super().__init__()
+        self.chunk_len = int(chunk_len)
+        self.tok_dim = int(tok_dim)
+        self.cap = float(cap)
+        self.d_in = 0          # 常量模板没有输入拼接（日志/报表兼容）
+        self.template = nn.Parameter(torch.zeros(int(chunk_len), int(tok_dim)))
+        if float(init_std) > 0:
+            nn.init.normal_(self.template, std=float(init_std))
+
+    def forward(self, Z: torch.Tensor, state64: torch.Tensor | None = None,
+                hist: torch.Tensor | None = None, mask: torch.Tensor | None = None,
+                *, cap: float | None = None,
+                return_raw: bool = False) -> torch.Tensor:
+        B, T = int(Z.shape[0]), int(Z.shape[1])
+        if T > self.chunk_len:
+            raise ValueError(f"[v5/pos-template] T={T} > chunk_len={self.chunk_len}")
+        u = self.template[:T][None].expand(B, -1, -1)
+        d = apply_norm_cap(u, float(self.cap if cap is None else cap))
+        if mask is not None:
+            d = d * mask[..., None].to(d.dtype)
+        if return_raw:
+            return d, u
+        return d
+
+    @property
+    def n_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+__all__ = ["HIST_DIM", "PositionTemplateActor", "TemporalActorCfg", "TemporalDeltaActorV5"]

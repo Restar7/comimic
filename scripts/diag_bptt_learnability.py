@@ -219,7 +219,9 @@ def start_weights(env: Env, delta: float) -> torch.Tensor:
 
 
 def eligible_start_mask(env: Env, *, horizon: int, drift: float = 0.10,
-                        h_tail: int = 0, min_frame: int = 10) -> tuple[torch.Tensor, dict]:
+                        h_tail: int = 0, min_frame: int = 10,
+                        allowed_clips: set[int] | None = None,
+                        ) -> tuple[torch.Tensor, dict]:
     """**可作 rollout 起点**的 0/1 权重（规范 §3.1 + §3.4），供 on-the-fly `multinomial` 用。
 
     约束（缺一不可）：
@@ -228,7 +230,9 @@ def eligible_start_mask(env: Env, *, horizon: int, drift: float = 0.10,
       * ``f ≥ 10``：`history` 需要前 10 帧；
       * ``f + H + H_tail ≤ clip_end``：尾部参考帧必须真实存在（否则 `teacher_references`
         会把它们 clamp 成重复帧 ⇒ 尾部价值退化成常数）；
-      * 由此 ``f..f+H`` 必然落在**同一个 clip** 内（帧在 clip 内连续）。
+      * 由此 ``f..f+H`` 必然落在**同一个 clip** 内（帧在 clip 内连续）；
+      * ``allowed_clips`` 给定时只允许这些 clip 的帧（**防 val/test 泄漏**：
+        评测集按 clip 分组切分，训练采样必须只取 train clips）。
     """
     w0 = start_weights(env, float(drift))
     lib = env.lib
@@ -240,13 +244,21 @@ def eligible_start_mask(env: Env, *, horizon: int, drift: float = 0.10,
     ok = (w0 > 0)
     ok[: int(min_frame)] = False
     ok &= (ar + int(horizon) + int(h_tail) <= end)
+    n_before_clip = int(ok.sum())
+    if allowed_clips is not None:
+        allow = torch.zeros(n, dtype=torch.bool)
+        _ids = torch.tensor(sorted(int(c) for c in allowed_clips), dtype=torch.long)
+        allow[_ids] = True
+        ok &= allow[cid]
     w = torch.zeros(n, dtype=torch.float32)
     w[ok] = 1.0
     info = dict(
         n_frames=n, n_eligible=int(ok.sum()), n_drift_eligible=int((w0 > 0).sum()),
         horizon=int(horizon), h_tail=int(h_tail), drift=float(drift), min_frame=int(min_frame),
         uniform_over_eligible=True,
-        eligible_per_clip=int(ok.sum().item()),
+        n_eligible_before_clip_filter=int(n_before_clip),
+        n_allowed_clips=(None if allowed_clips is None else int(len(allowed_clips))),
+        clip_filter="none" if allowed_clips is None else "only train clips (no val/test leak)",
     )
     return w, info
 

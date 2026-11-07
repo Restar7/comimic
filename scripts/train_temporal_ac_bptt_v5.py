@@ -67,7 +67,7 @@ from diff_vla_wbc.delta_token_io_v5 import (                # noqa: E402
     DeltaTokenSpecV5, hist10_from_hist64, save_temporal_actor_v5,
     spec_v5_from_actor, with_meta)
 from diff_vla_wbc.delta_token_temporal_v5 import (          # noqa: E402
-    HIST_DIM, TemporalActorCfg, TemporalDeltaActorV5)
+    HIST_DIM, PositionTemplateActor, TemporalActorCfg, TemporalDeltaActorV5)
 from diff_vla_wbc.imagined_value_v5 import (                # noqa: E402
     CriticBatch, CriticCfgV5, CriticFeatureAdapter, ValueReadinessGate,
     bootstrap_identifiable, build_value_net, ema_update, mc_returns, td_lambda_targets)
@@ -139,6 +139,14 @@ class FrozenParamCtx:
         return False
 
 
+def pooled_rms(e: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """``(B,H,29)`` 误差在 mask 上的**池化** RMS（rad）。"""
+    m = m.float()
+    num = (e.pow(2).sum(-1) * m).sum()
+    den = (29.0 * m.sum()).clamp_min(1e-8)
+    return (num / den).clamp_min(0.0).sqrt()
+
+
 def masked_return(env, batch: dict, H: int):
     """`J`（折扣 WM 想象回报）+ rollout（与 `diag.window_returns` 同一实现）。"""
     return d03.window_returns(env.bundle, batch, H, GAMMA, want_actions=True)
@@ -153,9 +161,28 @@ class OnTheFlySource:
         self.args = args
         self.H = int(args.horizon)
         self.dev = env.device
+        # ★ 防泄漏：训练采样只允许评测集的 **train clips**（val/test 的 clip 一帧都不取）
+        allowed = None
+        if args.eval_set is not None:
+            _meta = json.loads((Path(args.eval_set) / "windows_meta.json").read_text())
+            _train_names = list(_meta.get("train_clips") or [])
+            if not _train_names:
+                raise SystemExit("[v5][fail-closed] eval_set 的 windows_meta 没有 train_clips，"
+                                 "无法保证训练不泄漏 val/test clip")
+            _cid, _names = d03.clip_groups(env.lib)
+            _name2cid = {str(nm): i for i, nm in enumerate(_names)}
+            missing = [nm for nm in _train_names if nm not in _name2cid]
+            if missing:
+                raise SystemExit(f"[v5][fail-closed] eval_set 的 train_clips 有 {len(missing)} 个"
+                                 f"对不上 motion library 的 clip 名（例：{missing[:3]}）")
+            allowed = {_name2cid[nm] for nm in _train_names}
+            if len(allowed) != len(_train_names):
+                raise SystemExit("[v5][fail-closed] clip 名映射后数量不一致")
         self.w, self.info = d03.eligible_start_mask(
             env, horizon=self.H, drift=float(args.start_max_drift),
-            h_tail=int(args.beta_h_tail), min_frame=10)
+            h_tail=int(args.beta_h_tail), min_frame=10, allowed_clips=allowed)
+        if allowed is not None and int(self.info["n_eligible"]) <= 0:
+            raise SystemExit("[v5] train-clip 过滤后没有合格起点")
         if int(self.info["n_eligible"]) <= 0:
             raise SystemExit("[v5] 合格起点为 0，检查 ref_drift_lib / real_transitions")
         self.gen = torch.Generator(device="cpu").manual_seed(int(seed) + 7919)
@@ -237,6 +264,48 @@ class CachedPoolSource:
         b["idx"] = idx
         b["frames"] = w.frames
         return b
+
+
+# --------------------------------------------------------------------------- 条件化验收
+@torch.no_grad()
+def conditional_check(env, ws, actor, *, H: int, cap: float, use_history: bool,
+                      mask_full: torch.Tensor, batch: int = 48) -> dict:
+    """规范 §11 "学成常量 ⇒ FAIL" 的**在线门禁**：Δ 的窗口/帧间差异 + 输入 shuffle 敏感性。
+
+    判据（建议，写入报告）：`cos(shuffle_z) < 0.9` 且 `delta_std_across_windows > 1e-4`
+    且 `frame_to_frame_std > 1e-4`。history 的 cosine 不强求（历史可能确实没有额外信息）。
+    """
+    dev = env.device
+    w = ws.index(slice(0, min(int(batch), len(ws))))
+    b = w.to(dev, H)
+    B = len(w)
+    hist = w.history[:, :, :HIST_DIM].contiguous().to(dev) if use_history else None
+    m = mask_full[None, :].expand(B, -1)
+    d = actor(b["tokens"], b["state64"], hist, m, cap=float(cap))
+    g = torch.Generator().manual_seed(0)
+    perm = torch.randperm(B, generator=g)
+    res = dict(
+        delta_std_across_windows=float(d.std(0).mean()),
+        delta_mean_norm=float(d.norm(dim=-1).mean()),
+        frame_to_frame_std=float((d - d.mean(1, keepdim=True)).std(1).mean()),
+    )
+    variants = {
+        "shuffle_z": (b["tokens"][perm], b["state64"], hist),
+        "shuffle_state": (b["tokens"], b["state64"][perm], hist),
+        "shuffle_hist": (b["tokens"], b["state64"],
+                         None if hist is None else hist[perm]),
+        "zero_all": (torch.zeros_like(b["tokens"]), torch.zeros_like(b["state64"]),
+                     None if hist is None else torch.zeros_like(hist)),
+    }
+    for name, (z_, s_, h_) in variants.items():
+        d2 = actor(z_, s_, h_, m, cap=float(cap))
+        res[f"cos_{name}"] = float(torch.nn.functional.cosine_similarity(
+            d2.flatten(1), d.flatten(1), dim=1).mean())
+        res[f"maxdiff_{name}"] = float((d2 - d).abs().max())
+    res["passed"] = bool(res["cos_shuffle_z"] < 0.9
+                         and res["delta_std_across_windows"] > 1e-4
+                         and res["frame_to_frame_std"] > 1e-4)
+    return res
 
 
 # --------------------------------------------------------------------------- 评测
@@ -327,6 +396,16 @@ def main() -> int:  # noqa: C901
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--warmup-updates", type=int, default=50)
     ap.add_argument("--use-history", type=int, default=1)
+    ap.add_argument("--actor-kind", default="temporal", choices=["temporal", "pos_template"],
+                    help="temporal=v5 条件化 Actor；pos_template=逐帧常量模板（防伪对照 A2）")
+    ap.add_argument("--lambda-raw", type=float, default=0.0,
+                    help="未 cap 范数 hinge 权重 L_raw=E[max(0,‖u‖/(κ·cap)-1)²]（防 tanh 饱和）")
+    ap.add_argument("--raw-norm-kappa", type=float, default=2.0, help="κ：目标 ‖u‖≤κ·cap")
+    ap.add_argument("--cond-check-every", type=int, default=0,
+                    help="每 N 步做一次条件化检查（Δ 方差 + shuffle 敏感性）；0=关")
+    ap.add_argument("--trust-mode", default="same_obs", choices=["same_obs", "traj"],
+                    help="动作 trust 的参照：same_obs=同一 SONIC obs 只换 token（规范原意）；"
+                         "traj=旧口径（两条 rollout 的动作差，混入轨迹差异）")
     # 损失
     ap.add_argument("--lambda-action", type=float, default=0.010)
     ap.add_argument("--tau-action", type=float, default=0.020, help="rad")
@@ -419,7 +498,11 @@ def main() -> int:  # noqa: C901
     mask_full[:K] = 1.0
     cfg = TemporalActorCfg(chunk_len=T_chunk, cap=float(a.cap),
                            use_history=bool(a.use_history))
-    actor = TemporalDeltaActorV5(cfg).to(dev)
+    if str(a.actor_kind) == "pos_template":
+        actor = PositionTemplateActor(chunk_len=T_chunk, cap=float(a.cap),
+                                      init_std=float(cfg.init_std)).to(dev)
+    else:
+        actor = TemporalDeltaActorV5(cfg).to(dev)
     d03.log(f"[v5] Actor {actor.n_params:,} 参数 d_in={actor.d_in} | T={T_chunk} K={K} H={H} "
             f"| history={'ON' if a.use_history else 'OFF'}")
 
@@ -575,7 +658,7 @@ def main() -> int:  # noqa: C901
         tokens = batch["tokens"].detach()
         hist10 = batch["hist10"] if a.use_history else None
         m = mask_full[None, :].expand(int(tokens.shape[0]), -1)
-        delta = actor(tokens, batch["state64"], hist10, m, cap=cap)
+        delta, raw_u = actor(tokens, batch["state64"], hist10, m, cap=cap, return_raw=True)
         _t.append(time.time())
         # Δ=0 的动作参照：**同起点、同 SONIC obs**，每步现算（规范 §7.1 注）
         with torch.no_grad():
@@ -584,15 +667,56 @@ def main() -> int:  # noqa: C901
                                           env.bundle.action_scale,
                                           extra0["actions"].float().permute(1, 0, 2))
         _t.append(time.time())
-        J, extra = masked_return(env, dict(batch, tokens=tokens + delta), H)
+        # ★ 同观测动作 trust（规范原意）：记录修正 rollout 每一步的 SONIC obs，
+        #   再用**同一 obs + 基础 token** 解一次 action 作为参照 —— 只隔离"token 差异"的
+        #   直接动作影响，不混入两条 WM 轨迹未来状态不同造成的差异。
+        #   ⚠️ SonicIsaacBundle.act 是**类方法**（__setattr__ 会把赋值转发给 base，但读取仍走类），
+        #   所以只能拦**执行器级**的 `executor.act(token, obs93)` —— 它正好就是
+        #   "token + 观测 → 动作" 的接口，拦截后可以用同一份 obs93 换回基础 token 重解。
+        _recorded: list = []
+        _orig_exec_act = env.bundle.executor.act
+        if str(a.trust_mode) == "same_obs":
+            def _rec_act(token, obs93):
+                _recorded.append((token.detach(), obs93))
+                return _orig_exec_act(token, obs93)
+
+            env.bundle.executor.act = _rec_act
+        try:
+            J, extra = masked_return(env, dict(batch, tokens=tokens + delta), H)
+        finally:
+            if str(a.trust_mode) == "same_obs":
+                env.bundle.executor.act = _orig_exec_act
         q_corr = q_target_from_action(env.bundle.default_joint_pos,
                                       env.bundle.action_scale,
                                       extra["actions"].float().permute(1, 0, 2))
-        e = joint_error_rad(q_corr, q_base.detach())          # (B,H,29) rad
+        if str(a.trust_mode) == "same_obs":
+            if not _recorded:
+                raise SystemExit("[v5][fail-closed] same_obs trust 没拦到 executor.act 调用")
+            with torch.no_grad():
+                _base_rows = []
+                for _step_i, (_tok, _obs) in enumerate(_recorded[:H]):
+                    _a0 = _orig_exec_act(tokens[:, _step_i], _obs.detach())
+                    _base_rows.append(q_target_from_action(
+                        env.bundle.default_joint_pos, env.bundle.action_scale, _a0.float()))
+                q_base_same = torch.stack(_base_rows, dim=1)   # (B,H,29)
+            e = joint_error_rad(q_corr, q_base_same.detach())     # (B,H,29) rad（同观测）
+            e_traj = joint_error_rad(q_corr, q_base.detach())     # 旧口径，仅诊断
+            e_loss = e
+        else:
+            e = joint_error_rad(q_corr, q_base.detach())          # 旧口径（两轨迹）
+            e_traj = e
+            e_loss = e
         M_surv = extra["rollout"].survival[:H].permute(1, 0).detach()
-        L_act, act_rms = physical_action_trust(e, M_surv, tau=float(a.tau_action))
-        L_sm = smoothness_penalty(e, M_surv, tau=float(a.tau_action))
+        L_act, act_rms = physical_action_trust(e_loss, M_surv, tau=float(a.tau_action))
+        L_sm = smoothness_penalty(e_loss, M_surv, tau=float(a.tau_action))
         L_anc = anchor_penalty(delta, m, cap=float(cap))
+        # 未 cap 范数 hinge：把 ‖u‖ 按在 κ·cap 附近（避免 tanh 饱和后输入梯度 ~ cap/‖u‖）
+        _un = raw_u.norm(dim=-1)
+        if float(a.lambda_raw) > 0:
+            L_raw = (torch.relu(_un / (float(a.raw_norm_kappa) * float(cap)) - 1.0).pow(2)
+                     * m).sum() / m.sum()
+        else:
+            L_raw = delta.sum() * 0.0
         J_ac = J
         tail_val = 0.0
         if critic_enabled and beta > 0.0:
@@ -605,7 +729,8 @@ def main() -> int:  # noqa: C901
                     * extra["rollout"].survival[H].detach() * v_H)
             tail_val = float(v_H.detach().mean())
         loss = (-J_ac.mean() + float(a.lambda_action) * L_act
-                + float(a.lambda_smooth) * L_sm + float(a.lambda_anchor) * L_anc)
+                + float(a.lambda_smooth) * L_sm + float(a.lambda_anchor) * L_anc
+                + float(a.lambda_raw) * L_raw)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gsum = 0.0
@@ -656,6 +781,13 @@ def main() -> int:  # noqa: C901
                        J_ac=float(J_ac.mean()), tail=tail_val, beta=beta,
                        L_act=float(L_act), act_rms_mrad=float(act_rms.mean()) * 1e3,
                        L_smooth=float(L_sm), L_anchor=float(L_anc),
+                       L_raw=float(L_raw),
+                       act_rms_traj_mrad=float(pooled_rms(e_traj, M_surv)) * 1e3,
+                       u_norm_over_cap_p50=float((_un[:, :K] / float(cap)).median()),
+                       u_norm_over_cap_p95=float(torch.quantile(
+                           (_un[:, :K] / float(cap)).flatten(), 0.95)),
+                       frac_u_gt_2c=float((_un[:, :K] > 2.0 * float(cap)).float().mean()),
+                       frac_u_gt_3c=float((_un[:, :K] > 3.0 * float(cap)).float().mean()),
                        delta_norm=float(delta.norm(dim=-1)[:, :K].mean()),
                        burnin_reward=(float(batch["burnin_reward"].mean())
                                       if batch.get("burnin_reward") is not None else None),
@@ -671,6 +803,18 @@ def main() -> int:  # noqa: C901
                     f"beta={beta:.2f} ({row['s_per_step']:.1f}s/step) "
                     f"[data {row['t_data']:.1f}s base {row['t_base_roll']:.1f}s "
                     f"roll {row['t_roll']:.1f}s opt {row['t_opt']:.1f}s]")
+
+        if (val_set is not None and int(a.cond_check_every) > 0
+                and it % int(a.cond_check_every) == 0):
+            cc = conditional_check(env, val_set, actor, H=H, cap=float(a.cap),
+                                   use_history=bool(a.use_history), mask_full=mask_full,
+                                   batch=int(a.eval_batch))
+            _append_jsonl(a.out / "cond_check.jsonl", dict(update=it, **cc))
+            d03.log(f"[v5][cond] it={it} std_win={cc['delta_std_across_windows']:.2e} "
+                    f"std_t={cc['frame_to_frame_std']:.2e} "
+                    f"cosZ={cc['cos_shuffle_z']:.4f} cosS={cc['cos_shuffle_state']:.4f} "
+                    f"cosH={cc['cos_shuffle_hist']:.4f} "
+                    f"=> {'PASS' if cc['passed'] else 'FAIL_CONSTANT?'}")
 
         if val_set is not None and int(a.eval_every) > 0 and it % int(a.eval_every) == 0:
             v = eval_split(env, val_set, actor, H=H, cap=float(a.cap),
@@ -773,6 +917,14 @@ def _hist_spec(env, K: int, H: int, T: int = 40) -> DeltaTokenSpecV5:
 
 
 def _save_ckpt(path: Path, actor, env, a, K: int, H: int, T: int, *, extra: dict) -> None:
+    if str(getattr(a, "actor_kind", "temporal")) == "pos_template":
+        import torch as _t  # noqa: PLC0415
+        _payload = dict(actor_kind="pos_template", state=actor.state_dict(),
+                        chunk_len=int(T))
+        _payload.setdefault("cap", float(a.cap))
+        _payload.update(extra)
+        _t.save(_payload, str(path))
+        return
     spec = spec_v5_from_actor(
         actor, K=int(K), H=int(H),
         meta=dict(

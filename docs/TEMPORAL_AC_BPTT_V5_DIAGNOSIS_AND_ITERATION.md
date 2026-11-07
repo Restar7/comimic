@@ -255,8 +255,13 @@ PASS：‖Δ‖max=0.0712 ≤ cap=0.08，t≥K 恒 0，换序一致
 | `chunk_norm` | 4.65e-5 |
 | `pe_chunk` / `pe_pos` | 3.74e-5 / 3.78e-6 |
 
-⇒ 优化器只能学"最后一层的常数偏置/常数方向"，编码器几乎不动。
-而常数方向是训练早期的**噪声方向**（实测与 val 平均梯度 cos≈0.03），所以只拿到常数解的一小部分。
+⇒ 优化器只能学"常数方向"，编码器几乎不动。
+
+> **修正（审阅意见，2026-11-07）**：不能写成"最后一层 bias 不受 Cap 影响"——
+> 末层 bias 的梯度**同样**经过 Cap 的 Jacobian。更准确的原因是：
+> **公共方向能从所有窗口累积相似的梯度（相干叠加），而依赖 chunk/state/history 的差异性梯度
+> 更嘈杂、又要经过更长的网络链（encoder → 400 维拼接 → 3 层 MLP），因此常数解先占优**；
+> 一旦饱和，输入路径的梯度再被压小 ~80×，差异项就更追不上。
 
 ### 6.3 为什么 `‖u‖` 会涨到 6.6？
 
@@ -434,3 +439,111 @@ python3 scripts/v5_run_report.py --run runs/temporal_ac_bptt_v5/main/seed0
 | 梯度拆半 cos（48 vs 48 窗口） | 0.131 |
 | 动作预算（it=50） | 前 5 步 RMS 19–27 mrad；t=19 peak 2.54 rad（相位切换） |
 | WM 40 步（B 路线门槛） | dump 口径 20 步 p50 = 21.2 mm ⇒ `B_NOT_RUN` |
+
+
+---
+
+# 13. v2 更新（2026-11-07 23:0x）：两个设计级 bug 已修 + 四臂 Pilot 结果
+
+> 本节是**在审阅意见之后**的实测更新，覆盖 §5–§9 的部分结论。当前主线 v2 已在跑。
+
+## 13.1 ★数据泄漏（审阅指出的风险，实测确认并已修）
+
+- 评测集按 **clip** 切成 375/81/81（train/val/test clip）；
+- 但 on-the-fly 采样器之前用的是**全部合格帧**（338,402），其中
+  **val/test 的 162 个 clip 占 103,122 帧 = 30.5%** ⇒ **训练时看得到评测 clip**；
+- 修法：`eligible_start_mask(..., allowed_clips=...)`，训练只允许评测集 `windows_meta.json`
+  里的 **375 个 train clip** ⇒ 合格帧降到 **235,280**（实测日志：
+  `n_eligible=235280, n_eligible_before_clip_filter=338402, n_allowed_clips=375,
+  clip_filter='only train clips (no val/test leak)'`）；
+- 缺 `train_clips` 时 **fail-closed** 直接报错（不许"没保证也开跑"）。
+- ⇒ 之前 `main/seed0|1` 的 held-out 数字**受泄漏污染**（虽然模型坍缩成常数，影响有限），
+  新 run 从 `main_v2/` 重新开始。
+
+## 13.2 ★动作 trust 与设计不一致（审阅指出的第二个优先项，已修）
+
+原实现：`e = q^Δ(x_k^Δ) − q^0(x_k^0)`（两条 rollout 的动作差）——
+把"token 改动的直接动作影响"和"两条 WM 轨迹未来状态不同"混在一起。
+
+修法（同观测）：在修正 rollout 里拦 **`executor.act(token, obs93)`**（`SonicIsaacBundle.act`
+是类方法，拦 `bundle.act` 无效），记录每步的 `obs93`；rollout 结束后用
+**同一份 obs93 + 基础 token** 重解一次 action 作为参照：
+
+```
+q_base_k = q_target( exec_act( Z_k , obs93_k ) )      # 同一 obs，只换 token
+e_same_k = q_target(a^Δ_k) − q_base_k                 # 只隔离 token 的直接动作影响
+e_traj_k = q_target(a^Δ_k) − q_target(a^0_k)          # 旧口径，仅作"轨迹偏差"诊断
+```
+
+`L_act / L_smooth` 用 `e_same`；`e_traj` 单独记进日志（`act_rms_traj_mrad`）。
+
+**这一项的实测影响（Pilot，见 13.4）：决定性。**
+旧口径下 `L_act` 的参数梯度是 `J` 的 **27×**（因为它把轨迹发散算成动作越界）；
+同观测口径下，动作差往往低于 τ=20mrad ⇒ `L_act` 基本自关断，J 才真正主导。
+
+## 13.3 未 cap 范数 hinge（方案 A）与权重标定
+
+```
+L_raw = E_{t<K}[ max(0, ‖u_t‖/(κ·cap) − 1)^2 ]     κ=2, λ_raw=1e-3
+```
+
+`λ_raw` 不是拍的，用 `scripts/calibrate_v5_weights.py` 在 4 个 u 尺度上按
+"每项梯度 ≈ ρ·‖g_J‖（ρ=0.1）"反解（cached 池、B=64）：
+
+| 状态 | ‖u‖/cap (p50) | ‖g_J‖ | act(同观测) | smooth | anchor | raw |
+|---|---|---|---|---|---|---|
+| init | 0.09 | 0.987 | 0× | 13.2× | 5.3× | 0× |
+| head×6 | 0.54 | 0.671 | 0× | 14.6× | 21.1× | 99× |
+| head×18 | 1.61 | 0.351 | **2.19×** | 23.1× | 16.4× | 2781× |
+| head×40 | 3.57 | 0.211 | **6.43×** | 28.8× | 1.03× | 19527× |
+
+（倍数 = `‖g_term(λ=1)‖ / ‖g_J‖`。旧口径下 act 是 27×；同观测口径只有 2–6×，
+再乘锁定 `λ_act=0.010` ⇒ **0.02–0.06×**，不再是主导项。）
+
+- `λ_smooth=0.002` ⇒ 2.6–5.8% of ‖g_J‖；`λ_anchor=0.001` ⇒ 0.1–2.1% —— **锁定值可保留**；
+- `λ_raw`：在 ‖u‖≈2c 处 λ=1 梯度是 2781×g_J ⇒ 取 **1e-3** 得 ~2.8×g_J（能把 u 按住），
+  而在 ‖u‖≈0.6c 处只有 ~0.1×g_J（不干扰学习）。
+- 之前建议的 `λ_act=3e-4` **不再需要**（同观测口径下 0.010 已经很小）。
+
+## 13.4 四臂 Pilot（`data_mode=cached_pool`，真实缓存 VLA chunk，固定 token；200 步）
+ 
+| 臂 | 动作 trust | raw hinge | test ΔJ（90 held-out 窗口） | cond@125 cosZ | ‖u‖/cap p50 | act RMS（同观测） |
+|---|---|---|---|---|---|---|
+| p0_old | 两轨迹（旧） | ✗ | **+0.00099** | **0.9999（坍缩）** | **11.5** | 25 mrad |
+| p1_trust | 同观测 | ✗ | **+0.02671** | 0.60（PASS） | 2.24 | 27.7 mrad |
+| p2_cap | 两轨迹（旧） | ✓ | **+0.00224** | 0.978（坍缩） | 3.08 | 27.0 mrad |
+| p3_both | 同观测 | ✓ | **+0.02640** | 0.68（PASS） | **1.80** | 27.3 mrad |
+| p4_postpl | —（常数模板） | — | 待补（val +0.00611 @it50） | — | — | — |
+
+**结论（决定性）**：
+1. **只修 raw 范数不够**（p2 仍坍缩，test +0.002）；
+2. **只修同观测 trust 就足够**（p1 test +0.0267、条件化 PASS、u 稳在 2.2c）；
+3. raw hinge 的作用是**把 ‖u‖ 从 2.24c 按到 1.80c**（p3），作为保险；
+4. 同观测 trust 后 200 步就达到 test **+0.026**，是之前坍缩 run（+0.001）的 **27×**，
+   也**超过常数模板**（+0.006 @val，同池同预算）。
+5. 动作预算：p1/p3 的**同观测** RMS 27 mrad（≈1.4τ），而**轨迹级** RMS 117 mrad、
+   peak 3.4 rad（来自晚期相位差）——报告里必须分开写。
+
+> 注意：Pilot 是 `cached_pool`（3072 固定窗口、固定 token），**不能**与 on-the-fly 主训练混表；
+> 它只回答"哪个修复有效"。
+
+## 13.5 主线 v2 已启动（on-the-fly，2 seeds）
+
+```
+scripts/launch_v5_main_v2.sh
+  --on-the-fly 1 --eval-set .../eval_set --updates 1000 --batch 256 --horizon 20 --beta 0
+  --trust-mode same_obs --lambda-raw 1e-3 --raw-norm-kappa 2
+  --cap-warmup-updates 0         # 可学习性试验：固定 cap=0.08
+  --cond-check-every 25          # 每 25 步条件化门禁（Δ 方差 + shuffle）
+```
+
+输出：`runs/temporal_ac_bptt_v5/main_v2/seed{0,1}/`；
+旧（坍缩）run 保留在 `runs/temporal_ac_bptt_v5/main/seed{0,1}/` 作为"锁定口径的负基线"。
+
+## 13.6 更新后的待办
+
+1. 等 v2 跑完：held-out test ΔJ、同观测/轨迹级动作预算、条件化门禁曲线；
+2. **动作预算对齐的常数模板对照**：p4 的 test 数 + 与 p1/p3 在**同一预算**下比较
+   （若 v2 的预算明显更大，需要把 `λ_act` 提到让 ‖g_act‖≈0.1‖g_J‖ 的水平重新标定）；
+3. 若 v2 仍不理想：再考虑 lr/批量/梯度累积、或"先用 WM 反传方向做蒸馏初始化"（教师路线）；
+4. 真 Isaac 配对（M3）与部署集成（M4）仍需会话 01 的服务端 per-frame 施加 + `state_hist_10`。
