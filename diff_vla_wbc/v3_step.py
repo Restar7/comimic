@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import os
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -198,6 +200,28 @@ class V3Config:
     #    必须配上 `adv_tau`：`-tanh(adv/τ)` 把每样本权重压成有界的，窗口难度大的样本不再
     #    独占梯度；τ 取"逐窗配对的典型量级"（实测 imag_delta_std≈0.019）。τ=0 ⇒ 退回均值形式
     #    （梯度与现在逐位相同，仅作诊断对照）。
+    # ==================================================================================
+    # ★ 2026-11-07（会话 02）：Teacher 口径修复
+    # ----------------------------------------------------------------------------------
+    # 旧 Teacher（legacy_token0_repeat_v1）的三个口径错误（见 docs/REVIEW... §5 与
+    # runs/harness_02_teacher/report.md）：
+    #   ① 只取 `token[:,0]` 并重复 H 步做 rollout，而部署/主训练是**完整 token chunk**
+    #      （`imagine_with_tokens` 按 `tokens[:, min(t,T-1)]` 取用）；
+    #   ② 回报用 `rewards.sum()`（未折扣、不含 survival），主训练用 `discounted_return`；
+    #   ③ 异常被 `except Exception: return None` 静默吞掉，训练照常记为"成功"。
+    # 新 Teacher（shared_delta_reward_only_v2）：
+    #   token'_t = token_t + ε，ε:(B,1,64) **共享**、可微；J 与主训练**同一个定义**；
+    #   g = dJ/dε 即部署时广播 Δ 的真实 BPTT 梯度。
+    # 开关走环境变量（不改 CLI，避免动别的会话的入口）：
+    #   GRAD_TARGET_TEACHER=shared_delta|legacy
+    #   GRAD_TARGET_REWARD=discounted|sum
+    #   GRAD_TARGET_STRICT=1|0     （0 = 诊断时允许跳过，但会计数原因）
+    #   GRAD_TARGET_COMPARE_OLD=1  （同窗口再算一次旧 Teacher，报 cos_old_vs_new）
+    # ==================================================================================
+    grad_target_teacher: str = "shared_delta"
+    grad_target_reward: str = "discounted"
+    grad_target_strict: bool = True
+    grad_target_compare_old: bool = False
     adv_baseline: str = "none"
     # ★ 2026-11-07（BPTT 那条路的"求和偏置"解药）：**每窗口梯度归一化**。
     #   现状：loss_r = -mean(ret_w)，梯度 = Σ_w ∂ret_w/∂θ / B ⇒ 大回报窗口主导，
@@ -364,7 +388,12 @@ class JointTrainerV3(JointTrainerV2):
         return torch.cat([rot6.float(), _qd.float()], dim=-1)
 
     def _delta_token_delta(self, batch, tokens: torch.Tensor) -> torch.Tensor:
-        """``(B, 1, 64)`` 的广播用 Δtoken（用窗口起点的命令 token[0] + 起点偏差）。"""
+        """``(B, 1, 64)`` 的广播用 Δtoken（用窗口起点的命令 token[0] + 起点偏差）。
+
+        ★ 2026-11-07（会话 02）：额外保存 **完整 base token chunk**（``self._dt_base_chunk``）。
+        新 Teacher 必须用它：部署与主训练都是 ``token_t + Δ``（t=0..T-1 各有自己的 base token），
+        旧 Teacher 只拿 ``token[:,0]`` 重复 H 步 ⇒ rollout 的条件序列与部署不一致。
+        """
         feat = self._delta_token_features(batch)
         base_tok = tokens[:, 0].detach()
         # ★★ 2026-11-07 修复：**标签必须算在这个 token 上**。
@@ -372,6 +401,7 @@ class JointTrainerV3(JointTrainerV2):
         #   而 Δ 实际加在 VLA 本次前向输出的 token 上 ⇒ 两者不是同一个点，
         #   ĝ 的方向对不上标的 token ⇒ 网络只能学到"长度"（ratio≈1）而学不到方向（cos≈0.05）。
         self._dt_base_tok = base_tok
+        self._dt_base_chunk = tokens.detach()
         d = self.delta_token_net(base_tok, feat)
         # ★ **状态敏感度**（2026-11-06）：同一批 token，把状态打乱再算一次。
         #   `‖g(tok,s) − g(tok,s_perm)‖ / ‖g(tok,s)‖` 才是这条路的"残差/均值"等价物：
@@ -387,14 +417,394 @@ class JointTrainerV3(JointTrainerV2):
         # 软上限：**与部署端同一个函数**（口径漂移的唯一防线）
         from .delta_token import apply_norm_cap  # noqa: PLC0415
 
-        d = apply_norm_cap(d, float(getattr(self.v3, "delta_token_cap", 0.0) or 0.0))
+        _cap = float(getattr(self.v3, "delta_token_cap", 0.0) or 0.0)
+        d = apply_norm_cap(d, _cap)
         self._dt_norm = float(d.norm(dim=-1).mean().detach())
+        # ★ 诊断（J1_EPS_GRAD=1）：把"实际施加的 Δ"换成一个**自由变量** ε（leaf），
+        #   于是 dL/dε 就是"完整训练 loss 对广播 Δ 的梯度"（不含参数链），
+        #   用来和 Teacher 的 reward-only 梯度逐项比。默认关，训练行为逐位不变。
+        self._dt_eps_leaf = None
+        if os.environ.get("J1_EPS_GRAD", "0") == "1":
+            if _cap > 0.0:
+                raise SystemExit("[eps-grad] delta_token_cap>0 时 dL/dε ≠ dL/dΔ（cap 会改写变量），"
+                                 " 诊断请设 DELTA_TOKEN_CAP=0")
+            eps = d.detach().clone().requires_grad_(True)
+            self._dt_eps_leaf = eps
+            self._dt_delta_last = eps
+            self._dt_norm = float(eps.norm(dim=-1).mean().detach())
+            return eps.unsqueeze(1)
         self._dt_delta_last = d          # ★ 第 3 刀：稠密监督要用（带梯度）
         return d.unsqueeze(1)
 
-    # ------------------------------------------------------------------ 第 3 刀
+    # ------------------------------------------------------------------ Teacher
+    #: 新 Teacher 的目标版本（写进 ckpt meta；服务端按它判断标签语义）
+    TEACHER_OBJECTIVE_VERSION = "shared_delta_reward_only_v2"
+    #: 旧 Teacher（单 token0 重复 H 步 + 未折扣 sum）——**只作 legacy 对照**，默认不再使用
+    LEGACY_TEACHER_OBJECTIVE_VERSION = "legacy_token0_repeat_v1"
+
+    def _teacher_cfg(self) -> dict:
+        """Teacher 口径（env > V3Config 默认）。所有开关都有明确的默认值，不猜。"""
+        teacher = str(os.environ.get(
+            "GRAD_TARGET_TEACHER",
+            getattr(self.v3, "grad_target_teacher", "shared_delta"))).strip().lower()
+        if teacher in ("legacy", "legacy_token0", "token0", "token0_repeat"):
+            teacher = "legacy"
+        elif teacher in ("shared", "shared_delta", "chunk"):
+            teacher = "shared_delta"
+        else:
+            raise SystemExit(f"[grad-target] 未知 GRAD_TARGET_TEACHER={teacher!r}"
+                             "（shared_delta|legacy）")
+        reward = str(os.environ.get(
+            "GRAD_TARGET_REWARD",
+            getattr(self.v3, "grad_target_reward", "discounted"))).strip().lower()
+        if reward in ("disc", "discounted", "return"):
+            reward = "discounted"
+        elif reward in ("sum", "undiscounted"):
+            reward = "sum"
+        else:
+            raise SystemExit(f"[grad-target] 未知 GRAD_TARGET_REWARD={reward!r}"
+                             "（discounted|sum）")
+
+        def _flag(env: str, default: bool) -> bool:
+            v = os.environ.get(env)
+            if v is None:
+                return bool(default)
+            return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+        return {
+            "teacher": teacher,
+            "reward": reward,
+            "strict": _flag("GRAD_TARGET_STRICT", bool(getattr(self.v3, "grad_target_strict", True))),
+            "compare_old": _flag("GRAD_TARGET_COMPARE_OLD",
+                                 bool(getattr(self.v3, "grad_target_compare_old", False))),
+            "n": int(getattr(self.v3, "grad_target_n", 16) or 16),
+            "eta": float(getattr(self.v3, "grad_target_eta", 0.08) or 0.08),
+            "horizon": int(getattr(self.v3, "grad_target_horizon", 0) or 0) or int(self.cfg.horizon),
+        }
+
+    def _teacher_windows(self, batch, n: int):
+        """取 Teacher 子批的 ``(sl, n, ctx)``：状态/参考/xi/prev_action/history 与主训练**同一批**。"""
+        from .isaac_joint import FrameRef  # noqa: PLC0415
+
+        B = int(batch.start_state.shape[0])
+        n = max(1, min(int(n), B))
+        sl = slice(0, n)
+        refs: list[Any] = []
+        for r in batch.references:
+            f = getattr(r, "f", None)
+            refs.append(FrameRef(f[sl].to(self.device)) if f is not None else r)
+        hist = getattr(batch, "history", None)
+        oh = getattr(batch, "obs_hist", None)
+        if hist is not None:
+            # history 两种布局都可能（(B,T,w) / (T,B,w)）；有 history 时 obs_hist 会被忽略
+            if int(hist.shape[0]) == B:
+                hist_arg = hist[sl]
+            elif hist.ndim >= 2 and int(hist.shape[1]) == B:
+                hist_arg = hist[:, sl]
+            else:
+                hist_arg = hist
+            oh_arg = None
+        else:
+            hist_arg = None
+            oh_arg = (oh[sl] if (oh is not None and int(oh.shape[0]) == B) else None)
+        prev = getattr(batch, "prev_action", None)
+        ctx = {
+            "state": batch.start_state[sl].to(self.device),
+            "references": refs,
+            "xi": (batch.xi[sl].to(self.device) if getattr(batch, "xi", None) is not None else None),
+            "prev_action": (prev[sl].to(self.device) if prev is not None else None),
+            "history": hist_arg,
+            "obs_hist": oh_arg,
+        }
+        return sl, n, ctx
+
+    def _teacher_loss_shared(self, batch, pred_delta, tcfg: dict):
+        """★ 正确 Teacher：``g = dJ/dε``，ε 是**完整 base chunk 上的共享 Δ**。
+
+        数学定义（与部署/主训练逐字一致）::
+
+            token'_t = token_t + ε,  ε:(B,1,64) 共享
+            a_t      = WBC(token'_t, obs_t)                # 冻结 SONIC decoder
+            s_{t+1}  = WM(s_t, a_t, ξ)                     # 冻结 WM
+            J        = Σ_t γ^t · survival_t · r_t          # = discounted_return（与主训练同定义）
+            g        = dJ/dε  （autograd，一次 20 步反传）
+
+        与旧实现的差别：
+          1. 用完整 chunk（t=0..H-1 各自的 token）而不是 ``token[:,0]`` 重复 H 步；
+          2. J 用 ``discounted_return``（含 γ 与 survival），不是 ``rewards.sum()``；
+          3. 异常不再静默：strict=1 直接抛出；strict=0 才允许跳过并计数。
+        """
+        from . import teacher_probe as tp  # noqa: PLC0415
+
+        base = getattr(self, "_dt_base_chunk", None)
+        src = "vla_chunk"
+        if base is None:
+            # 显式录制 token 对照（只有在没有 VLA chunk 时才允许；不是默认路径）
+            base = getattr(batch, "port_tokens", None)
+            src = "recorded_chunk_fallback"
+        if base is None:
+            raise RuntimeError("没有 base token chunk（既无 VLA chunk 也无 port_tokens）")
+        base = base.detach().to(self.device)
+        eta, H = float(tcfg["eta"]), int(tcfg["horizon"])
+        sl, n, ctx = self._teacher_windows(batch, tcfg["n"])
+        H = max(1, min(H, len(ctx["references"])))
+        base = base[sl]
+        eps0 = None if getattr(self, "_dt_eps_leaf", None) is None else self._dt_eps_leaf.detach()
+        out = tp.shared_delta_reward_grad(
+            self.bundle, base, **ctx, horizon=H,
+            gamma=float(self.v3.gamma),
+            reward_steps=int(getattr(self.v3, "reward_horizon", 0) or 0),
+            eps0=eps0, grad_undisc=True,
+        )
+        g_main = out.g if tcfg["reward"] == "discounted" else out.g_undisc
+        tgt, gn, valid = tp.unit_labels(g_main, eta)
+        nv = int(valid.sum())
+        if nv == 0:
+            raise RuntimeError(
+                f"Teacher 标签全部无效（n={n}，H={H}）：g 有限={int(torch.isfinite(g_main).all(-1).sum())}，"
+                f"|g| min={float(gn.min()):.3e} —— 不是'训练成功'，必须查")
+        pred = pred_delta.reshape(int(pred_delta.shape[0]), -1)[:n]
+        if int(pred.shape[-1]) != int(tgt.shape[-1]):
+            raise RuntimeError(f"Δ 宽度 {int(pred.shape[-1])} != 标签宽度 {int(tgt.shape[-1])}")
+        _vm = valid[:, None].to(pred.dtype)
+        loss = (((pred - tgt.to(pred.dtype)) ** 2) * _vm).sum(-1).sum() / nv
+        # DDP：指标是**本 rank 子批**上的，全局标签数 = 本 rank × world_size
+        _world = 1
+        try:
+            import torch.distributed as _dist  # noqa: PLC0415
+
+            if _dist.is_available() and _dist.is_initialized():
+                _world = int(_dist.get_world_size())
+        except Exception:  # noqa: BLE001
+            _world = 1
+        with torch.no_grad():
+            _cos = tp.cosine(pred.detach(), g_main, mask=valid)
+            meta = {
+                "delta_token/grad_cos": float(_cos[valid].mean()),
+                "delta_token/grad_n_global": float(nv * _world),
+                "delta_token/grad_world": float(_world),
+                "delta_token/grad_cos_scope": 0.0,   # 0 = train-sub-batch（不是 held-out）
+                "delta_token/grad_norm_ratio": float(
+                    pred.detach().norm(dim=-1)[valid].mean() / max(eta, 1e-9)),
+                "delta_token/grad_J": float(out.J[valid].mean()),
+                "delta_token/grad_J_sum": float(out.J_undisc[valid].mean()),
+                "delta_token/grad_n": float(n),
+                "delta_token/grad_n_valid": float(nv),
+                "delta_token/grad_valid_frac": float(nv) / float(n),
+                "delta_token/grad_H": float(H),
+                "delta_token/grad_norm_mean": float(gn[valid].mean()),
+                "delta_token/grad_norm_p50": float(gn[valid].median()),
+                "delta_token/grad_norm_max": float(gn[valid].max()),
+                "delta_token/teacher_disc": float(tcfg["reward"] == "discounted"),
+                "delta_token/teacher_legacy": 0.0,
+                "delta_token/teacher_chunk_tokens": float(base.shape[1]),
+                "delta_token/teacher_src_vla": float(src == "vla_chunk"),
+            }
+            self._teacher_last = {
+                "g": g_main.detach(), "g_disc": out.g, "g_sum": out.g_undisc,
+                "valid": valid, "norm": gn, "J": out.J.detach(), "H": H, "eta": eta,
+                "src": src, "base": base.detach(), "eps0": eps0,
+            }
+            if tcfg["compare_old"]:
+                meta.update(self._teacher_compare_old(base, ctx, H, g_main, valid, tcfg))
+            # ★ J1_TEACHER_RESAMPLE=1：同一窗口、fresh VLA noise ⇒ 标签噪声的**直接**测量
+            _alt = getattr(self, "_dt_alt_chunk", None)
+            if _alt is not None:
+                _alt_b = _alt[sl].to(self.device)
+                with torch.enable_grad():
+                    _o_alt = tp.shared_delta_reward_grad(
+                        self.bundle, _alt_b, **ctx, horizon=H,
+                        gamma=float(self.v3.gamma),
+                        reward_steps=int(getattr(self.v3, "reward_horizon", 0) or 0),
+                        eps0=None, grad_undisc=False,
+                    )
+                _v_alt = valid & torch.isfinite(_o_alt.g).all(-1)
+                if int(_v_alt.sum()) > 0:
+                    meta["teacher/cos_resample_label"] = float(
+                        tp.cosine(g_main, _o_alt.g, mask=_v_alt)[_v_alt].mean())
+                    meta["teacher/g_resample_norm_mean"] = float(
+                        _o_alt.g.norm(dim=-1)[_v_alt].mean())
+                meta["teacher/token_chunk_rel_diff"] = float(
+                    (base - _alt_b).norm() / base.norm().clamp_min(1e-12))
+                self._teacher_last["g_resample"] = _o_alt.g
+            # ★ J1_TEACHER_EXTRA_H=5：同窗口再算一个短视界标签（paired 对照"H=5 vs H=20 可学性"）
+            _extra_h = str(os.environ.get("J1_TEACHER_EXTRA_H", "") or "").strip()
+            if _extra_h:
+                for _h2 in [int(v) for v in _extra_h.split(",") if v.strip()]:
+                    _h2 = max(1, min(_h2, len(ctx["references"])))
+                    with torch.enable_grad():   # 这一段在 no_grad 里，必须显式开图
+                        _o2 = tp.shared_delta_reward_grad(
+                            self.bundle, base, **ctx, horizon=_h2,
+                            gamma=float(self.v3.gamma),
+                            reward_steps=int(getattr(self.v3, "reward_horizon", 0) or 0),
+                            eps0=eps0, grad_undisc=True,
+                        )
+                    _g2 = _o2.g if tcfg["reward"] == "discounted" else _o2.g_undisc
+                    self._teacher_last[f"g_H{_h2}"] = _g2.detach()
+                    _v2 = valid & torch.isfinite(_g2).all(-1)
+                    if int(_v2.sum()) > 0:
+                        meta[f"teacher/cos_H{_h2}_vs_H{H}"] = float(
+                            tp.cosine(g_main, _g2, mask=_v2)[_v2].mean())
+                    meta[f"teacher/g_H{_h2}_norm_mean"] = float(
+                        _g2.norm(dim=-1)[_v2].mean()) if int(_v2.sum()) else float("nan")
+        self._maybe_dump_teacher(batch, sl, n, tcfg, meta)
+        return loss, meta
+
+    def _teacher_compare_old(self, base, ctx, H, g_new, valid, tcfg) -> dict:
+        """同窗口、同 J 口径下，新旧 Teacher 的梯度余弦（**直接回答"cos 0.10 是不是 Teacher 的锅"**）。
+
+        三个对照：
+          * ``cos_old_vs_new``：旧实现原样（token0 重复 + 未折扣 sum）vs 新实现（完整 chunk+折扣）
+          * ``cos_old_disc_vs_new``：只换 token 序列（旧 token0 重复，但回报改成折扣）
+          * ``cos_new_undisc_vs_new``：只换回报定义（完整 chunk，但未折扣）
+        """
+        from . import teacher_probe as tp  # noqa: PLC0415
+
+        with torch.enable_grad():
+            leg = tp.tokenwise_reward_grad(
+                self.bundle, base[:, :1, :], **ctx, horizon=H,
+                gamma=float(self.v3.gamma),
+                reward_steps=int(getattr(self.v3, "reward_horizon", 0) or 0),
+                grad_undisc=True,
+            )
+        _m = valid & torch.isfinite(leg.g_undisc).all(-1)
+        if int(_m.sum()) == 0:
+            return {"teacher/cos_old_vs_new": float("nan")}
+        self._teacher_last["g_old"] = leg.g_undisc
+        self._teacher_last["g_old_disc"] = leg.g
+        return {
+            "teacher/cos_old_vs_new": float(tp.cosine(g_new, leg.g_undisc, mask=_m)[_m].mean()),
+            "teacher/cos_old_disc_vs_new": float(tp.cosine(g_new, leg.g, mask=_m)[_m].mean()),
+            "teacher/cos_new_undisc_vs_new": float(
+                tp.cosine(g_new, self._teacher_last["g_sum"], mask=_m)[_m].mean()),
+            "teacher/g_old_norm_mean": float(leg.g_undisc.norm(dim=-1)[_m].mean()),
+            "teacher/g_new_norm_mean": float(g_new.norm(dim=-1)[_m].mean()),
+            "teacher/n_compare": float(int(_m.sum())),
+        }
+
+    def _teacher_loss_legacy(self, batch, pred_delta, tcfg: dict):
+        """**旧 Teacher 原样保留**（``legacy_token0_repeat_v1``），只作显式对照。
+
+        语义：``tok = token0``（单 token，rollout 内部重复 H 步），``J = Σ_t r_t``（未折扣），
+        ``g = dJ/dtoken0``。默认**不再用**；只有 `GRAD_TARGET_TEACHER=legacy` 才会走到这里。
+        """
+        from . import teacher_probe as tp  # noqa: PLC0415
+
+        base = getattr(self, "_dt_base_chunk", None)
+        if base is None:
+            base = getattr(batch, "port_tokens", None)
+        if base is None:
+            raise RuntimeError("没有 base token chunk")
+        base = base.detach().to(self.device)
+        eta, H = float(tcfg["eta"]), int(tcfg["horizon"])
+        sl, n, ctx = self._teacher_windows(batch, tcfg["n"])
+        H = max(1, min(H, len(ctx["references"])))
+        tok0 = base[sl][:, :1, :]
+        out = tp.tokenwise_reward_grad(
+            self.bundle, tok0, **ctx, horizon=H, gamma=1.0, reward_steps=0, grad_undisc=True)
+        g = out.g_undisc
+        tgt, gn, valid = tp.unit_labels(g, eta)
+        nv = int(valid.sum())
+        if nv == 0:
+            raise RuntimeError(f"legacy Teacher 标签全部无效（n={n}）")
+        pred = pred_delta.reshape(int(pred_delta.shape[0]), -1)[:n]
+        loss = (((pred - tgt.to(pred.dtype)) ** 2) * valid[:, None].to(pred.dtype)).sum(-1).sum() / nv
+        with torch.no_grad():
+            _cos = tp.cosine(pred.detach(), g, mask=valid)
+            meta = {
+                "delta_token/grad_cos": float(_cos[valid].mean()),
+                "delta_token/grad_norm_ratio": float(
+                    pred.detach().norm(dim=-1)[valid].mean() / max(eta, 1e-9)),
+                "delta_token/grad_J": float(out.J_undisc[valid].mean()),
+                "delta_token/grad_n": float(n),
+                "delta_token/grad_n_valid": float(nv),
+                "delta_token/grad_H": float(H),
+                "delta_token/teacher_legacy": 1.0,
+                "delta_token/teacher_disc": 0.0,
+            }
+            self._teacher_last = {"g": g.detach(), "valid": valid, "norm": gn,
+                                  "J": out.J_undisc.detach(), "H": H, "eta": eta,
+                                  "src": "legacy_token0", "base": base[sl].detach()}
+        self._maybe_dump_teacher(batch, sl, n, tcfg, meta)
+        return loss, meta
+
+    def _maybe_dump_teacher(self, batch, sl, n, tcfg, meta) -> None:
+        """``J1_TEACHER_DUMP=<dir>``：落盘 (state64, token chunk, g, J, valid)，供离线复算/蒸馏。"""
+        dump = os.environ.get("J1_TEACHER_DUMP", "")
+        if not dump:
+            return
+        import json  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        import numpy as np  # noqa: PLC0415
+
+        d = Path(dump)
+        d.mkdir(parents=True, exist_ok=True)
+        last = getattr(self, "_teacher_last", {}) or {}
+        step = int(getattr(self, "steps", 0))
+        frames = None
+        try:
+            frames = torch.stack([r.f[sl] for r in batch.references], 0).cpu()
+        except Exception:  # noqa: BLE001
+            frames = None
+        def _np(x, dtype=None):
+            if x is None:
+                return np.zeros(0)
+            if torch.is_tensor(x):
+                x = x.detach().float().cpu().numpy()
+            return np.asarray(x).astype(dtype) if dtype is not None else np.asarray(x)
+
+        _base = last.get("base", None)
+        payload = {
+            "step": np.asarray(step),
+            "H": np.asarray(int(last.get("H", tcfg["horizon"]))),
+            "eta": np.asarray(float(tcfg["eta"])),
+            "feats": _np(self._delta_token_features(batch)[sl], "float32"),
+            "token_chunk": (_np(_base, "float32").reshape(int(_base.shape[0]), int(_base.shape[1]), -1)
+                            if _base is not None else np.zeros(0)),
+            "g": _np(last.get("g"), "float32"),
+            "J": _np(last.get("J"), "float32"),
+            "valid": _np(last.get("valid"), "bool"),
+            "state": _np(batch.start_state[sl], "float32"),
+            "xi": _np(getattr(batch, "xi", None) if getattr(batch, "xi", None) is None
+                      else batch.xi[sl], "float32"),
+            "prev_action": _np(getattr(batch, "prev_action", None) if getattr(batch, "prev_action", None) is None
+                               else batch.prev_action[sl], "float32"),
+        }
+        for key in ("g_old", "g_old_disc", "g_sum", "g_disc"):
+            v = last.get(key, None)
+            if v is not None:
+                payload[key] = _np(v, "float32")
+        for key, v in list(last.items()):
+            if isinstance(key, str) and key.startswith("g_H") and v is not None:
+                payload[key] = _np(v, "float32")
+        if frames is not None:
+            payload["frames"] = frames.numpy()
+            try:
+                _lib = self.bundle.library
+                _dev = getattr(_lib.clip_id, "device", torch.device("cpu"))
+                payload["clip_ids"] = _lib.clip_id[
+                    frames.reshape(-1).to(_dev).long()].reshape(frames.shape).cpu().numpy()
+            except Exception as _e:  # noqa: BLE001
+                print(f"[teacher-dump][warn] clip_ids 取不到: {_e!r}", flush=True)
+        hist = getattr(batch, "history", None)
+        if hist is not None and int(hist.shape[0]) == int(batch.start_state.shape[0]):
+            payload["history"] = hist[sl].detach().float().cpu().numpy()
+        elif hist is not None and hist.ndim >= 2 and int(hist.shape[1]) == int(batch.start_state.shape[0]):
+            payload["history"] = hist[:, sl].detach().float().cpu().numpy()
+        oh = getattr(batch, "obs_hist", None)
+        if oh is not None:
+            payload["obs_hist"] = oh[sl].detach().float().cpu().numpy()
+        np.savez(d / f"teacher_{step:05d}.npz", **payload)
+        rec = {"step": step, "teacher": tcfg["teacher"], "reward": tcfg["reward"],
+               "n": int(n), "H": int(last.get("H", tcfg["horizon"])), "eta": float(tcfg["eta"]),
+               "git": self._git_commit(), **{k: float(v) for k, v in meta.items()
+                                             if isinstance(v, (int, float))}}
+        with open(d / "teacher_index.jsonl", "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
     def _grad_target_loss(self, batch):
-        """稠密监督：让 Δ 直接对齐 ``eta·unit(∂J/∂token)``。
+        """稠密监督：让 Δ 对齐 ``η·unit(∂J/∂Δ)``（J 与主训练同口径）。
 
         为什么这是"最重要的一刀"
         ------------------------
@@ -403,75 +813,169 @@ class JointTrainerV3(JointTrainerV2):
         而真机 ±δ 实验证明**单窗口的 ĝ 方向本身是好的**（H=2 96/96、H=20 63/64）。
         所以把 ĝ 当**标签**用：逐窗口回归，不做求和，方向信息就保住了。
 
-        成本：子批 ``grad_target_n`` 个窗口各一次 20 步反传（默认 16 个 ⇒ ~3 s/step）。
+        ★ 2026-11-07：标签的 **定义** 修好了（见 ``_teacher_loss_shared``）。旧实现
+        （单 token0 重复 + 未折扣 sum + 异常静默）保留为 ``GRAD_TARGET_TEACHER=legacy``。
         """
         w = float(getattr(self.v3, "grad_target_weight", 0.0) or 0.0)
         delta = getattr(self, "_dt_delta_last", None)
         if w <= 0 or delta is None:
             return None, {}
+        tcfg = self._teacher_cfg()
+        self._teacher_cfg_last = dict(tcfg)
         try:
-            from .isaac_joint import FrameRef  # noqa: PLC0415
-            from .rollout import imagine_with_tokens  # noqa: PLC0415
+            if tcfg["teacher"] == "legacy":
+                return self._teacher_loss_legacy(batch, delta, tcfg)
+            return self._teacher_loss_shared(batch, delta, tcfg)
+        except Exception as exc:  # noqa: BLE001
+            self._teacher_fail_n = int(getattr(self, "_teacher_fail_n", 0)) + 1
+            self._teacher_fail_reason = repr(exc)
+            if tcfg["strict"]:
+                print(f"[grad-target][FATAL] teacher={tcfg['teacher']} 失败"
+                      f"（GRAD_TARGET_STRICT=1 ⇒ 直接中止，不允许静默跳过）: {exc!r}",
+                      flush=True)
+                raise RuntimeError(f"[grad-target] Teacher 失败（strict）: {exc}") from exc
+            print(f"[grad-target][warn] teacher={tcfg['teacher']} 失败 "
+                  f"#{self._teacher_fail_n}（strict=0 ⇒ 跳过；原因={exc!r}）", flush=True)
+            return None, {
+                "delta_token/teacher_fail": 1.0,
+                "delta_token/teacher_fail_n": float(self._teacher_fail_n),
+            }
 
-            cfg = self.cfg
-            # ★ 优先用"Δ 实际依附的那个 token"（VLA 输出），退路才是录制 token
-            _bt = getattr(self, "_dt_base_tok", None)
-            tok = _bt[:, None, :] if _bt is not None else getattr(batch, "port_tokens", None)
-            if tok is None:
-                return None, {}
-            if tok.ndim == 2:
-                tok = tok[:, None, :]
-            n = max(1, min(int(getattr(self.v3, "grad_target_n", 16) or 16), int(tok.shape[0])))
-            # ★ 第 5 刀：短视界标签（0 ⇒ 用 cfg.horizon）
-            _H_gt = int(getattr(self.v3, "grad_target_horizon", 0) or 0) or int(cfg.horizon)
-            _H_gt = max(1, min(_H_gt, len(batch.references)))
-            sl = slice(0, n)
-            _tok = tok[sl].detach().float().clone().requires_grad_(True)
-            _refs = []
-            for r in batch.references:
-                _f = getattr(r, "f", None)
-                _refs.append(FrameRef(_f[sl].to(self.device)) if _f is not None else r)
-            # history 两种布局都可能（(B,T,w) / (T,B,w)）；有 history 时 obs_hist 会被忽略
-            _hist = getattr(batch, "history", None)
-            _oh = getattr(batch, "obs_hist", None)
-            if _hist is not None:
-                _hist_arg = (_hist[sl] if _hist.shape[0] == tok.shape[0]
-                             else (_hist[:, sl] if _hist.shape[1] == tok.shape[0] else _hist))
-                _oh_arg = None
-            else:
-                _hist_arg = None
-                _oh_arg = (_oh[sl] if (_oh is not None and _oh.shape[0] == tok.shape[0]) else None)
-            with torch.enable_grad():
-                _ro = imagine_with_tokens(
-                    self.bundle, tokens=_tok, state=batch.start_state[sl],
-                    obs_hist=_oh_arg,
-                    history=_hist_arg,
-                    xi=batch.xi[sl], references=_refs,
-                    prev_action=(batch.prev_action[sl] if getattr(batch, "prev_action", None) is not None else None),
-                    horizon=_H_gt,
-                )
-                _J = _ro.rewards.sum()
-                _g = torch.autograd.grad(_J, _tok)[0].mean(1).detach()      # (n,64)
-            _gn = _g.norm(dim=-1, keepdim=True).clamp_min(1e-9)
-            eta = float(getattr(self.v3, "grad_target_eta", 0.08) or 0.08)
-            _tgt = (eta * _g / _gn).to(delta.dtype)                        # (n,64)
-            _d = delta.reshape(-1, delta.shape[-1])[:n]
-            loss = ((_d - _tgt) ** 2).sum(-1).mean()
-            with torch.no_grad():
-                _cos = (_d * _g.to(_d.dtype)).sum(-1) / (_d.norm(dim=-1).clamp_min(1e-9) * _gn.squeeze(-1).to(_d.dtype))
-                meta = {
-                    "delta_token/grad_cos": float(_cos.mean()),
-                    "delta_token/grad_norm_ratio": float(_d.norm(dim=-1).mean() / max(eta, 1e-9)),
-                    "delta_token/grad_J": float(_J.detach()),
-                    "delta_token/grad_n": float(n),
-                    "delta_token/grad_H": float(_H_gt),
-                }
-            return loss, meta
-        except Exception as _e:  # noqa: BLE001 - 监督项绝不能挡住训练
-            if not getattr(self, "_gt_warned", False):
-                self._gt_warned = True
-                print(f"[grad-target][warn] {_e}", flush=True)
-            return None, {}
+    # ------------------------------------------------------------ 完整训练梯度诊断
+    def _log_eps_grad(self, loss) -> dict:
+        """``J1_EPS_GRAD=1``：逐项量 ``dL/dε``（ε=施加的广播 Δ），回答"谁在放大/抵消 reward 梯度"。
+
+        符号约定：``-dL/dε`` 是 loss 下降方向；对 reward 项它就是**奖励上升方向**
+        （因为 ``L = -λ_r J + ...``）。所以 ``cos(-dL_total/dε, g_reward) > 0`` 表示
+        训练整体在沿 Teacher 的奖励方向走；辅助项按 ``cos(-dL_aux/dε, g_reward)`` 判断
+        是"同向放大"还是"反向抵消"。
+        """
+        from . import teacher_probe as tp  # noqa: PLC0415
+
+        eps = getattr(self, "_dt_eps_leaf", None)
+        if eps is None:
+            return {}
+        terms = dict(getattr(self, "_loss_terms", None) or {})
+        terms["total"] = loss
+        ascent: dict[str, torch.Tensor] = {}
+        for name, term in terms.items():
+            if not torch.is_tensor(term) or (not term.requires_grad):
+                continue
+            try:
+                g = torch.autograd.grad(term, eps, retain_graph=True, allow_unused=True)[0]
+            except RuntimeError:
+                g = None
+            if g is not None:
+                ascent[name] = (-g.reshape(int(eps.shape[0]), -1)).detach()
+        rec: dict[str, float] = {"step": float(self.steps)}
+        gt = ascent.get("total")
+        if gt is not None:
+            rec["norm/total"] = float(gt.norm())
+            teacher = getattr(self, "_teacher_last", None) or {}
+            gr = teacher.get("g", None)
+            if gr is not None:
+                gr = gr.to(gt.dtype)
+                m = int(min(gr.shape[0], gt.shape[0]))
+                v = teacher.get("valid", None)
+                v = (v[:m].to(gt.device) if v is not None
+                     else torch.ones(m, dtype=torch.bool, device=gt.device))
+                if int(v.sum()) > 0:
+                    rec["cos_reward_vs_full"] = float(
+                        tp.cosine(gt[:m], gr[:m], mask=v)[v].mean())
+                    rec["cos_reward_vs_full_abs"] = float(
+                        tp.cosine(gt[:m], gr[:m], mask=v)[v].abs().mean())
+                    for name, ga in ascent.items():
+                        if name == "total":
+                            continue
+                        rec[f"norm/{name}"] = float(ga.norm())
+                        if name != "reward":     # reward_pure 与 reward 自比恒为 1，只留前者
+                            rec[f"cos/{name}_vs_reward"] = float(
+                                tp.cosine(ga[:m], gr[:m], mask=v)[v].mean())
+                        rec[f"proj/{name}_on_reward"] = float(
+                            (ga[:m] * gr[:m]).sum() / gr[:m].norm().clamp_min(1e-12))
+                        rec[f"cos/{name}_vs_full"] = float(tp.cosine(ga, gt).mean())
+                    # 可加性检查：只对**真正进入 loss 的项**求和（reward_pure 是诊断子集，
+                    # 加进去会重复计奖励 ⇒ 早期版本 residual≈1.0 就是这个重复计数）
+                    _additive = [k for k in ascent
+                                 if k != "total" and k != "reward_pure"]
+                    if _additive:
+                        _sum = sum(ascent[k] for k in _additive)
+                        rec["composition_residual"] = float(
+                            (gt - _sum).norm() / gt.norm().clamp_min(1e-12))
+                        rec["composition_residual_unrecorded_frac"] = float(
+                            (_sum - gt).norm() / gt.norm().clamp_min(1e-12))
+        out = os.environ.get("J1_EPS_GRAD_OUT", "")
+        if out:
+            import json  # noqa: PLC0415
+
+            with open(out, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            # 逐项梯度向量落盘（轨迹级分析用：谁抵消谁、投影分布、window 分布）
+            if ascent:
+                torch.save(
+                    {"step": int(self.steps),
+                     "teacher_g": (getattr(self, "_teacher_last", {}) or {}).get("g"),
+                     "teacher_valid": (getattr(self, "_teacher_last", {}) or {}).get("valid"),
+                     "ascent": {k: v.cpu() for k, v in ascent.items()}},
+                    f"{out}.step{int(self.steps):04d}.pt")
+        return rec
+
+    @staticmethod
+    def _git_commit() -> str:
+        """ckpt 里记录"产出它的代码版本"；工作树有未提交改动时标 ``-dirty``（不假装干净）。"""
+        try:
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        try:
+            subprocess.check_output(["git", "diff", "--quiet"], stderr=subprocess.DEVNULL)
+            return head
+        except subprocess.CalledProcessError:
+            return head + "-dirty"
+        except Exception:  # noqa: BLE001
+            return head
+
+    #: ckpt 里 ``delta_token_meta`` 的 schema 版本（会话 01 的部署侧按它决定怎么加载）
+    DELTA_TOKEN_META_SCHEMA = 2
+
+    def delta_token_meta(self) -> dict:
+        """Δ ckpt 的自描述元信息（**训练侧负责写全**，部署侧只读不猜）。
+
+        schema v2 相对 v1 补齐了：``feat_dim`` / ``token_dim`` / 输入特征版本 /
+        Teacher objective 版本 / horizon / git commit。缺这些字段时部署侧只能靠
+        ``hidden``/``depth`` 猜输入宽度（state64 vs 35 维），正是历史上"训 A 部署 B"的来源。
+        """
+        net = getattr(self, "delta_token_net", None)
+        tcfg = getattr(self, "_teacher_cfg_last", None) or {}
+        _full = bool(getattr(self.v3, "delta_token_fullstate", False))
+        meta = {
+            "schema_version": int(self.DELTA_TOKEN_META_SCHEMA),
+            "hidden": int(getattr(self.v3, "delta_token_hidden", 1024) or 1024),
+            "init_std": float(getattr(self.v3, "delta_token_init_std", 4e-4) or 0.0),
+            "depth": int(getattr(self.v3, "delta_token_depth", 2) or 2),
+            "cap": float(getattr(self.v3, "delta_token_cap", 0.0) or 0.0),
+            "feat_dim": int(getattr(net, "feat_dim", 64 if _full else 35)),
+            "token_dim": int(getattr(net, "token_dim", 64)),
+            # 输入特征的**语义版本**（部署端按字符串分支，不要按维度猜）
+            "input_features": ("state64[rot6d6|dof_pos29|dof_vel29]" if _full
+                               else "rot6d6+dof_vel29"),
+            "input_features_version": ("deploy_state64_v1" if _full else "legacy_35_v1"),
+            "apply": "broadcast_shared_over_chunk",
+            "norm_cap": "apply_norm_cap(tanh)",
+            # Teacher 目标语义（学生是用什么标签训出来的）
+            "teacher_objective": (self.LEGACY_TEACHER_OBJECTIVE_VERSION
+                                  if tcfg.get("teacher") == "legacy"
+                                  else self.TEACHER_OBJECTIVE_VERSION),
+            "teacher_reward": str(tcfg.get("reward", "discounted")),
+            "teacher_horizon": int(tcfg.get("horizon", int(self.cfg.horizon))),
+            "teacher_eta": float(tcfg.get("eta", getattr(self.v3, "grad_target_eta", 0.08))),
+            "teacher_n": int(tcfg.get("n", getattr(self.v3, "grad_target_n", 0))),
+            "grad_target_weight": float(getattr(self.v3, "grad_target_weight", 0.0) or 0.0),
+            "trained_steps": int(getattr(self, "steps", 0)),
+            "git_commit": self._git_commit(),
+        }
+        return meta
 
     def save_vla(self, path, *, extra: dict | None = None):
         """带上 ``state_extra_scale``（否则下一轮续接时这 6 个数会丢，新维度白学）。"""
@@ -486,12 +990,7 @@ class JointTrainerV3(JointTrainerV2):
                 k: v.detach().to("cpu", dtype=torch.float32)
                 for k, v in self.delta_token_net.state_dict().items()
             }
-            _extra["delta_token_meta"] = {
-                "hidden": int(getattr(self.v3, "delta_token_hidden", 1024) or 1024),
-                "init_std": float(getattr(self.v3, "delta_token_init_std", 4e-4) or 0.0),
-                "depth": int(getattr(self.v3, "delta_token_depth", 2) or 2),
-                "cap": float(getattr(self.v3, "delta_token_cap", 0.0) or 0.0),
-            }
+            _extra["delta_token_meta"] = self.delta_token_meta()
         return super().save_vla(path, extra=_extra)
 
     # ------------------------------------------------------------------ 真数据 critic
@@ -730,6 +1229,8 @@ class JointTrainerV3(JointTrainerV2):
                 _marks.append((_n, _time_p.perf_counter()))
 
         _mark("start")
+        # ★ 2026-11-07（会话 02）：分项 loss 记录器（只在 J1_EPS_GRAD=1 时被消费）。
+        self._loss_terms = {}
         self.bundle.policy.eval()
         self.bundle.wm.eval()
         self.head_mode()
@@ -754,6 +1255,14 @@ class JointTrainerV3(JointTrainerV2):
         x_norm, x_raw, tokens = self._sample_tokens(act_in, bb_out, noise=_noise)
         # 冻结主采样点的量化诊断：下面 trust-center（prev/base）还会再采样，会覆盖 _quant_stats
         self._quant_main = self.quant_metrics()
+        # ★ 2026-11-07（会话 02，诊断）：同一 batch 用**fresh noise** 再采一次 token chunk。
+        #   目的：量"冻结 VLA 的采样噪声"在 Teacher 标签里占多大（同窗口两次采样标签的 cos）。
+        #   默认关；只在缓存/诊断跑里开（多一次 2B 前向）。
+        self._dt_alt_chunk = None
+        if os.environ.get("J1_TEACHER_RESAMPLE", "0") == "1":
+            # ⚠️ 不能包 no_grad：`sample_once_with_grad` 会显式拒绝无梯度上下文
+            _, _, _tok_alt = self._sample_tokens(act_in, bb_out)
+            self._dt_alt_chunk = _tok_alt.detach()
         _mark("fm_sample")
         out_of_range = self.codec.out_of_range_frac(x_norm)
 
@@ -890,6 +1399,12 @@ class JointTrainerV3(JointTrainerV2):
                 loss_r = -_red(ret + boot)
         else:
             loss_r = -_red(ret + boot)
+        # 记录"当前训练 rollout 的纯奖励项"（不含 boot/adv），
+        # J1_EPS_GRAD 的诊断拿它和 Teacher 的 reward-only 梯度对齐比较。
+        self._loss_terms = {
+            "reward": float(v3.lambda_r) * loss_r,
+            "reward_pure": -float(v3.lambda_r) * _red(ret),
+        }
         _mark("self_adv")
 
         # ---------- (B) state 项：把**误差直接反传**（2026-10-30 新增到 v3）----------
@@ -964,6 +1479,7 @@ class JointTrainerV3(JointTrainerV2):
             loss_anchor = torch.nn.functional.mse_loss(
                 tokens[:, :n_anchor].float(), prior[:, :n_anchor].float())
             loss = loss + v3.anchor_weight * loss_anchor
+            self._loss_terms["anchor"] = v3.anchor_weight * loss_anchor
         # ---- token trust region：relu(RMSE/eps − 1)^2 ----
         loss_trust = None
         rmse_tok = None
@@ -1000,6 +1516,7 @@ class JointTrainerV3(JointTrainerV2):
             else:
                 loss_trust = float(v3.trust_weight) * excess.pow(2).mean()
             loss = loss + loss_trust
+            self._loss_terms["trust"] = loss_trust
         # ---- 动作空间 trust region：relu(RMS(a − a_ref)/eps − 1)^2 ----
         # 参照 = **用标签 token 跑同一段 rollout** 得到的动作序列（无梯度）。
         # 为什么不用库里的命令 q_cmd：实测 WBC 的动作与 (q_cmd−dq)/scale 有 ~1.1 RMS 的
@@ -1089,6 +1606,7 @@ class JointTrainerV3(JointTrainerV2):
                 else:
                     _pen = excess_a.pow(2)
             loss_act = float(v3.act_weight) * _pen.mean()
+            self._loss_terms["act"] = loss_act
             if float(v3.act_weight) > 0:
                 loss = loss + loss_act
 
@@ -1114,6 +1632,7 @@ class JointTrainerV3(JointTrainerV2):
                 _ratio = _num / _den
                 loss_var = -_vw * torch.log(_ratio + 1e-3)
                 loss = loss + loss_var
+                self._loss_terms["var"] = loss_var
                 self._var_ratio = float(_ratio.detach())
                 self._var_mu_rms = float(_den_raw.detach())
 
@@ -1419,6 +1938,7 @@ class JointTrainerV3(JointTrainerV2):
         _gt_loss, _gt_meta = self._grad_target_loss(batch)
         if _gt_loss is not None:
             loss = loss + float(v3.grad_target_weight) * _gt_loss
+            self._loss_terms["grad_target"] = float(v3.grad_target_weight) * _gt_loss
             self._grad_target_meta = dict(_gt_meta)
 
         # ---------- P1：动作空间目标（2026-11-05，v2 修正）----------
@@ -1599,6 +2119,12 @@ class JointTrainerV3(JointTrainerV2):
         self._accum_count += 1
         if self._accum_count == 1:
             self.optimizer.zero_grad(set_to_none=True)
+        # ★ 2026-11-07（会话 02，J1_EPS_GRAD=1 才跑）：逐项 dL/dε（ε=广播 Δ）。
+        #   必须在 backward 之前算（retain_graph=True），否则图已释放。
+        if os.environ.get("J1_EPS_GRAD", "0") == "1":
+            _eps_rec = self._log_eps_grad(loss)
+            if _eps_rec:
+                metrics.update(_eps_rec)
         (loss / accum).backward()
         if self._accum_count >= accum:
             # ★ DDP：只在累积边界做一次梯度 all_reduce（等价于全局 batch = 各卡之和）。
