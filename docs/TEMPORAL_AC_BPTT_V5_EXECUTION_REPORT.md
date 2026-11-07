@@ -1,5 +1,8 @@
 # v5 主线执行报告（worktree `comimic-wt03` / `harness/03-bptt-diagnosis`）
 
+> ★ **给审阅者**：问题、证据、结论、候选修复方案已单独整理成自包含文档
+> `docs/TEMPORAL_AC_BPTT_V5_DIAGNOSIS_AND_ITERATION.md`（含给 GPT 的问题清单）。
+
 > 规范：`docs/TEMPORAL_AC_BPTT_V5_MAINLINE_SPEC.md`。
 > 本文只记录**本机实际做了什么、验证结果、与规范的偏差**；不复述规范。
 > 生成时间：2026-11-07 20:5x（训练进行中，见 §6 的实时状态）。
