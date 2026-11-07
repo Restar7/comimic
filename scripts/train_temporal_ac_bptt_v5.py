@@ -323,12 +323,35 @@ def eval_split(env, ws, actor, *, H: int, cap: float, use_history: bool,
         hist = w.history[:, :, :HIST_DIM].contiguous().to(dev) if use_history else None
         m = mask_full[None, :].expand(len(w), -1)
         delta = actor(b["tokens"], b["state64"], hist, m, cap=float(cap))
-        J, extra = masked_return(env, {**b, "tokens": b["tokens"] + delta}, H)
+        # 同观测动作预算：记录修正 rollout 的每步 obs93，再用同一 obs + 基础 token 重解
+        _rec: list = []
+        _oe = env.bundle.executor.act
+
+        def _esc(token, obs93):
+            _rec.append(obs93)
+            return _oe(token, obs93)
+
+        env.bundle.executor.act = _esc
+        try:
+            J, extra = masked_return(env, {**b, "tokens": b["tokens"] + delta}, H)
+        finally:
+            env.bundle.executor.act = _oe
         Js.append(J.detach().cpu())
         dn.append(float(delta.norm(dim=-1)[:, : int(mask_full.sum())].mean()))
         q_corr = q_target_from_action(env.bundle.default_joint_pos,
                                       env.bundle.action_scale,
                                       extra["actions"].float().permute(1, 0, 2))
+        if len(_rec) >= H:
+            _rows = [q_target_from_action(
+                env.bundle.default_joint_pos, env.bundle.action_scale,
+                _oe(b["tokens"][:, _ti], _ob.detach()).float())
+                for _ti, _ob in enumerate(_rec[:H])]
+            q_base_same = torch.stack(_rows, dim=1)                 # (B,H,29)
+            e_same = joint_error_rad(q_corr, q_base_same.detach())
+            st_same = action_budget_stats(e_same, torch.ones(len(w), H, device=dev))
+        else:
+            st_same = dict(rms_mrad=float("nan"), peak_mrad=float("nan"),
+                           p99_mrad=float("nan"), steps=0.0, samples=0.0)
         msk = torch.ones(len(w), H, device=dev)
         if want_base:
             J0, extra0 = masked_return(env, b, H)
@@ -342,7 +365,9 @@ def eval_split(env, ws, actor, *, H: int, cap: float, use_history: bool,
             if q_base_cache is None:
                 raise SystemExit("[v5] eval 需要 base 动作缓存（want_base=True 先跑一次）")
             q_base = q_base_cache[s:s + len(w)].to(dev)
-        stats.append(action_budget_stats(joint_error_rad(q_corr, q_base.detach()), msk))
+        st_traj = action_budget_stats(joint_error_rad(q_corr, q_base.detach()), msk)
+        st_traj.update({f"same_obs_{k}": v for k, v in st_same.items()})
+        stats.append(st_traj)
     out = dict(J=torch.cat(Js) if Js else torch.zeros(0),
                delta_norm=float(np.mean(dn)) if dn else 0.0,
                stats={k: float(np.mean([s[k] for s in stats])) for k in stats[0]} if stats else {})
