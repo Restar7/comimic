@@ -36,8 +36,12 @@ def quat_to_rot6(q: np.ndarray) -> np.ndarray:
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     n = np.sqrt(w * w + x * x + y * y + z * z) + 1e-9
     w, x, y, z = w / n, x / n, y / n, z / n
-    return np.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y),
-                     2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], 1).astype(np.float32)
+    # ★ 2026-11-07 修正：元素顺序必须与**线上**一致（`state_extra.mat_to_rot6d_wire` /
+    #   HA `quat_to_rotation_6d`）：``[m00, m01, m10, m11, m20, m21]``，即 R[:, :2] 行优先。
+    #   之前写成了列优先 ``[m00, m10, m20, m01, m11, m21]`` ⇒ 训练/部署特征错位（静默）。
+    return np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z),
+                     2 * (x * y + w * z), 1 - 2 * (x * x + z * z),
+                     2 * (x * z + w * y), 2 * (y * z - w * x)], 1).astype(np.float32)
 
 
 def load(d: str) -> dict[str, np.ndarray]:
@@ -145,11 +149,38 @@ def main() -> int:
     tmpl = Path(a.template)
     ck = torch.load(tmpl, map_location="cpu", weights_only=False) if tmpl.exists() else {}
     ck["delta_token_state"] = best_state
-    ck["delta_token_meta"] = {"hidden": int(a.hidden), "depth": int(a.depth),
-                             "init_std": 4e-4, "cap": 0.0, "feat_dim": int(X.shape[1] - 64),
-                             "trained": "offline-distill", "eta": float(a.eta),
-                             "heldout_cos": float(best), "n_labels": int(len(X)),
-                             "holdout_clusters": hold.tolist()}
+    # ★ schema v2：与 `V3Trainer.delta_token_meta()` **同键**，部署侧（delta_token_io）
+    #   才能不靠猜地读出输入契约；缺字段会退回 legacy 推断（有告警、但不该出现在新产物上）。
+    _feat_dim = int(X.shape[1] - 64)
+    _full = _feat_dim == 64
+    ck["delta_token_meta"] = {
+        "schema_version": 2,
+        "hidden": int(a.hidden),
+        "depth": int(a.depth),
+        "init_std": 4e-4,
+        "cap": 0.0,
+        "feat_dim": _feat_dim,
+        "token_dim": 64,
+        "input_features": ("state64[rot6d6|dof_pos29|dof_vel29]" if _full
+                           else "rot6d6+dof_vel29"),
+        "input_features_version": ("deploy_state64_v1" if _full else "legacy_35_v1"),
+        "feat_joint_order": "standard",       # 与训练侧 `_delta_token_features` 同序
+        "apply": "broadcast_shared_over_chunk",
+        "norm_cap": "apply_norm_cap(tanh)",
+        "teacher_objective": "shared_delta_discounted_v1",
+        "teacher_reward": "discounted",
+        "teacher_horizon": 20,
+        "teacher_eta": float(a.eta),
+        "teacher_n": 0,
+        "grad_target_weight": 1.0,
+        "trained_steps": int(a.epochs),
+        "trained": "offline-distill",
+        "eta": float(a.eta),
+        "heldout_cos": float(best),
+        "n_labels": int(len(X)),
+        "holdout_clusters": hold.tolist(),
+        "target": str(a.target),
+    }
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ck, out)

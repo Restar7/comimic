@@ -401,6 +401,9 @@ class JointTrainerV3(JointTrainerV2):
         #   而 Δ 实际加在 VLA 本次前向输出的 token 上 ⇒ 两者不是同一个点，
         #   ĝ 的方向对不上标的 token ⇒ 网络只能学到"长度"（ratio≈1）而学不到方向（cos≈0.05）。
         self._dt_base_tok = base_tok
+        # ★ 2026-11-07：整段 chunk 也留下 —— 标签点必须在这里（与部署 chunk64 同源），
+        #   而且逐帧标签需要 (B,T,64) 的梯度，不能只用第 0 帧。
+        self._dt_tok_chunk = tokens.detach()
         self._dt_base_chunk = tokens.detach()
         d = self.delta_token_net(base_tok, feat)
         # ★ **状态敏感度**（2026-11-06）：同一批 token，把状态打乱再算一次。
@@ -1705,16 +1708,23 @@ class JointTrainerV3(JointTrainerV2):
                 #   一次 backward 即得，比 20 次 Jacobian 连乘干净。用它回答"原路线（Δ 加在
                 #   token 上）到底有没有可学信息"，而不是靠 A 空间的结果反推。
                 if __import__("os").environ.get("J1_GRAD_DUMP_TOK", "0") == "1":
+                    # ★★ 2026-11-07 三处口径修正（用户要求，逐条对应）：
+                    #   ① 标签点：**VLA 本次前向的整段 chunk**（= 部署的 chunk64），
+                    #      不再是 `batch.port_tokens`（数据集录制 token）；
+                    #   ② 逐帧：存 (B,T,64)，**不取平均**（部署是逐帧修正）；
+                    #   ③ 目标：`discounted_return`（与主训练/规范 Teacher 同定义），
+                    #      不再是 `rewards.sum()`；
+                    #   ④ 另外把"10 帧 obs 历史"原样存下来（内容层面以后可离线核对/重算）。
                     from diff_vla_wbc.isaac_joint import FrameRef  # noqa: PLC0415
+                    from diff_vla_wbc.rollout import discounted_return as _dret  # noqa: PLC0415
                     from diff_vla_wbc.rollout import imagine_with_tokens as _iwt  # noqa: PLC0415
-                    _tp = getattr(batch, "port_tokens", None)
+                    _tp = getattr(self, "_dt_tok_chunk", None)
                     if _tp is None:
-                        raise RuntimeError("没有 port_tokens")
+                        raise RuntimeError("没有 _dt_tok_chunk（Δ 分支没跑？）")
                     if _tp.ndim == 2:
                         _tp = _tp[:, None, :]
-                    # ★ 只在**子批**上算 ĝ（`J1_GRAD_DUMP_N`）：20 步带梯度 rollout 的成本
-                    #   随 batch 线性增长 ⇒ 这是把"3 万条标签"从 7 小时压到 1 小时内的关键。
-                    _tp = _tp[_sl]
+                    # 只在**子批**上算 ĝ（`J1_GRAD_DUMP_N`）：20 步带梯度 rollout 成本随 batch 线性
+                    _tp = _tp[_sl].contiguous()
                     _refs = []
                     for _r in batch.references:
                         _f = getattr(_r, "f", None)
@@ -1733,12 +1743,38 @@ class JointTrainerV3(JointTrainerV2):
                             references=_refs, prev_action=batch.prev_action[_sl],
                             horizon=int(cfg.horizon),
                         )
+                        _J20 = _dret(_ro, float(v3.gamma))          # ★ 与主训练同一口径
                         _g1t = torch.autograd.grad(_ro.rewards[0].sum(), _tg, retain_graph=True)[0]
-                        _gHt = torch.autograd.grad(_ro.rewards.sum(), _tg)[0]
-                    _X["g_tok1"] = _g1t.detach().float().mean(1).cpu().numpy()   # (B,64)
-                    _X["g_tokH"] = _gHt.detach().float().mean(1).cpu().numpy()   # (B,64)
+                        _gHt = torch.autograd.grad(_J20.sum(), _tg)[0]
+                    # 逐帧（不平均）+ 兼容旧消费者的平均版
+                    _X["g_tok_pert"] = _gHt.detach().float().cpu().numpy()          # (B,T,64)
+                    _X["g_tok1_pert"] = _g1t.detach().float().cpu().numpy()         # (B,T,64)
+                    _X["g_tokH"] = _gHt.detach().float().mean(1).cpu().numpy()      # (B,64) 旧口径
+                    _X["token_chunk"] = _tp.detach().float().cpu().numpy()          # (B,T,64) VLA chunk
                     _X["actH"] = _ro.actions.detach().float().transpose(0, 1).reshape(
-                        _ro.actions.shape[1], -1).cpu().numpy()                 # (B,H*29)
+                        _ro.actions.shape[1], -1).cpu().numpy()                     # (B,H*29)
+                    _X["J20"] = _J20.detach().float().cpu().numpy()
+                    _X["token_vla0"] = _tp.detach().float()[:, 0].cpu().numpy()      # (B,64) 与部署 chunk64[0] 同源
+                    # ④ 10 帧历史：既存**原样**（训练侧 term-major 93 维），也存
+                    #    **部署布局的 930 维**（`diff_vla_wbc.deploy_obs`，与 SONIC decoder
+                    #    输入里那一块逐位同构）。后者由单元测试
+                    #    `tests/test_deploy_obs_alignment.py` 保证与部署侧拼装一致。
+                    if _hist is not None:
+                        _h = _hist.detach().float()
+                        _h = _h.permute(1, 0, 2) if _h.shape[0] == 10 else _h        # (B,10,W)
+                        _X["hist10"] = _h.cpu().numpy()
+                        _X["hist_width"] = int(_h.shape[-1])
+                        try:
+                            from diff_vla_wbc.deploy_obs import to_deploy_obs_hist  # noqa: PLC0415
+                            _xi = getattr(batch, "xi", None)
+                            _xi_dq0 = (_xi[_sl][:, 1:30].detach().float().cpu().numpy()
+                                       if _xi is not None else None)
+                            _X["obs_deploy930"] = to_deploy_obs_hist(
+                                _h, xi_dq0=_xi_dq0).astype("float32")                   # (B,930)
+                        except Exception as _e4:  # noqa: BLE001 - 只影响附加字段
+                            print(f"[gradump][warn] obs_deploy930: {_e4}", flush=True)
+                    elif _oh is not None:
+                        _X["obs_hist"] = _oh.detach().float().cpu().numpy()
                 import os as _os  # noqa: PLC0415
                 _os.makedirs(_dumpdir, exist_ok=True)
                 # ★ DDP：每个 rank 各写各的文件（否则同名互相覆盖）
