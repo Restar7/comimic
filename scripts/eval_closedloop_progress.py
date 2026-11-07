@@ -30,13 +30,13 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 
-def demo_paths(min_len: int = 200):
+def demo_paths(min_len: int = 200, task_filter: str = "double_desk"):
     pk = torch.load(ROOT / "runs/isaac_motion/ha_cmd/packed.pt", map_location="cpu",
                     weights_only=False)
     names, starts, lengths = list(pk["names"]), pk["starts"], pk["lengths"]
     out = []
     for i, n in enumerate(names):
-        if "double_desk" not in str(n):
+        if task_filter and task_filter not in str(n):
             continue
         s, L = int(starts[i]), int(lengths[i])
         if L < min_len:
@@ -77,8 +77,10 @@ def score(traj: np.ndarray, paths):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", nargs="+", required=True, metavar="TAG=DIR")
+    ap.add_argument("--task", default="double_desk",
+                    help="示范路径按任务名过滤（子串）；OpenDoor 用 open_door，置空则不过滤")
     a = ap.parse_args()
-    paths = demo_paths()
+    paths = demo_paths(task_filter=a.task)
     print(f"[eval] 示范路径 {len(paths)} 条（HOI_double_desk）")
     agg: dict[str, list[dict]] = {}
     for spec in a.runs:

@@ -48,5 +48,19 @@ if [[ -z "$_DEPS_VENDOR" ]]; then
   echo "[deps_env] av+skimage 都来自系统 python3（含编译扩展）✓" >&2
 fi
 
-export PYTHONPATH="${_DEPS_VENDOR}$COMIMIC:$COMIMIC/Isaac-GR00T:$COMIMIC/third_party/gr00t_deps:$COMIMIC/third_party/gr00t_deps/_noflash${PYTHONPATH:+:$PYTHONPATH}"
+# 2026-11-06：`third_party/gr00t_deps/skimage` 被换成了 **cp311** 构建（05:06），
+# 而本机 python3 = 3.12 ⇒ 一旦 gr00t_deps 进了 PYTHONPATH，就会用那份坏的 skimage，
+# 报 `ModuleNotFoundError: No module named 'skimage.measure._ccomp'`
+# （训练在 load_gr00t_processor 就崩：albumentations → skimage.measure.label）。
+# 上面的探测是在**没有** gr00t_deps 的路径下做的，探不出来 ⇒ 这里单独兜一层：
+#   py3.12 时把 py312_shims（里面 skimage -> 系统 0.26.0 的 cp312 构建）排在 gr00t_deps 前面。
+_DEPS_SHIMS=""
+if python3 -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"; then
+  if [[ -e "$COMIMIC/third_party/py312_shims/skimage" ]]; then
+    _DEPS_SHIMS="$COMIMIC/third_party/py312_shims:"
+    echo "[deps_env] py3.12 ⇒ 前置 third_party/py312_shims（遮住 gr00t_deps 里 cp311 的 skimage）" >&2
+  fi
+fi
+
+export PYTHONPATH="${_DEPS_VENDOR}$COMIMIC:$COMIMIC/Isaac-GR00T:${_DEPS_SHIMS}$COMIMIC/third_party/gr00t_deps:$COMIMIC/third_party/gr00t_deps/_noflash${PYTHONPATH:+:$PYTHONPATH}"
 export NO_ALBUMENTATIONS_UPDATE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1

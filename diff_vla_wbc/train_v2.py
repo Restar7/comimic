@@ -139,13 +139,19 @@ class JointTrainerV2:
         # ---------------- J5 / S3.2：执行器与动力学完全冻结 -----------------
         self._freeze_executor()
         self.fm_parameters = [p for p in vlm.action_head.parameters() if p.requires_grad]
-        if not self.fm_parameters:
-            raise SystemExit("[v2] action head 没有可训练参数（tune_* 全 False？）")
         self.wbc_parameters = [p for p in bundle.policy.parameters() if p.requires_grad]
-        _groups = [{"params": self.fm_parameters, "lr": self.cfg.fm_lr}]
+        _groups = []
+        if self.fm_parameters:
+            _groups.append({"params": self.fm_parameters, "lr": self.cfg.fm_lr})
         if self.wbc_parameters:
             _groups.append({"params": self.wbc_parameters, "lr": float(self.cfg.wbc_lr)})
-        self.optimizer = torch.optim.AdamW(_groups, weight_decay=self.cfg.weight_decay)
+        if _groups:
+            self.optimizer = torch.optim.AdamW(_groups, weight_decay=self.cfg.weight_decay)
+        else:
+            # ★ 2026-11-06：允许 **VLA 全冻（lora_rank=0）+ 无可训 WBC** ——
+            #   这时可训参数只有子类（v3）后面才建的 delta-token / state_extra。
+            #   `AdamW([])` 会直接报 "empty parameter list"，所以推迟到 `_ensure_optimizer()`。
+            self.optimizer = None
         self._ratio_params = grad_ratio_parameters(vlm.action_head)
         self._accum_count = 0
         self.last_metrics: dict[str, float] = {}
@@ -161,6 +167,23 @@ class JointTrainerV2:
             f"head_eval={self.cfg.head_eval_mode}",
             flush=True,
         )
+
+    def _ensure_optimizer(self, params, lr: float) -> None:
+        """延迟建优化器 / 追加参数组。
+
+        为什么需要：`--freeze-vla`（无 LoRA）+ 无 WBC 时，基类建不出优化器（空参数列表会
+        直接抛异常），而可训参数是子类后面才创建的（delta-token / state_extra）。
+        """
+        params = [p for p in params if p is not None and getattr(p, "requires_grad", True)]
+        if not params:
+            return
+        if self.optimizer is None:
+            self.optimizer = torch.optim.AdamW(
+                [{"params": params, "lr": float(lr)}], weight_decay=self.cfg.weight_decay)
+            self.log(f"[AUDIT][opt] 延迟建优化器（VLA 无 LoRA）："
+                     f"{sum(p.numel() for p in params):,} 参数 lr={float(lr):g}")
+        else:
+            self.optimizer.add_param_group({"params": params, "lr": float(lr)})
 
     # ------------------------------------------------------------------ distributed
     def _sync_param_grads(self) -> None:
@@ -184,6 +207,11 @@ class JointTrainerV2:
         _se = getattr(self, "state_extra_scale", None)
         if _se is not None and _se.grad is not None:
             grads.append(_se.grad)
+        # ★ 2026-11-06：delta-token 也是**单独** param group（不在 fm_parameters 里），
+        #   不同步的话两个 rank 会训练出两个不同的 g ⇒ rank0 存出来的只是它那份。
+        _dt = getattr(self, "delta_token_net", None)
+        if _dt is not None:
+            grads += [p.grad for p in _dt.parameters() if p.grad is not None]
         if not grads:
             return
         import os as _os
@@ -728,6 +756,16 @@ def fixed_eval(
 
             x_raw = trainer.codec.decode(x_norm)
             tokens_vla = x_raw[..., :64]
+            # ★ 2026-11-06：**评测也必须加 Δtoken**，否则 `imag_reward_vla / token_shift / win`
+            #   全都还是"底模 token"的数 —— 实测后果：step 0 与 step 50 的评测值**逐位相同**
+            #   （因为 g 的改动根本没进评测），这条曲线就完全失去了判读价值。
+            #   口径与 `train_step` 完全一致：取窗口起点的命令 token + 起点偏差，广播到整段。
+            _dt_net = getattr(trainer, "delta_token_net", None)
+            if _dt_net is not None:
+                _dt_fn = getattr(trainer, "_delta_token_delta", None)
+                if _dt_fn is None:
+                    raise SystemExit("[eval] 有 delta_token_net 但没有 _delta_token_delta")
+                tokens_vla = tokens_vla + _dt_fn(b, tokens_vla).to(tokens_vla.dtype)
             if decode_diag:
                 n = min(tokens_vla.shape[1], b.port_tokens.shape[1])
                 add("token_mse_decoded", F.mse_loss(tokens_vla[:, :n], b.port_tokens[:, :n].float()))

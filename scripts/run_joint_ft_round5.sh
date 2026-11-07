@@ -43,7 +43,7 @@ export ACT_PENALTY=${ACT_PENALTY:-hinge}
 export REWARD_HORIZON=${REWARD_HORIZON:-0}
 export ACT_EPS=${ACT_EPS:-0.30} ACT_WEIGHT=${ACT_WEIGHT:-0.20}
 export TRUST_CENTER=base TRUST_EPS=${TRUST_EPS:-0.05} TRUST_WEIGHT=${TRUST_WEIGHT:-0.5}
-export GAMMA=0.95 CRITIC_ON=0 ADV_BASELINE=none ADV_TAU=0
+export GAMMA=${GAMMA:-0.95} CRITIC_ON=${CRITIC_ON:-0} CRITIC_SOURCE=${CRITIC_SOURCE:-imagined} ADV_BASELINE=${ADV_BASELINE:-none} ADV_TAU=${ADV_TAU:-0}
 export RUN=${RUN:-joint_v5} STEPS=${STEPS:-400}
 export EVAL_EVERY=${EVAL_EVERY:-50} SAVE_EVERY=${SAVE_EVERY:-200}
 export DDP=1 NPROC=${NPROC:-4} DDP_GPUS=${DDP_GPUS:-0,1,2,3}
@@ -59,7 +59,11 @@ echo "[r5] 手部：服务端 $SRV_EXTRA"
 
 # ---- 启动前硬门（任一条不满足就 exit 9）--------------------------------------
 [[ -f "$WM_CKPT" ]] || { echo "[r5][FAIL] WM_CKPT 不存在：$WM_CKPT" >&2; exit 9; }
-[[ -f "$DIR/filtered_std.pt" ]] || { echo "[r5][FAIL] 缺 $DIR/filtered_std.pt" >&2; exit 9; }
+# ★ 2026-11-06：不再假设起点一定是 $DIR/filtered_std.pt（leash）；
+#   改成校验 EXTRA 里**实际传给** --real-transitions 的那个文件。
+_TRANS=$(printf '%s' "$EXTRA" | sed -n 's/.*--real-transitions \([^ ]*\).*/\1/p')
+[[ -n "$_TRANS" && -f "$_TRANS" ]] || { echo "[r5][FAIL] 起点 transitions 不存在：${_TRANS:-<未在 EXTRA 里指定 --real-transitions>}" >&2; exit 9; }
+echo "[r5] 起点集合：$_TRANS"
 python3 - "$WM_CKPT" "$TRUST_EPS" "$TRUST_WEIGHT" "$ACT_EPS" "$REWARD_VEL_SCALE" "$ACT_WEIGHT" <<'PYG' || exit 9
 import sys
 from pathlib import Path

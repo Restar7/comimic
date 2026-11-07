@@ -1,7 +1,7 @@
 {
   "version": 1,
   "purpose": "HA 闭环推理锁死契约：场景/资产/机器人初始位姿/仿真参数/编解码器",
-  "created_utc": "2026-11-03T19:46:00+00:00",
+  "created_utc": "2026-11-06T07:12:45+00:00",
   "ha_root": "/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic/third_party/HumanoidArena/isaaclab_twist2_g1",
   "robot_type": "unitree_g1_refpose_v3_1",
   "protocol": {

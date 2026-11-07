@@ -117,6 +117,36 @@ REWARD_MODE=${REWARD_MODE:-saturating}   # 用 WM 当裁判时必须 linear（�
 POSTURE_WEIGHT=${POSTURE_WEIGHT:-0.0}    # 摔倒/歪斜的连续惩罚
 REWARD_VEL_SCALE=${REWARD_VEL_SCALE:-1.0}
 TERM_OFF=${TERM_OFF:-0}   # 1 = 关掉存活折扣（新 WM 的 soft_termination 会误触发） # WM 速度通道最不准（qd_corr≈0.64），可设 0
+# ★ 2026-11-06：改成**显式数组**，不再用 `$( [[ ... ]] && echo ... )` 命令替换（实测会被吞，
+#   导致 term_off 没传进训练器、survival<1、回报被砍半）。我们所有轮次都想要 --term-off。
+VAR_WEIGHT=${VAR_WEIGHT:-0}
+TERM_OFF_ARG=""
+[[ "$TERM_OFF" == "1" ]] && TERM_OFF_ARG="--term-off"
+# ★ 2026-11-06：**命令层残差**（DELTA_TOKEN=1）—— 与 LoRA/state_extra/var 并行的第四条路。
+#   默认 0 ⇒ 不传任何参数，现有行为逐位不变。
+DELTA_TOKEN=${DELTA_TOKEN:-0}
+DELTA_TOKEN_HIDDEN=${DELTA_TOKEN_HIDDEN:-1024}  # 99→1024→1024→64 = 1,217,600 参数
+DELTA_TOKEN_INIT_STD=${DELTA_TOKEN_INIT_STD:-4e-4}
+DELTA_TOKEN_LR=${DELTA_TOKEN_LR:-5e-4}   # ★ 独立小 MLP 的 lr，别用 fm_lr(1e-5)
+DELTA_TOKEN_DEPTH=${DELTA_TOKEN_DEPTH:-2}
+DELTA_TOKEN_CAP=${DELTA_TOKEN_CAP:-0}
+FREEZE_VLA=${FREEZE_VLA:-0}
+_DT_ARG=()
+DELTA_TOKEN_FULLSTATE=${DELTA_TOKEN_FULLSTATE:-0}
+GRAD_TARGET_WEIGHT=${GRAD_TARGET_WEIGHT:-0}
+GRAD_TARGET_N=${GRAD_TARGET_N:-16}
+GRAD_TARGET_ETA=${GRAD_TARGET_ETA:-0.08}
+GRAD_TARGET_HORIZON=${GRAD_TARGET_HORIZON:-0}
+WINDOW_NORM=${WINDOW_NORM:-0}
+[[ "$DELTA_TOKEN" == "1" ]] && _DT_ARG=(--delta-token
+    --delta-token-hidden "$DELTA_TOKEN_HIDDEN" --delta-token-depth "$DELTA_TOKEN_DEPTH"
+    --delta-token-init-std "$DELTA_TOKEN_INIT_STD" --delta-token-lr "$DELTA_TOKEN_LR"
+    --delta-token-cap "$DELTA_TOKEN_CAP"
+    --grad-target-weight "$GRAD_TARGET_WEIGHT" --grad-target-n "$GRAD_TARGET_N"
+    --grad-target-eta "$GRAD_TARGET_ETA" --grad-target-horizon "$GRAD_TARGET_HORIZON" \
+    $([[ "$WINDOW_NORM" == "1" ]] && printf '%s' '--window-norm')
+    $([[ "$DELTA_TOKEN_FULLSTATE" == "1" ]] && printf '%s' '--delta-token-fullstate'))
+[[ "$FREEZE_VLA" == "1" ]] && _DT_ARG+=(--freeze-vla)
 REWARD_ROOT_WEIGHT=${REWARD_ROOT_WEIGHT:-}   # root 奖励权重覆盖（我们 ckpt 0.5 / mjlab 1.0）
 REWARD_ROOT_POS_STD=${REWARD_ROOT_POS_STD:-} # root_pos_std 覆盖（我们 0.3 / mjlab 0.2）
 REWARD_ROOT_ORI_STD=${REWARD_ROOT_ORI_STD:-} # root_ori_std 覆盖（我们 0.4 / mjlab 0.25）
@@ -260,7 +290,7 @@ _ARGS=(
   --reward-mode "$REWARD_MODE" --huber-delta "$HUBER_DELTA" --huber-cap "$HUBER_CAP" \
   --reward-delta-pos "$REWARD_DELTA_POS" --reward-delta-ori "$REWARD_DELTA_ORI" \
   --reward-delta-vel "$REWARD_DELTA_VEL" \
-  $( [[ "$TERM_OFF" == "1" ]] && echo --term-off || true ) \
+  ${TERM_OFF_ARG:-} ${VAR_WEIGHT:+--var-weight "$VAR_WEIGHT"} \
   --posture-weight "$POSTURE_WEIGHT" --reward-vel-scale "$REWARD_VEL_SCALE" \
   ${REWARD_ROOT_WEIGHT:+--reward-root-weight "$REWARD_ROOT_WEIGHT"} \
   ${REWARD_ROOT_POS_STD:+--reward-root-pos-std "$REWARD_ROOT_POS_STD"} \
@@ -273,6 +303,7 @@ _ARGS=(
   ${TAIL_POS_CAP:+--tail-pos-cap "$TAIL_POS_CAP"} \
   --tail-cap-slope "$TAIL_CAP_SLOPE" --state-extra "$STATE_EXTRA" \
   --adv-baseline "$ADV_BASELINE" --adv-tau "$ADV_TAU" \
+  "${_DT_ARG[@]}" \
   --executor "${EXECUTOR:-sonic}" ${SONIC_DECODER:+--sonic-decoder "$SONIC_DECODER"} \
   --start-source "$START_SOURCE" --start-max-drift "$START_MAX_DRIFT" \
   --reward-d-max "$REWARD_D_MAX" \
@@ -327,6 +358,21 @@ if [[ "$DDP" == "1" ]]; then
     echo "[launch-v2][ddp] CUDA_VISIBLE_DEVICES=$DDP_GPUS"
   fi
   _LAUNCH=(torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" --no_python python3)
+fi
+# ★ 2026-11-06：DRY_RUN=1 ⇒ 只打印最终命令行然后退出（不占 GPU、不建 run 目录副作用）。
+#   用来核对"命令行选哪条路"是否真的传到了训练器：
+#     DRY_RUN=1 DELTA_TOKEN=1 FREEZE_VLA=1 bash scripts/run_p1_round_b.sh
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  echo "[launch-v2][dry-run] 最终命令："
+  printf '  %q' "${_LAUNCH[@]}" "${_ARGS[@]}"; echo
+  echo "[launch-v2][dry-run] 线路开关："
+  echo "  DELTA_TOKEN=${DELTA_TOKEN:-0} (hidden=${DELTA_TOKEN_HIDDEN:-512} depth=${DELTA_TOKEN_DEPTH:-2} cap=${DELTA_TOKEN_CAP:-0})"
+  echo "  FREEZE_VLA=${FREEZE_VLA:-0}   VAR_WEIGHT=${VAR_WEIGHT:-0}   STATE_EXTRA=${STATE_EXTRA:-none}"
+  echo "  ACTION_TARGET_WEIGHT=${ACTION_TARGET_WEIGHT:-0} ACT_WEIGHT=${ACT_WEIGHT:-0} ACT_EPS=${ACT_EPS:-0}"
+  echo "  WM_CKPT=${WM_CKPT:-<default>}  TERM_OFF=${TERM_OFF:-0}  LORA_RANK=${LORA_RANK:-32}"
+  [[ "${FREEZE_VLA:-0}" == "1" ]] && echo "  ↑ FREEZE_VLA=1 会在训练器里把 lora_rank 强制改成 0（VLA 全冻）"
+  true
+  exit 0
 fi
 if [[ "$_TEE" == "1" ]]; then
   exec "${_LAUNCH[@]}" "${_ARGS[@]}" 2>&1 | tee -a "$LOG"

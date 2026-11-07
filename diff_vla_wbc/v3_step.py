@@ -101,6 +101,44 @@ class V3Config:
     critic_rel_clip: float = 5.0           # V 相对值 clamp（超界梯度为 0）
     # P1-4 稳定性：hinge 上界（min(excess, cap)^2），防止两条 rollout 分叉后一次爆掉
     act_hinge_cap: float = 2.0
+    # ★ 2026-11-06：**反常量项**。直接最大化"跨窗口残差/均值"（= 状态相关度）。
+    #   为什么需要：`action_target` 关掉后就没有任何东西惩罚"固定方向"了（v10 就是这样
+    #   学到 0.398 的常向量）。常量解会让 ratio→0、log→-∞ ⇒ 无法被占。
+    var_weight: float = 0.0
+    # ★ 2026-11-06（与上面三条**并行**，默认关）：**命令层残差** token' = token + g(token, 偏差)。
+    #   为什么另开一条：LoRA/state_extra/反常量项 都是"给信息指望它自己学"，四轮实测
+    #   残差/均值只从 0.098 → 0.164（阈值 0.5），而残差/噪声 3.79→4.00 没变（学的是噪声）。
+    #   这里把状态相关写进**结构**：g 的输入就是偏差特征，末层零初始化 ⇒ 第 0 步与底模逐位相同。
+    #   部署口径零客户端改动（server 用 state64[:6] 与 state64[35:64]）。
+    delta_token: bool = False
+    delta_token_hidden: int = 1024     # 99→1024→1024→64 = 1,217,600 参数（LoRA 的 3.6%）
+    delta_token_depth: int = 2
+    #: 末层初始化 std。**不是严格 0**：`dL/dW_前层 ∝ W_out`，严格 0 会让前两层第 0 步没梯度。
+    #: 4e-4 ⇒ 初始 ‖Δtoken‖ ≈ 0.009（底模 ‖token‖ ≈ 7.9 的 0.12%）⇒ 等价于从底模出发。
+    #: 设 0 可退回严格零初始化（A/B 用）。
+    delta_token_init_std: float = 4e-4
+    #: delta-token 的 lr。**不能跟 fm_lr(1e-5) 走** —— 那是给 2B 主干上的 LoRA 用的；
+    #: 独立的 1.2M 小 MLP 用 1e-5 等于几乎不学（实测 250 步 win 只 0.342→0.382，
+    #: 按此速率追平参考要 ~740 步）。小网络常规区间 3e-4 ~ 1e-3。
+    delta_token_lr: float = 5e-4
+    #: >0 时对 ‖Δtoken‖ 做**软**上限（tanh 收缩，保留梯度）。防止把 token 推出 codec 流形。
+    delta_token_cap: float = 0.0
+    # ★ 2026-11-06（第 2 刀）：特征从 35 维(rot6d+dof_vel) 扩成**部署 state64 全 64 维**
+    #   （多了 dof_pos 29 维 —— 之前根本没用上）。依据：cos 0.24 → 0.39~0.47。
+    delta_token_fullstate: bool = False
+    # ★ 2026-11-06（第 1+3 刀）：**稠密 ĝ 监督** —— 直接把"理想修正方向"当标签回归，
+    #   不再只靠 20 步报酬反传（那条路跨窗口求和只剩均值 ⇒ 常向量）。
+    #   目标 = eta·unit(ĝ_token)，ĝ_token = ∂J/∂token（一次 backward）。
+    #   eta=0.08 = 0.15/1.8（真机实测 WM 高估幅度 1.8×：预测 +0.128 vs 实测 +0.059）。
+    grad_target_weight: float = 0.0
+    grad_target_n: int = 32        # 子批大小（每步只在这 32 个窗口上求 ĝ，控成本）
+    grad_target_eta: float = 0.08  # 目标幅度（token RMS）；★ 已按 1.8× 高估修正
+    grad_target_every: int = 1     # 每几步算一次（>1 时复用上一次的 ĝ）
+    # ★ 2026-11-06（第 5 刀，用户指出的那一刀）：**短视界标签**。
+    #   20 步的 ĝ 是 20 次 Jacobian 连乘，可学性 cos 0.22~0.35；单步 ĝ₁ 无连乘，cos 0.47~0.50。
+    #   部署时每 chunk（16 步）重算一次 ⇒ 短视界标签 = 滚动重规划，与用法一致。
+    #   0 = 沿用 cfg.horizon（老行为）；建议 1~5（真机 H=2 已验证 96/96）。
+    grad_target_horizon: int = 0
     act_eps: float = 0.0              # 0 = 关；容差 = (a − a_ref) 的逐关节 RMS（归一化动作空间）
     act_weight: float = 0.0           # hinge 权重（无量纲）
     # ★ 2026-11-05：惩罚形状。`hinge`（历史默认）= relu(r/eps-1)²，**eps 以内梯度恰为 0**；
@@ -161,6 +199,14 @@ class V3Config:
     #    独占梯度；τ 取"逐窗配对的典型量级"（实测 imag_delta_std≈0.019）。τ=0 ⇒ 退回均值形式
     #    （梯度与现在逐位相同，仅作诊断对照）。
     adv_baseline: str = "none"
+    # ★ 2026-11-07（BPTT 那条路的"求和偏置"解药）：**每窗口梯度归一化**。
+    #   现状：loss_r = -mean(ret_w)，梯度 = Σ_w ∂ret_w/∂θ / B ⇒ 大回报窗口主导，
+    #         而"跨窗口求和只剩均值"正是常向量的机制。
+    #   开启后：每个窗口先按自身量级归一化再加权 ⇒ 每窗口影响力相同
+    #         （梯度里带 1/|ret_w| 权重，等价于逐窗口缩放后的求和）。
+    #   默认 False ⇒ 老行为逐位不变。
+    window_norm: bool = False
+    window_norm_floor: float = 0.2   # 归一化下限（×|ret| 的中位数），防止接近 0 的窗口爆掉
     adv_tau: float = 0.02
 
 
@@ -247,8 +293,8 @@ class JointTrainerV3(JointTrainerV2):
             self.state_extra_scale = torch.nn.Parameter(
                 torch.full((STATE_EXTRA_DIM,), _init, dtype=torch.float32, device=self.device))
             # 进优化器（否则永远是 0 = 白加 6 维）。lr 跟 action head 一致。
-            self.optimizer.add_param_group(
-                {"params": [self.state_extra_scale], "lr": float(self.cfg.fm_lr)})
+            # 用 _ensure_optimizer：`--freeze-vla` 时基类建不出优化器（空参数列表）。
+            self._ensure_optimizer([self.state_extra_scale], float(self.cfg.fm_lr))
             self.v3.state_extra = _extra
             log(f"[AUDIT][state-extra] mode={_extra} slots=46:52 × scale(init={_init:g}) "
                 f"params={self.state_extra_scale.numel()} "
@@ -260,6 +306,173 @@ class JointTrainerV3(JointTrainerV2):
         else:
             self.v3.state_extra = "none"
 
+        # ---- 命令层残差 g(state)：token' = token + g(token, 偏差) ----
+        # 与上面三条路**并行**，默认关（DELTA_TOKEN=0）。开启后 LoRA 可以照样开着（做 A/B），
+        # 但推荐同时冻掉（否则两个可训练通道混在一起，归因不清）。
+        self.delta_token_net = None
+        self._dt_norm = None
+        self._dt_state_sens = None
+        if bool(getattr(self.v3, "delta_token", False)):
+            from .delta_token import FEAT_DIM, STATE64_DIM, DeltaTokenNet  # noqa: PLC0415
+            _fdim = (STATE64_DIM if bool(getattr(self.v3, "delta_token_fullstate", False))
+                     else FEAT_DIM)
+
+            self.delta_token_net = DeltaTokenNet(
+                feat_dim=int(_fdim),
+                hidden=int(getattr(self.v3, "delta_token_hidden", 1024) or 1024),
+                depth=int(getattr(self.v3, "delta_token_depth", 2) or 2),
+                init_std=float(getattr(self.v3, "delta_token_init_std", 4e-4) or 0.0),
+            ).to(self.device)
+            _dt_lr = float(getattr(self.v3, "delta_token_lr", 5e-4) or 5e-4)
+            self._ensure_optimizer(list(self.delta_token_net.parameters()), _dt_lr)
+            log(f"[AUDIT][delta-token] 启用：feat={FEAT_DIM}(rot6d+dof_vel) + token64 → Δtoken64；"
+                f"hidden={getattr(self.v3, 'delta_token_hidden', 256)} "
+                f"params={self.delta_token_net.n_params}"
+                f" lr={float(getattr(self.v3, 'delta_token_lr', 5e-4) or 5e-4):g}"
+                f" cap={float(getattr(self.v3, 'delta_token_cap', 0.0) or 0.0):g}")
+
+        # 兜底：如果既没有 LoRA、没有 WBC、也没有任何延迟添加的参数组 ⇒ 明确失败，
+        # 而不是等到 train_step 里 `self.optimizer.step()` 抛 NoneType。
+        if getattr(self, "optimizer", "missing") is None:
+            raise SystemExit(
+                "[v3] 没有任何可训练参数（既无 LoRA/无 WBC，也未开 --delta-token / --state-extra）。"
+                " 用 --freeze-vla 时必须同时开 --delta-token。")
+
+    # ---------------------------------------------------------------- delta token
+    def _delta_token_features(self, batch) -> torch.Tensor:
+        """``(B, 35)`` = rot6d(6) + dof_vel(29)，与部署 ``state64`` 同口径可复算。
+
+        rot6d 用 **rotlocal6**（heading-canonical，回合起始为 identity）—— 部署端
+        ``state64[:6]`` 就是这个量，所以训练/部署必须走同一条 ``extra6_for``。
+        """
+        from .isaac_joint import flat_state_tuple  # noqa: PLC0415
+        from .state_extra import extra6_for  # noqa: PLC0415
+
+        start = batch.start_state.to(self.device).float()
+        _p, _R, _v, _w, _q, _qd = flat_state_tuple(start)
+        q0 = getattr(batch, "start_quat0", None)
+        if q0 is None:
+            # 兜底：没有回合起始姿态时退化为绝对朝向（与部署口径会有偏，但不会崩）
+            rot6 = extra6_for("abs6", quat=start[:, 3:7])
+        else:
+            rot6 = extra6_for("rotlocal6", quat=start[:, 3:7],
+                              q_init=q0.to(self.device).float().reshape(-1, 4))
+        if bool(getattr(self.v3, "delta_token_fullstate", False)):
+            # ★ 第 2 刀：与部署 state64 逐位同序 —— [ rot6d(6) | dof_pos(29) | dof_vel(29) ]
+            #   dof_pos 是之前完全没喂的那 29 维（cos 0.24 → 0.39~0.47 的主要来源）。
+            return torch.cat([rot6.float(), _q.float(), _qd.float()], dim=-1)
+        return torch.cat([rot6.float(), _qd.float()], dim=-1)
+
+    def _delta_token_delta(self, batch, tokens: torch.Tensor) -> torch.Tensor:
+        """``(B, 1, 64)`` 的广播用 Δtoken（用窗口起点的命令 token[0] + 起点偏差）。"""
+        feat = self._delta_token_features(batch)
+        base_tok = tokens[:, 0].detach()
+        # ★★ 2026-11-07 修复：**标签必须算在这个 token 上**。
+        #   之前 `_grad_target_loss` 用的是 `batch.port_tokens`（**录制数据里的 token**），
+        #   而 Δ 实际加在 VLA 本次前向输出的 token 上 ⇒ 两者不是同一个点，
+        #   ĝ 的方向对不上标的 token ⇒ 网络只能学到"长度"（ratio≈1）而学不到方向（cos≈0.05）。
+        self._dt_base_tok = base_tok
+        d = self.delta_token_net(base_tok, feat)
+        # ★ **状态敏感度**（2026-11-06）：同一批 token，把状态打乱再算一次。
+        #   `‖g(tok,s) − g(tok,s_perm)‖ / ‖g(tok,s)‖` 才是这条路的"残差/均值"等价物：
+        #   原来的 `action_var/ratio` 是跨窗口比较，在 token 残差路径下会被"token 本来就不同"
+        #   混淆（token 里已含相位）；这个量把 token 固定住，只量状态贡献。
+        #   ≈0 ⇒ g 根本没看状态（这条路当场判定无效）；随训练上升 ⇒ 真的在按状态改命令。
+        with torch.no_grad():
+            _perm = torch.randperm(feat.shape[0], device=feat.device)
+            _d_perm = self.delta_token_net(base_tok, feat[_perm])
+            _n = d.norm(dim=-1).mean()
+            self._dt_state_sens = float(((d - _d_perm).norm(dim=-1).mean()
+                                         / _n.clamp_min(1e-9)).detach())
+        # 软上限：**与部署端同一个函数**（口径漂移的唯一防线）
+        from .delta_token import apply_norm_cap  # noqa: PLC0415
+
+        d = apply_norm_cap(d, float(getattr(self.v3, "delta_token_cap", 0.0) or 0.0))
+        self._dt_norm = float(d.norm(dim=-1).mean().detach())
+        self._dt_delta_last = d          # ★ 第 3 刀：稠密监督要用（带梯度）
+        return d.unsqueeze(1)
+
+    # ------------------------------------------------------------------ 第 3 刀
+    def _grad_target_loss(self, batch):
+        """稠密监督：让 Δ 直接对齐 ``eta·unit(∂J/∂token)``。
+
+        为什么这是"最重要的一刀"
+        ------------------------
+        20 步报酬反传时，参数梯度是**跨窗口求和**的 ``Σ_w ∂J_w/∂θ``，各窗口独有的那部分
+        互相抵消，只剩均值 ⇒ 收敛到常向量（四种参数化实测 0.08~0.17 都是同一个病）。
+        而真机 ±δ 实验证明**单窗口的 ĝ 方向本身是好的**（H=2 96/96、H=20 63/64）。
+        所以把 ĝ 当**标签**用：逐窗口回归，不做求和，方向信息就保住了。
+
+        成本：子批 ``grad_target_n`` 个窗口各一次 20 步反传（默认 16 个 ⇒ ~3 s/step）。
+        """
+        w = float(getattr(self.v3, "grad_target_weight", 0.0) or 0.0)
+        delta = getattr(self, "_dt_delta_last", None)
+        if w <= 0 or delta is None:
+            return None, {}
+        try:
+            from .isaac_joint import FrameRef  # noqa: PLC0415
+            from .rollout import imagine_with_tokens  # noqa: PLC0415
+
+            cfg = self.cfg
+            # ★ 优先用"Δ 实际依附的那个 token"（VLA 输出），退路才是录制 token
+            _bt = getattr(self, "_dt_base_tok", None)
+            tok = _bt[:, None, :] if _bt is not None else getattr(batch, "port_tokens", None)
+            if tok is None:
+                return None, {}
+            if tok.ndim == 2:
+                tok = tok[:, None, :]
+            n = max(1, min(int(getattr(self.v3, "grad_target_n", 16) or 16), int(tok.shape[0])))
+            # ★ 第 5 刀：短视界标签（0 ⇒ 用 cfg.horizon）
+            _H_gt = int(getattr(self.v3, "grad_target_horizon", 0) or 0) or int(cfg.horizon)
+            _H_gt = max(1, min(_H_gt, len(batch.references)))
+            sl = slice(0, n)
+            _tok = tok[sl].detach().float().clone().requires_grad_(True)
+            _refs = []
+            for r in batch.references:
+                _f = getattr(r, "f", None)
+                _refs.append(FrameRef(_f[sl].to(self.device)) if _f is not None else r)
+            # history 两种布局都可能（(B,T,w) / (T,B,w)）；有 history 时 obs_hist 会被忽略
+            _hist = getattr(batch, "history", None)
+            _oh = getattr(batch, "obs_hist", None)
+            if _hist is not None:
+                _hist_arg = (_hist[sl] if _hist.shape[0] == tok.shape[0]
+                             else (_hist[:, sl] if _hist.shape[1] == tok.shape[0] else _hist))
+                _oh_arg = None
+            else:
+                _hist_arg = None
+                _oh_arg = (_oh[sl] if (_oh is not None and _oh.shape[0] == tok.shape[0]) else None)
+            with torch.enable_grad():
+                _ro = imagine_with_tokens(
+                    self.bundle, tokens=_tok, state=batch.start_state[sl],
+                    obs_hist=_oh_arg,
+                    history=_hist_arg,
+                    xi=batch.xi[sl], references=_refs,
+                    prev_action=(batch.prev_action[sl] if getattr(batch, "prev_action", None) is not None else None),
+                    horizon=_H_gt,
+                )
+                _J = _ro.rewards.sum()
+                _g = torch.autograd.grad(_J, _tok)[0].mean(1).detach()      # (n,64)
+            _gn = _g.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            eta = float(getattr(self.v3, "grad_target_eta", 0.08) or 0.08)
+            _tgt = (eta * _g / _gn).to(delta.dtype)                        # (n,64)
+            _d = delta.reshape(-1, delta.shape[-1])[:n]
+            loss = ((_d - _tgt) ** 2).sum(-1).mean()
+            with torch.no_grad():
+                _cos = (_d * _g.to(_d.dtype)).sum(-1) / (_d.norm(dim=-1).clamp_min(1e-9) * _gn.squeeze(-1).to(_d.dtype))
+                meta = {
+                    "delta_token/grad_cos": float(_cos.mean()),
+                    "delta_token/grad_norm_ratio": float(_d.norm(dim=-1).mean() / max(eta, 1e-9)),
+                    "delta_token/grad_J": float(_J.detach()),
+                    "delta_token/grad_n": float(n),
+                    "delta_token/grad_H": float(_H_gt),
+                }
+            return loss, meta
+        except Exception as _e:  # noqa: BLE001 - 监督项绝不能挡住训练
+            if not getattr(self, "_gt_warned", False):
+                self._gt_warned = True
+                print(f"[grad-target][warn] {_e}", flush=True)
+            return None, {}
+
     def save_vla(self, path, *, extra: dict | None = None):
         """带上 ``state_extra_scale``（否则下一轮续接时这 6 个数会丢，新维度白学）。"""
         _extra = dict(extra or {})
@@ -268,6 +481,17 @@ class JointTrainerV3(JointTrainerV2):
             _extra["state_extra_mode"] = str(getattr(self.v3, "state_extra", "none"))
             if not _extra.get("state_extra_mode"):
                 raise SystemExit("[state-extra] 保存时 mode 为空")
+        if getattr(self, "delta_token_net", None) is not None:
+            _extra["delta_token_state"] = {
+                k: v.detach().to("cpu", dtype=torch.float32)
+                for k, v in self.delta_token_net.state_dict().items()
+            }
+            _extra["delta_token_meta"] = {
+                "hidden": int(getattr(self.v3, "delta_token_hidden", 1024) or 1024),
+                "init_std": float(getattr(self.v3, "delta_token_init_std", 4e-4) or 0.0),
+                "depth": int(getattr(self.v3, "delta_token_depth", 2) or 2),
+                "cap": float(getattr(self.v3, "delta_token_cap", 0.0) or 0.0),
+            }
         return super().save_vla(path, extra=_extra)
 
     # ------------------------------------------------------------------ 真数据 critic
@@ -512,6 +736,15 @@ class JointTrainerV3(JointTrainerV2):
 
         # A1：观测侧覆写走 prepare_model_inputs（训练/评测同一条路，避免评测看不到改动）
         model_inputs = self.prepare_model_inputs(batch)
+        # ★ 2026-11-06：**VLA 全冻时把主干+FM 采样放进 no_grad**。
+        #   否则 `tokens` 自带整条 2B 主干的计算图，`loss.backward()` 会把 2B 的激活全部
+        #   反传一遍 —— 而里面**一个可训参数都没有**（纯浪费）。实测后果：DDP 下 backward
+        #   直接 OOM（47.4 GiB 只剩 200 MiB）。
+        #   冻 VLA 时唯一需要有梯度的是 `g`（delta-token），把它接在 detach 后的 tokens 上即可。
+        # ⚠️ 不能用 torch.no_grad() 包：`sample_fm_from_features` 在 no_grad 下会主动
+        #   raise（"the joint training graph would be cut"）。VLA 全冻时本来就没有可训参数、
+        #   输入也不带梯度 ⇒ 采样天然不建图，不需要 no_grad。
+        _vla_frozen = not self.fm_parameters
         act_in, bb_out = self._backbone_output(model_inputs)
         _mark("backbone")
         # 固定噪声：自适应头与"底模参照"用**同一个噪声**采样，两者只差 LoRA 增量
@@ -523,6 +756,19 @@ class JointTrainerV3(JointTrainerV2):
         self._quant_main = self.quant_metrics()
         _mark("fm_sample")
         out_of_range = self.codec.out_of_range_frac(x_norm)
+
+        if _vla_frozen:
+            # 显式切断：之后唯一的梯度来源是 `g`
+            x_norm = x_norm.detach(); x_raw = x_raw.detach(); tokens = tokens.detach()
+
+        # 未加 Δ 的底模 token（trust_center=base 的参照；下面可能直接复用，省一次 VLA 前向）
+        tokens_base = tokens
+
+        # ★ 命令层残差：token' = token + g(token_0, 偏差)，**在进 WBC 之前**加。
+        #   只到 g 的梯度（VLA 若冻结则不回传），act/惩罚/diverge 全都不需要改口径。
+        if self.delta_token_net is not None:
+            tokens = tokens + self._delta_token_delta(batch, tokens).to(tokens.dtype)
+            _mark("delta_token")
 
         rollout = imagine_with_tokens(
             self.bundle, tokens=tokens, state=batch.start_state, obs_hist=batch.obs_hist,
@@ -585,6 +831,16 @@ class JointTrainerV3(JointTrainerV2):
             metrics_v = 0.0
             metrics_v_raw = 0.0
         _mark("boot")
+        # ★ 每窗口归一化归约（window_norm=1 才生效；默认等价于 .mean()）
+        _win = bool(getattr(v3, "window_norm", False))
+
+        def _red(v: torch.Tensor) -> torch.Tensor:
+            if not _win:
+                return v.mean()
+            _a = v.detach().abs()
+            _floor = float(getattr(v3, "window_norm_floor", 0.2) or 0.0) * float(_a.median())
+            _den = _a.clamp_min(max(_floor, 1e-6))
+            return (v / _den).mean()
         # ---------- e2：配对基线（用"执行 token"当控制变量）----------
         _adv_stats: dict[str, float] = {}
         _bl = str(getattr(v3, "adv_baseline", "none"))
@@ -627,13 +883,13 @@ class JointTrainerV3(JointTrainerV2):
                 if _tau > 0.0:
                     _adv_stats["adv/frac_inside_tau"] = float(
                         (adv.detach().abs() < _tau).float().mean())
-                    loss_r = -torch.tanh((adv + boot) / _tau).mean()
+                    loss_r = -_red(torch.tanh((adv + boot) / _tau))
                 else:
-                    loss_r = -(adv + boot).mean()
+                    loss_r = -_red(adv + boot)
             else:
-                loss_r = -(ret + boot).mean()
+                loss_r = -_red(ret + boot)
         else:
-            loss_r = -(ret + boot).mean()
+            loss_r = -_red(ret + boot)
         _mark("self_adv")
 
         # ---------- (B) state 项：把**误差直接反传**（2026-10-30 新增到 v3）----------
@@ -767,11 +1023,17 @@ class JointTrainerV3(JointTrainerV2):
                         act_in, bb_out, noise=_noise, backend="truncated")
                 _ref_tok = _ref_tok.detach()
             elif _center == "base":
-                from .lora import lora_disabled  # noqa: PLC0415
-                with lora_disabled(self.vlm.action_head):
-                    _, _, _ref_tok = self._sample_tokens(
-                        act_in, bb_out, noise=_noise, backend="truncated")
-                _ref_tok = _ref_tok.detach()
+                # ★ 2026-11-06：VLA 全冻（--freeze-vla）时 `lora_disabled()` 是**空操作**，
+                #   再采一次得到的 ref token 与 tokens_base **逐位相同** ⇒ 直接复用，
+                #   省掉一次 1.09B 的前向（实测每步 ~4 s，这一次约占 1/3）。
+                if _vla_frozen:
+                    _ref_tok = tokens_base.detach()
+                else:
+                    from .lora import lora_disabled  # noqa: PLC0415
+                    with lora_disabled(self.vlm.action_head):
+                        _, _, _ref_tok = self._sample_tokens(
+                            act_in, bb_out, noise=_noise, backend="truncated")
+                    _ref_tok = _ref_tok.detach()
             elif _center == "self" and getattr(batch, "self_tokens", None) is not None:
                 # 中心 = 采集时真正下发的 token（B 线真值）：用它跑同一段 rollout 得 a_ref
                 _ref_tok = batch.self_tokens.detach()
@@ -830,10 +1092,306 @@ class JointTrainerV3(JointTrainerV2):
             if float(v3.act_weight) > 0:
                 loss = loss + loss_act
 
+            # ★ 反常量项：把"每个窗口的 20 帧平均动作改变"拆成 均值 + 残差，
+            #   最大化 rms(残差)/rms(均值)。常向量 ⇒ 分子 0 ⇒ 梯度把策略推离常量。
+            _vw = float(getattr(v3, "var_weight", 0.0) or 0.0)
+            if _vw > 0.0:
+                _dmean = diff_a.mean(dim=0)                      # (B,29) 每窗口平均改变
+                _mu = _dmean.mean(dim=0)                         # (29,)
+                _res = _dmean - _mu                              # (B,29)
+                _num = (_res.pow(2).mean() + 1e-12).sqrt()
+                _den_raw = (_mu.pow(2).mean() + 1e-12).sqrt()
+                # ★ 2026-11-06 11:20：分母加下限，堵掉"把均值压小"这条捷径。
+                #   实测证据（VAR_WEIGHT=0.1、无下限、step50 的落地探针，24 请求 × 3 噪声）：
+                #     残差/均值 0.097 → 0.391（看着变好），但 ‖Δa‖ 0.132 → 0.0069（0.05×η，
+                #     要求 0.10–0.20），效应/噪声 1.49 → 0.33 ⇒ 闭环里根本测不到。
+                #   原因：-log(rms(残)/rms(均值)) 里"压小均值"和"做大残差"等价，而压小更省力。
+                #   钳住分母后，均值低于下限时该项对 _mu 的梯度为 0 ⇒ 只能靠"做大残差"降 loss，
+                #   均值回到"奖励推力 vs act 刹车"的自然平衡（v13 实测 rms(mean)=0.0245）。
+                #   P1B_MU_FLOOR=0.02 ⇒ ‖Δa‖_L2 ≈ sqrt(29)·0.02 ≈ 0.108，正好是 G5 区间下界。
+                _mu_floor = float(__import__("os").environ.get("P1B_MU_FLOOR", "0.02") or 0.02)
+                _den = _den_raw.clamp_min(max(_mu_floor, 1e-3))
+                _ratio = _num / _den
+                loss_var = -_vw * torch.log(_ratio + 1e-3)
+                loss = loss + loss_var
+                self._var_ratio = float(_ratio.detach())
+                self._var_mu_rms = float(_den_raw.detach())
+
+        # ★ 2026-11-06（一次性判读探针，J1_GRAD_PROBE=1 才跑）：量"**理想修正方向**"本身
+        #   有没有状态依赖。做法与 action_target 完全同口径：在 base 动作处对 20 步想象回报
+        #   求梯度 ĝ = ∂J/∂A（(H,B,29)），再算**跨窗口**的 残差/均值。
+        #   为什么需要：四种参数化（LoRA/反常量项/state_extra/delta-token）全都收敛到
+        #   常向量，唯一还没量过的就是"最优点本身是不是常数"。
+        #     残差/均值 ≈0.1 ⇒ 最优点就是常数 ⇒ 这条路从目标上就死了，别再训。
+        #     残差/均值 >0.5 ⇒ 最优点状态相关 ⇒ 是学习信号/幅度的问题。
+        # ★★ 2026-11-06（**可学性**判读，J1_GRAD_DUMP=<dir> 才跑，每步都跑）：
+        #   前面所有 R² 都是**线性**（ridge）的，全 ≤0 只证明"线性不可解"，不证明"不可学"。
+        #   ∂r/∂a 里含 FK 雅可比与 huber 分段符号 ⇒ 天然强非线性，线性模型本来就测不出来。
+        #   这里把**单步**梯度 ĝ1 = ∂r_0/∂a_0（无 Jacobian 连乘、最干净的对象）连同可观测输入
+        #   一起 dump，离线用**和 delta-token 同量级的 MLP** 做 8 折 CV：
+        #     R²_mlp 高 ⇒ 有可学结构，训练失败是数据/优化/幅度问题（继续投入）
+        #     R²_mlp ≈0 ⇒ ĝ 对可观测输入是高维噪声，整条"梯度蒸馏"路线从目标上就死
+        _dumpdir = __import__("os").environ.get("J1_GRAD_DUMP", "")
+        if _dumpdir:
+            try:
+                _rr = locals().get("roll_ref", None)
+                if _rr is None:
+                    raise RuntimeError("没有 roll_ref")
+                with torch.enable_grad():
+                    _A1 = _rr.actions.detach().float().clone().requires_grad_(True)
+                    _s1 = batch.start_state.to(self.device).float()
+                    _n1 = self.bundle.step(_s1, _A1[0], batch.xi, step_idx=1)
+                    _r1 = self.bundle.reward(_n1, _A1[0], _A1[0], batch.references[0])
+                    _J1 = _r1["total"].sum()
+                    _g1 = torch.autograd.grad(_J1, _A1)[0][0]              # (B,29)
+                _X = {
+                    "state": batch.start_state.detach().float().cpu().numpy(),
+                    "act0": _rr.actions[0].detach().float().cpu().numpy(),
+                    "feats": self._delta_token_features(batch).detach().float().cpu().numpy(),
+                }
+                _pt2 = getattr(batch, "port_tokens", None)
+                if _pt2 is not None:
+                    _X["token"] = _pt2.detach().float().mean(1).cpu().numpy()
+                _fr2 = getattr(batch, "frames", None)
+                if _fr2 is not None:
+                    _X["ref0"] = self.bundle.ref_state_at(
+                        _fr2.to(self.device).long()).detach().float().cpu().numpy()
+                _X["g1"] = _g1.detach().float().cpu().numpy()
+                _X["r1"] = _r1["total"].detach().float().cpu().numpy()
+                # ★★ `J1_GRAD_DUMP_TOK=1`：**token 空间**的理想修正 ∂J/∂token。
+                #   这不是 ∂J/∂A 换皮：Δtoken 该学的目标就是它（含解码器雅可比 J_dec^T ĝ）。
+                #   一次 backward 即得，比 20 次 Jacobian 连乘干净。用它回答"原路线（Δ 加在
+                #   token 上）到底有没有可学信息"，而不是靠 A 空间的结果反推。
+                if __import__("os").environ.get("J1_GRAD_DUMP_TOK", "0") == "1":
+                    from diff_vla_wbc.rollout import imagine_with_tokens as _iwt  # noqa: PLC0415
+                    _tp = getattr(batch, "port_tokens", None)
+                    if _tp is None:
+                        raise RuntimeError("没有 port_tokens")
+                    if _tp.ndim == 2:
+                        _tp = _tp[:, None, :]
+                    _tg = _tp.detach().float().clone().requires_grad_(True)
+                    with torch.enable_grad(), self._wbc_ref_ctx():
+                        _ro = _iwt(
+                            self.bundle, tokens=_tg, state=batch.start_state,
+                            obs_hist=batch.obs_hist, history=batch.history, xi=batch.xi,
+                            references=batch.references, prev_action=batch.prev_action,
+                            horizon=int(cfg.horizon),
+                        )
+                        _g1t = torch.autograd.grad(_ro.rewards[0].sum(), _tg, retain_graph=True)[0]
+                        _gHt = torch.autograd.grad(_ro.rewards.sum(), _tg)[0]
+                    _X["g_tok1"] = _g1t.detach().float().mean(1).cpu().numpy()   # (B,64)
+                    _X["g_tokH"] = _gHt.detach().float().mean(1).cpu().numpy()   # (B,64)
+                    _X["actH"] = _ro.actions.detach().float().transpose(0, 1).reshape(
+                        _ro.actions.shape[1], -1).cpu().numpy()                 # (B,H*29)
+                import os as _os  # noqa: PLC0415
+                _os.makedirs(_dumpdir, exist_ok=True)
+                _n = int(getattr(self, "_gdump_n", 0))
+                import numpy as _np2  # noqa: PLC0415
+                _np2.savez(f"{_dumpdir}/dump_{_n:03d}.npz", **_X)
+                self._gdump_n = _n + 1
+                print(f"[gradump] {_dumpdir}/dump_{_n:03d}.npz n={_X['g1'].shape[0]} "
+                      f"|g1|={float(_np2.abs(_X['g1']).mean()):.5f}", flush=True)
+            except Exception as _e3:  # noqa: BLE001
+                print(f"[gradump] FAILED: {_e3}", flush=True)
+                self._gdump_n = int(getattr(self, "_gdump_n", 0)) + 1
+
+        if __import__("os").environ.get("J1_GRAD_PROBE", "0") == "1" and not getattr(self, "_gp_done", False):
+            try:
+                _ref_roll = locals().get("roll_ref", None)
+                if _ref_roll is None:
+                    raise RuntimeError("没有 roll_ref（需要 trust_center=base 且 act_eps>0）")
+                with torch.enable_grad():
+                    _A = _ref_roll.actions.detach().float().clone().requires_grad_(True)
+                    _s = batch.start_state.to(self.device).float()
+                    _J = torch.zeros((), device=self.device)
+                    for _t in range(int(cfg.horizon)):
+                        _nxt = self.bundle.step(_s, _A[_t], batch.xi, step_idx=_t + 1)
+                        _r = self.bundle.reward(_nxt, _A[_t], _A[max(_t - 1, 0)],
+                                                batch.references[_t])
+                        _J = _J + _r["total"].sum()
+                        _s = _nxt
+                    _g = torch.autograd.grad(_J, _A)[0]            # (H,B,29)
+                _gm = _g.mean(0)                                   # (B,29) 每窗口平均方向
+                _mu = _gm.mean(0)
+                _res = _gm - _mu
+                _num = float(_res.pow(2).mean().sqrt())
+                _den_rms = float(_mu.pow(2).mean().sqrt())
+                _den_l2 = float(_mu.norm())
+                # ★ 附加：**特征能解释多少 ĝ 的状态依赖**（8 折 CV 的 R²，避免 in-sample 虚高）
+                def _cv_r2(X, Y, folds=8, lam=1e-3):
+                    import numpy as _np
+                    X = _np.asarray(X, _np.float64); Y = _np.asarray(Y, _np.float64)
+                    if X.ndim == 1:
+                        X = X[:, None]
+                    X = (X - X.mean(0)) / (X.std(0) + 1e-8)
+                    X = _np.concatenate([X, _np.ones((len(X), 1))], 1)
+                    n = len(X)
+                    idx = _np.arange(n); _np.random.default_rng(0).shuffle(idx)
+                    ss_res = ss_tot = 0.0
+                    for f in range(min(folds, n)):
+                        te = idx[f::folds]; tr = _np.setdiff1d(idx, te)
+                        W = _np.linalg.solve(X[tr].T @ X[tr] + lam * _np.eye(X.shape[1]),
+                                             X[tr].T @ Y[tr])
+                        ss_res += float(((Y[te] - X[te] @ W) ** 2).sum())
+                        ss_tot += float(((Y[te] - Y[tr].mean(0)) ** 2).sum())
+                    return 1.0 - ss_res / max(ss_tot, 1e-12)
+
+                import numpy as _np  # noqa: PLC0415
+
+                _Y = _gm.detach().float().cpu().numpy()               # (B,29) 每窗口 ĝ
+                _fdev = self._delta_token_features(batch).detach().float().cpu().numpy()  # (B,35)
+                _pt = getattr(batch, "port_tokens", None)
+                _ftok = (None if _pt is None
+                         else _pt.detach().float().mean(1).cpu().numpy())  # (B,64)
+                _r2 = {"gradprobe/r2_dev": _cv_r2(_fdev, _Y)}
+                if _ftok is not None and _ftok.shape[0] == _Y.shape[0]:
+                    _r2["gradprobe/r2_token"] = _cv_r2(_ftok, _Y)
+                    _r2["gradprobe/r2_all"] = _cv_r2(_np.concatenate([_ftok, _fdev], 1), _Y)
+                # ★ 关键对照：`xi` 是 rollout 的**潜变量**（训练时给、部署时没有）。
+                #   如果 ĝ 的状态依赖其实是 xi 驱动的，那它不是"状态相关"，而是
+                #   "训练期潜变量相关" ⇒ 部署端根本没有这个信息，谁也学不出来。
+                _xi = getattr(batch, "xi", None)
+                if _xi is not None:
+                    _fx = _xi.detach().float().reshape(_Y.shape[0], -1).cpu().numpy()
+                    _r2["gradprobe/r2_xi"] = _cv_r2(_fx, _Y)
+                    _r2["gradprobe/r2_all_xi"] = _cv_r2(
+                        _np.concatenate([_ftok if _ftok is not None else _fdev, _fdev, _fx], 1), _Y)
+                    _r2["gradprobe/xi_dim"] = float(_fx.shape[1])
+                # ★ 决定性对照：把**完整 71 维状态**当特征。
+                #   r2_state 高 ⇒ 是我们喂的特征太少（修法明确）；≈0 ⇒ 跨窗口的 ĝ 变化主要是噪声。
+                _fs = batch.start_state.detach().float().cpu().numpy()
+                _r2["gradprobe/r2_state"] = _cv_r2(_fs, _Y)
+                _r2["gradprobe/r2_state_dev"] = _cv_r2(
+                    _np.concatenate([_fs, _fdev], 1), _Y)
+                # ★ 历史：`obs_hist`(930) = WBC 的 10 帧观测历史。p>>n 必须强正则。
+                _fh = getattr(batch, "obs_hist", None)
+                if _fh is not None:
+                    _fh = _fh.detach().float().cpu().numpy()
+                    _r2["gradprobe/hist_dim"] = float(_fh.shape[1])
+                    _r2["gradprobe/r2_hist_lam100"] = _cv_r2(_fh, _Y, lam=100.0)
+                    _r2["gradprobe/r2_hist_lam1000"] = _cv_r2(_fh, _Y, lam=1000.0)
+                    # 最近 2 帧（186 维，p<n 一点）
+                    if _fh.shape[1] >= 186:
+                        _r2["gradprobe/r2_hist_last2"] = _cv_r2(_fh[:, -186:], _Y, lam=20.0)
+                    # 用 PCA 压到 24 维（在全体上拟合，轻微乐观，仅作趋势）
+                    _Xc = _fh - _fh.mean(0)
+                    _U, _S, _Vt = _np.linalg.svd(_Xc, full_matrices=False)
+                    _P = _Vt[:24].T
+                    _r2["gradprobe/r2_hist_pca24"] = _cv_r2(_Xc @ _P, _Y, lam=1.0)
+                    _r2["gradprobe/r2_hist_pca24_dev"] = _cv_r2(
+                        _np.concatenate([_Xc @ _P, _fdev], 1), _Y, lam=1.0)
+                # ★ 2026-11-06（B 假设）：**完整 20 步参考**当特征 —— token 只压了 64 维均值，
+                #   丢掉的是"未来要做什么"的细节。它才是 ĝ 最可能的真正条件。
+                # `FrameRef` 只有帧号 ⇒ 用参考库现取未来 H 步的参考状态
+                _frames = getattr(batch, "frames", None)
+                if _frames is not None:
+                    _dev_ = self.bundle.device if hasattr(self.bundle, "device") else self.device
+                    _base_f = _frames.to(_dev_).long()
+                    _rows = []
+                    for _t in range(int(cfg.horizon)):
+                        _rf = self.bundle.ref_state_at((_base_f + _t).clamp(max=10**9))
+                        _rows.append(_rf.detach().float().cpu().numpy())
+                    _fr = _np.concatenate(_rows, 1)                     # (B, H*D)
+                    _r2["gradprobe/ref_dim"] = float(_fr.shape[1])
+                    _r2["gradprobe/r2_ref_lam1000"] = _cv_r2(_fr, _Y, lam=1000.0)
+                    _Xr = _fr - _fr.mean(0)
+                    _Ur, _Sr, _Vtr = _np.linalg.svd(_Xr, full_matrices=False)
+                    _Pr = _Vtr[:24].T
+                    _r2["gradprobe/r2_ref_pca24"] = _cv_r2(_Xr @ _Pr, _Y, lam=1.0)
+                    _r2["gradprobe/r2_ref_pca24_dev"] = _cv_r2(
+                        _np.concatenate([_Xr @ _Pr, _fdev], 1), _Y, lam=1.0)
+                    _r2["gradprobe/r2_ref_var24"] = float(
+                        (_Sr[:24] ** 2).sum() / max((_Sr ** 2).sum(), 1e-12))
+                self._gp = _r2
+                self._gp.update({
+                    "gradprobe/resid_ratio_l2": _num / max(_den_l2, 1e-9),
+                    "gradprobe/resid_ratio_rms": _num / max(_den_rms, 1e-9),
+                    "gradprobe/mean_norm_l2": _den_l2,
+                    "gradprobe/resid_norm": _num,
+                    "gradprobe/n_win": float(_gm.shape[0]),
+                })
+                self._gp_done = True
+                print("[gradprobe] " + " ".join(f"{k}={v:.4f}" for k, v in self._gp.items()),
+                      flush=True)
+
+                # ★★ k-sweep（J1_GRAD_PROBE_K="2,5,10,20"）：**视界扫掠**
+                #   动机：20 步的 ĝ 是 20 次 Jacobian 连乘，混沌系统里长视界梯度基本是噪声，
+                #   所以"R²≈0"可能只是"20 步太远"，而不是"没有可学信号"。
+                #   对每个 k 单独求 ĝ_k = ∂J_k/∂A[0:k]，报 残差/均值(L2) 与 dev/state/all 的 CV R²。
+                #   判据：k 小（2~3）时 R² 明显 >0 ⇒ 短视界可学 ⇒ 改训练目标/缩短 horizon 有意义；
+                #        全 k 都 ≈0 ⇒ 梯度噪声是本质的，别再在这个方向上投入。
+                _kenv = __import__("os").environ.get("J1_GRAD_PROBE_K", "")
+                if _kenv and not getattr(self, "_gpk_done", False):
+                  try:
+                    _ksweep = {}
+                    _H = int(cfg.horizon)
+                    for _k in [int(v) for v in _kenv.split(",") if v.strip()]:
+                        if _k < 1 or _k > _H:
+                            continue
+                        with torch.enable_grad():
+                            _Ak = _ref_roll.actions.detach().float().clone().requires_grad_(True)
+                            _sk = batch.start_state.to(self.device).float()
+                            _Jk = torch.zeros((), device=self.device)
+                            for _t in range(_k):
+                                _nxk = self.bundle.step(_sk, _Ak[_t], batch.xi, step_idx=_t + 1)
+                                _rk = self.bundle.reward(_nxk, _Ak[_t], _Ak[max(_t - 1, 0)],
+                                                         batch.references[_t])
+                                _Jk = _Jk + _rk["total"].sum()
+                                _sk = _nxk
+                            _gk = torch.autograd.grad(_Jk, _Ak)[0]          # (H,B,29)
+                        _gmk = _gk[:max(_k // 2, 1)].mean(0)                # 只用前 k/2 步，避免混入无关步
+                        _muk = _gmk.mean(0)
+                        _resk = _gmk - _muk
+                        _numk = float(_resk.pow(2).mean().sqrt())
+                        _denk = float(_muk.norm())
+                        _Yk = _gmk.detach().float().cpu().numpy()
+                        _ksweep[f"gradsweep/k{_k}_resid_l2"] = _numk / max(_denk, 1e-9)
+                        _ksweep[f"gradsweep/k{_k}_mean_l2"] = _denk
+                        _ksweep[f"gradsweep/k{_k}_r2_dev"] = _cv_r2(_fdev, _Yk)
+                        _ksweep[f"gradsweep/k{_k}_r2_state"] = _cv_r2(_fs, _Yk)
+                        if _ftok is not None and _ftok.shape[0] == _Yk.shape[0]:
+                            _ksweep[f"gradsweep/k{_k}_r2_all"] = _cv_r2(
+                                _np.concatenate([_ftok, _fdev], 1), _Yk)
+                        # ★★ 决定性对照：**动作自己**能不能解释 ĝ 的跨窗口变化？
+                        #   前面 state/token/hist/ref 全都解释不了；但 ĝ 是在**不同动作序列**处求的
+                        #   （每个窗口的 A0 不同），而 ∂r/∂a 天然强烈依赖 a 本身（奖励是 huber 距离）。
+                        #   ⇒ 若 r2_act 高：最优修正 = f(当前动作)，而"当前动作"部署端**有**
+                        #      ⇒ 修法明确：delta-token 的输入加上动作（现在是 state64）。
+                        #   ⇒ 若 r2_act 也 ≈0：跨窗口的 ĝ 差异是**WM 梯度噪声**，任何输入都学不出来。
+                        _Anp = _ref_roll.actions.detach().float().cpu().numpy()   # (H,B,29)
+                        _Bk = _Anp.shape[1]
+                        _act1 = _Anp[0]                                          # (B,29)
+                        _ksweep[f"gradsweep/k{_k}_r2_act1"] = _cv_r2(_act1, _Yk)
+                        _ksweep[f"gradsweep/k{_k}_r2_act1_state"] = _cv_r2(
+                            _np.concatenate([_act1, _fs], 1), _Yk, lam=10.0)
+                        if _k >= 2:
+                            _act2 = _Anp[:2].transpose(1, 0, 2).reshape(_Bk, -1)  # (B,58)
+                            _ksweep[f"gradsweep/k{_k}_r2_act2"] = _cv_r2(_act2, _Yk, lam=1.0)
+                        if _k >= 5:
+                            _actH = _Anp.transpose(1, 0, 2).reshape(_Bk, -1)      # (B,H*29)
+                            _ksweep[f"gradsweep/k{_k}_r2_actH"] = _cv_r2(_actH, _Yk, lam=100.0)
+                    if _ksweep:
+                        self._gp.update(_ksweep)
+                        print("[gradsweep] " + " ".join(
+                            f"{k}={v:.4f}" for k, v in _ksweep.items()), flush=True)
+                    self._gpk_done = True
+                  except Exception as _e2:  # noqa: BLE001
+                    self._gpk_done = True
+                    print(f"[gradsweep] FAILED: {_e2}", flush=True)
+            except Exception as _e:  # noqa: BLE001
+                self._gp = {"gradprobe/err": 1.0}
+                self._gp_done = True
+                print(f"[gradprobe] FAILED: {_e}", flush=True)
+
         if loss_hand is not None:
             loss = loss + v3.lambda_hand * loss_hand
         if loss_token_bc is not None:
             loss = loss + float(v3.token_bc_weight) * loss_token_bc
+        # ★ 第 3 刀：稠密 ĝ 监督（grad_target_weight，默认 0 = 老行为逐位不变）
+        _gt_loss, _gt_meta = self._grad_target_loss(batch)
+        if _gt_loss is not None:
+            loss = loss + float(v3.grad_target_weight) * _gt_loss
+            self._grad_target_meta = dict(_gt_meta)
 
         # ---------- P1：动作空间目标（2026-11-05，v2 修正）----------
         #  ⚠️ v1 的 bug：锚点用了**当前动作** A0 = rollout.actions，于是
@@ -906,12 +1464,38 @@ class JointTrainerV3(JointTrainerV2):
             "loss/reward_raw": float(ret.mean().detach()),
             "loss/boot": float(boot.mean().detach()),
             "rollout/reward": float(rollout.rewards.mean().detach()),
+            "action_var/ratio": float(getattr(self, "_var_ratio", float("nan"))),
+            # 命令层残差：‖Δtoken‖（部署端同口径，>0 才说明这条路在动）
+            "delta_token/norm": float(getattr(self, "_dt_norm", float("nan")) if self._dt_norm is not None else float("nan")),
+            **getattr(self, "_gp", {}),
+            **getattr(self, "_grad_target_meta", {}),
+            # 状态敏感度 = 打乱状态后 Δ 的变化 / Δ 本身。≈0 ⇒ g 没在用状态（这条路无效）
+            "delta_token/state_sens": float(getattr(self, "_dt_state_sens", float("nan"))),
             "rollout/survival": float(rollout.survival[-1].mean().detach()),
             "codec/out_of_range": float(out_of_range),
             "loss": float(loss.detach()),
             **getattr(self, "_quant_main", {}),
             **metrics_at,
         }
+        # ★ 2026-11-06：量"策略轨迹 vs base 轨迹"的分叉，用来**决定 action_target_steps**
+        #   现在这个 k=6 是抄代码注释的，没实测。这里把 t=5/10/20 的位置差与关节差打出来，
+        #   下一轮就能按"位置差 <1cm 的最大 t"来定 k，而不是猜。
+        #   ⚠️ 2026-11-06 10:25 修复：这段原本写在 `metrics = {...}` **之前**，一旦
+        #   roll_ref 存在（trust_center=base 且 act_eps>0，本轮的配置就是）就
+        #   UnboundLocalError: cannot access local variable 'metrics' —— P1b 首跑即崩。
+        #   现在挪到 metrics 建好之后。
+        _rr = locals().get("roll_ref", None)
+        if _rr is not None:
+            with torch.no_grad():
+                _st = rollout.states[1:]                 # (H, B, 71)
+                _sr = _rr.states[1:]
+                _dp = (_st[..., 0:3] - _sr[..., 0:3]).norm(dim=-1)          # (H,B) 米
+                _dq = (_st[..., 7:36] - _sr[..., 7:36]).abs().mean(-1)      # (H,B) 弧度
+                for _t in (4, 9, 19):
+                    if _t < _dp.shape[0]:
+                        metrics[f"diverge/pos_t{_t+1}"] = float(_dp[_t].mean())
+                        metrics[f"diverge/joint_t{_t+1}"] = float(_dq[_t].mean())
+
         if loss_s is not None:
             metrics["loss/state"] = float(loss_s.detach())
         if loss_hand is not None:
@@ -997,6 +1581,9 @@ class JointTrainerV3(JointTrainerV2):
             _clip_params = list(self.fm_parameters)
             if getattr(self, "state_extra_scale", None) is not None:
                 _clip_params.append(self.state_extra_scale)
+            # ★ 2026-11-06：delta-token 也必须在裁剪列表里（lr=5e-4，比 LoRA 大 50×）
+            if getattr(self, "delta_token_net", None) is not None:
+                _clip_params += list(self.delta_token_net.parameters())
             total = torch.nn.utils.clip_grad_norm_(_clip_params, v3.clip_head)
             metrics["grad/head_preclip"] = float(total)
             # **熔断**（2026-10-30 事故）：一旦梯度出现 NaN/inf 立刻停，不要继续烧下去。

@@ -374,6 +374,27 @@ class Engine:
             self.state_extra_mode = str(d.get("state_extra_mode") or "vel6")
             print(f"[server][head][state-extra] mode={self.state_extra_mode} "
                   f"scale={[round(float(x), 5) for x in _sc]}", flush=True)
+
+        # ---- 命令层残差：token' = token + g(token0, [rot6d(6), dof_vel(29)]) ----
+        # 与 state_extra 一样：mode/权重都从 ckpt 读 ⇒ 训练开了部署自动生效，
+        # 特征直接取自线上 state64（[0:6] 朝向、[35:64] 关节速度），**第三方客户端零改动**。
+        self.delta_token_net = None
+        if isinstance(d, dict) and d.get("delta_token_state") is not None:
+            from diff_vla_wbc.delta_token import DeltaTokenNet  # noqa: PLC0415
+
+            _meta = d.get("delta_token_meta") or {}
+            _net = DeltaTokenNet(hidden=int(_meta.get("hidden", 512) or 512),
+                                 depth=int(_meta.get("depth", 2) or 2))
+            _miss, _unexp = _net.load_state_dict(d["delta_token_state"], strict=False)
+            _net = _net.to(self.args.device).eval()
+            for _p in _net.parameters():
+                _p.requires_grad_(False)
+            self.delta_token_net = _net
+            # ★ cap 必须从 ckpt 的 meta 带过来：训练时它是"软缩放"，部署不跟着做就是口径漂移
+            self.delta_token_cap = float(_meta.get("cap", 0.0) or 0.0)
+            print(f"[server][head][delta-token] 已加载 params={_net.n_params} "
+                  f"meta={_meta} missing={len(_miss)} unexpected={len(_unexp)} "
+                  f"⇒ 前向 token + g(state)，客户端无需改动", flush=True)
         self._head_loaded = True
 
     # ---------------------------------------------------------------- inference
@@ -506,6 +527,28 @@ class Engine:
                 fingers = np.mean(np.stack(_fins, 0), 0).astype(np.float32)
             else:
                 chunk64, fingers = _toks[0], _fins[0]
+            # ★ 命令层残差：用**本次请求的 state64** 算 Δ，广播到整段 chunk。
+            #   与训练侧同口径（rotlocal6 就是 state64[:6]；dof_vel 就是 [35:64]）。
+            if getattr(self, "delta_token_net", None) is not None:
+                _s64 = np.asarray(state64, dtype=np.float32).reshape(-1)
+                if _s64.size < 64:
+                    raise SystemExit(
+                        f"[server][delta-token] state64 宽度 {_s64.size} < 64，算不出偏差特征")
+                _feat = np.concatenate([_s64[0:6], _s64[35:64]]).astype(np.float32)
+                with torch.no_grad():
+                    _tok0 = torch.from_numpy(chunk64[0]).to(self.args.device).float()[None]
+                    _fe = torch.from_numpy(_feat).to(self.args.device).float()[None]
+                    from diff_vla_wbc.delta_token import apply_norm_cap  # noqa: PLC0415
+
+                    _d = apply_norm_cap(self.delta_token_net(_tok0, _fe),
+                                        float(getattr(self, "delta_token_cap", 0.0) or 0.0))
+                    _d = _d[0].detach().cpu().numpy().astype(np.float32)
+                chunk64 = (chunk64 + _d[None, :]).astype(np.float32)
+                self._dt_n = int(getattr(self, "_dt_n", 0)) + 1
+                if self._dt_n % 20 == 1:
+                    print(f"[server][delta-token] #%d ‖Δtoken‖=%.4f rot6d=%s"
+                          % (self._dt_n, float(np.linalg.norm(_d)),
+                             np.round(_feat[:6], 3).tolist()), flush=True)
             # ★ 2026-11-01（滞后性检验）：token 空间一阶外推 = "提前量"
             #   tok_t ← tok_t + β (tok_t − tok_{t−1})，跨请求用**未外推**的上次末 token 作 t−1，
             #   避免外推逐次复利放大。

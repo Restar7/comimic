@@ -42,7 +42,7 @@ fi
 # GR00T 的依赖是 vendored 的（diffusers/tyro/transformers 在 third_party/gr00t_deps），
 # 系统 python3 没有 diffusers；**只给 server 这一条进程加**，别污染 Isaac 那条
 # （isaac_env.sh 会自己 prepend venv，混进来会串包）。
-SRV_PY="$COMIMIC:$COMIMIC/Isaac-GR00T:$COMIMIC/third_party/gr00t_deps:$COMIMIC/third_party/gr00t_deps/_noflash"
+SRV_PY="$COMIMIC:$COMIMIC/Isaac-GR00T:$COMIMIC/third_party/skimage_py311:$COMIMIC/third_party/gr00t_deps:$COMIMIC/third_party/gr00t_deps/_noflash"
 # SRV_CMD 覆盖：用来把闭环接到**真值 token 服务**（scripts/ha_gt_token_server.py），
 # 以验证"执行器 + 部署接线"本身是对的（机器人应能复现录制里的 1.17 m/12 s 行走）。
 if [[ -n "${SRV_CMD:-}" ]]; then

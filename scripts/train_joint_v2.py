@@ -160,6 +160,11 @@ def _ddp_broadcast_trainables(trainer) -> None:
     _critic = getattr(trainer, "critic", None)
     if _critic is not None:
         params += list(_critic.parameters())
+    # ★ 2026-11-06：delta-token 的初值是**随机**的（极小 std），两个 rank 若不广播会从一开始
+    #   就是两套权重；配合下面的梯度 all_reduce 才能保证"全局 batch 训一个网络"。
+    _dt = getattr(trainer, "delta_token_net", None)
+    if _dt is not None:
+        params += list(_dt.parameters())
     with torch.no_grad():
         for p in params:
             dist.broadcast(p.data, src=0)
@@ -406,6 +411,40 @@ def main() -> int:
                     help="动作空间惩罚形状。hinge=历史默认（eps 以内梯度为 0，有死区）；"
                          "l2=(r/eps)^2 从 0 起就有梯度。2026-11-05：round-5 的动作漂移"
                          "滑到 0.80 就是死区造成的，改用 l2 + 收紧 act-eps")
+    ap.add_argument("--var-weight", type=float, default=0.0,
+                    help="反常量项：-w·log(rms(残差)/rms(均值))。0=关；建议 0.1。"
+                         "关掉 action_target 后必须靠它阻止策略学成常向量")
+    ap.add_argument("--boot-one-sided", action="store_true",
+                    help="bootstrap 只许惩罚偏离（rel := min(rel,0)）；R2 实测 rel 恒正，开着更安全")
+    # ★ 2026-11-06：**命令层残差**（与 LoRA/state_extra/var 并行，默认关）
+    ap.add_argument("--delta-token", action="store_true",
+                    help="开启 token 残差：token' = token + g(token, rot6d+dof_vel)。"
+                         "末层零初始化 ⇒ 第 0 步与底模逐位相同。部署口径零客户端改动")
+    ap.add_argument("--delta-token-hidden", type=int, default=1024,
+                    help="99→h→h→64。1024×2=1,217,600 参数（LoRA 的 3.6%）；欠拟合再上 2048")
+    ap.add_argument("--delta-token-init-std", type=float, default=4e-4,
+                    help="末层初始化 std。0=严格零初始化（前两层第 0 步无梯度）；"
+                         "4e-4 ⇒ 初始 ‖Δtoken‖≈0.009（= 从底模出发，但三层一起可训）")
+    ap.add_argument("--delta-token-depth", type=int, default=2)
+    ap.add_argument("--delta-token-lr", type=float, default=5e-4,
+                    help="delta-token 的 lr。**别跟 --fm-lr(1e-5) 走**：独立小 MLP 用 1e-5 等于不学")
+    ap.add_argument("--delta-token-fullstate", action="store_true",
+                    help="Δtoken 的输入用**部署 state64 全 64 维**（含 dof_pos），而不是 35 维 feats")
+    ap.add_argument("--grad-target-weight", type=float, default=0.0,
+                    help="稠密 ĝ 监督权重（第 3 刀；0=关。目标 = eta·unit(∂J/∂token)）")
+    ap.add_argument("--window-norm", action="store_true",
+                    help="★BPTT 路线：每窗口梯度归一化（削弱'跨窗口求和只剩均值'）")
+    ap.add_argument("--grad-target-horizon", type=int, default=0,
+                    help="★第5刀：ĝ 标签的视界（0=沿用 cfg.horizon；建议 1~5，H=2 真机已验证 96/96）")
+    ap.add_argument("--grad-target-n", type=int, default=16,
+                    help="每步在多少个窗口上求 ĝ（子批，控成本）")
+    ap.add_argument("--grad-target-eta", type=float, default=0.08,
+                    help="目标幅度（token RMS）：0.15/1.8，按真机实测 WM 高估 1.8× 修正")
+    ap.add_argument("--delta-token-cap", type=float, default=0.0,
+                    help="‖Δtoken‖ 软上限（tanh 收缩，保留梯度）；0=不限")
+    ap.add_argument("--freeze-vla", action="store_true",
+                    help="冻结 VLA（LoRA 不训练，只训 delta-token/critic）。"
+                         "配合 --delta-token 使用：归因干净、每步快数倍")
     ap.add_argument("--critic-source", choices=("imagined", "real"), default="imagined",
                     help="critic 的监督来源：imagined=想象转移 GAE（旧）；real=真录制轨迹 return-to-go（grounded）")
     ap.add_argument("--critic-ckpt", type=Path, default=None,
@@ -710,6 +749,23 @@ def main() -> int:
         device=device, action_horizon=40, max_state_dim=132,
         freeze_vlm=True, attn_implementation="sdpa",
     )
+    # ★ 2026-11-06：--freeze-vla = **整个 VLA 冻结**（backbone + action head），
+    #   只训 delta-token / critic。
+    #   ⚠️ 踩过的坑：`Gr00tVLM.from_pretrained(freeze_vlm=True)` 只冻 **backbone**
+    #   （`backbone.requires_grad_(False)`），action head 是**新建的、默认可训**（1.09B 参数）。
+    #   所以"只是不挂 LoRA"≠"冻结 VLA" —— 那样会把 1.09B 全解开：AdamW 状态 8.7 GB
+    #   + 梯度 4.3 GB，DDP 下 backward 直接 OOM（实测 47.4 GiB 只剩 200 MiB）。
+    if bool(getattr(args, "freeze_vla", False)):
+        if int(args.lora_rank) > 0:
+            print(f"[AUDIT][freeze-vla] 强制 lora_rank {args.lora_rank} → 0（不挂 LoRA）")
+            args.lora_rank = 0
+        _n_frozen = 0
+        for _p in vlm.parameters():
+            if _p.requires_grad:
+                _p.requires_grad_(False)
+                _n_frozen += _p.numel()
+        print(f"[AUDIT][freeze-vla] 冻结 backbone+action_head 共 {_n_frozen:,} 参数"
+              f" ⇒ 本轮只训 delta-token({getattr(args, 'delta_token_hidden', 0)}宽) + critic")
     if int(args.lora_rank) > 0:
         from diff_vla_wbc.lora import apply_lora, lora_summary  # noqa: PLC0415
 
@@ -746,6 +802,10 @@ def main() -> int:
                 f"also_train={'proj_out' if args.lora_train_proj_out else '-'}）")
         _lora_b = [v for k, v in _sd.items() if k.endswith("lora_B")]
         _absmean = (sum(float(v.float().abs().mean()) for v in _lora_b) / max(1, len(_lora_b)))
+        if isinstance(_d, dict) and _d.get("delta_token_state") is not None:
+            args._delta_token_state_ckpt = _d["delta_token_state"]
+            print(f"[AUDIT][init-vla] ckpt 带 delta_token_state"
+                  f"（{len(_d['delta_token_state'])} tensors）")
         if isinstance(_d, dict) and _d.get("state_extra_scale") is not None:
             args._state_extra_scale_ckpt = torch.as_tensor(_d["state_extra_scale"]).float().reshape(-1)
             print(f"[AUDIT][init-vla] ckpt 带 state_extra_scale="
@@ -1129,12 +1189,26 @@ def main() -> int:
             critic_rel_clip=float(args.critic_rel_clip),
             act_hinge_cap=float(args.act_hinge_cap),
             critic_source=args.critic_source,
+            boot_one_sided=bool(getattr(args, "boot_one_sided", False)),
+            var_weight=float(getattr(args, "var_weight", 0.0) or 0.0),
             critic_use_diff=bool(args.critic_use_diff),
             grad_log_every=args.grad_log_every,
             clip_head=args.clip_head,
             adv_baseline=str(getattr(args, "adv_baseline", "none") or "none"),
             adv_tau=float(getattr(args, "adv_tau", 0.0) or 0.0),
             state_extra=str(getattr(args, "state_extra", "none") or "none"),
+            delta_token=bool(getattr(args, "delta_token", False)),
+            delta_token_hidden=int(getattr(args, "delta_token_hidden", 1024) or 1024),
+            delta_token_init_std=float(getattr(args, "delta_token_init_std", 4e-4) or 0.0),
+            delta_token_lr=float(getattr(args, "delta_token_lr", 5e-4) or 5e-4),
+            delta_token_depth=int(getattr(args, "delta_token_depth", 2) or 2),
+            delta_token_cap=float(getattr(args, "delta_token_cap", 0.0) or 0.0),
+            delta_token_fullstate=bool(getattr(args, "delta_token_fullstate", False)),
+            grad_target_weight=float(getattr(args, "grad_target_weight", 0.0) or 0.0),
+            grad_target_n=int(getattr(args, "grad_target_n", 16) or 16),
+            grad_target_eta=float(getattr(args, "grad_target_eta", 0.08) or 0.08),
+            grad_target_horizon=int(getattr(args, "grad_target_horizon", 0) or 0),
+            window_norm=bool(getattr(args, "window_norm", False)),
             state_extra_scale_init=float(getattr(args, "_state_extra_scale_init", 1.0)),
             wbc_kl_anchor=float(getattr(args, "wbc_kl_anchor", 0.0) or 0.0),
             vla_kl_anchor=float(getattr(args, "vla_kl_anchor", 0.0) or 0.0),
@@ -1153,6 +1227,18 @@ def main() -> int:
         elif getattr(trainer, "state_extra_scale", None) is not None:
             print("[AUDIT][state-extra] 无 ckpt 里的 scale ⇒ 用初值 "
                   f"{[round(float(x), 5) for x in trainer.state_extra_scale.detach().cpu()]}")
+        # ---- 命令层残差：从 --init-vla 恢复（续训/评测必须带上，否则 Δtoken 丢）----
+        _dt_ckpt = getattr(args, "_delta_token_state_ckpt", None)
+        if getattr(trainer, "delta_token_net", None) is not None:
+            if _dt_ckpt is not None:
+                _missing, _unexpected = trainer.delta_token_net.load_state_dict(_dt_ckpt, strict=False)
+                print(f"[AUDIT][delta-token] 从 --init-vla 恢复权重 "
+                      f"(missing={len(_missing)} unexpected={len(_unexpected)})")
+            else:
+                print("[AUDIT][delta-token] ckpt 里没有 delta_token_state ⇒ 用零初始化 (Δ=0)")
+        elif _dt_ckpt is not None:
+            print("[AUDIT][delta-token][warn] ckpt 带 delta_token，但本轮没开 --delta-token ⇒ 权重被丢弃")
+
         if args.critic_source == "real":
             _rrp = Path(args.critic_real)
             if not _rrp.exists():

@@ -111,6 +111,24 @@ def main() -> int:
         missing, unexpected = eng.model.load_state_dict(sd, strict=False)
         if unexpected:
             raise SystemExit(f"[land] {name}: unexpected={len(unexpected)}（LoRA 配置不一致）")
+        # ★ 2026-11-06：**命令层残差**也要按臂单独装载/清空（否则会串到下一个臂）。
+        #   shape 与 server 的 infer 完全一致：eng.infer 内部用 state64[:6]/[35:64] 算 Δ 并加到 token。
+        eng.delta_token_net = None
+        _d = arm_sds[name]
+        if isinstance(_d, dict) and _d.get("delta_token_state") is not None:
+            from diff_vla_wbc.delta_token import DeltaTokenNet  # noqa: PLC0415
+
+            _meta = _d.get("delta_token_meta") or {}
+            _net = DeltaTokenNet(hidden=int(_meta.get("hidden", 512) or 512),
+                                 depth=int(_meta.get("depth", 2) or 2))
+            _net.load_state_dict(_d["delta_token_state"], strict=False)
+            _net = _net.to(a.device).eval()
+            for _p in _net.parameters():
+                _p.requires_grad_(False)
+            eng.delta_token_net = _net
+            eng.delta_token_cap = float(_meta.get("cap", 0.0) or 0.0)
+            print(f"[land] {name}: delta-token 已装载 params={_net.n_params} meta={_meta}",
+                  flush=True)
         eng._head_loaded = True
 
     # ---- 3) 逐请求、逐噪声：三臂用**同一个噪声种子** ⇒ Δa 是干净的配对差 ----
