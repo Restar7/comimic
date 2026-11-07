@@ -1,7 +1,8 @@
 # Δtoken 蒸馏 Teacher 修复：结论与证据（会话 02）
 
 > 写给后续接手的人 / 外部评审（包括别的模型）：**这一轮到底证明了什么、没证明什么**。
-> 写于 2026-11-07。代码 commit **`1fa87b0`**（分支 `harness/02-teacher`，worktree `comimic-wt02`，基线 `a4bd1ff`）。
+> 写于 2026-11-07。代码 commit **`1fa87b0`**（Teacher 修复）+ **`9c58c0d`**（DDP 指标聚合 + 本文档），
+> 分支 `harness/02-teacher`、worktree `comimic-wt02`，基线 `a4bd1ff`。
 > 完整数据、逐项数字、复现脚本在 `runs/harness_02_teacher/`（`runs/` 被 `.gitignore` 排除，不在 commit 里）。
 > 本文所有"结论"都带 `PASS / FAIL / NOT_RUN` 标记；**推测**统一放在 §7，不写成结果。
 
