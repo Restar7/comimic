@@ -94,6 +94,7 @@ def main() -> int:
             "worktree": str(ROOT),
             "branch": "harness/02-teacher",
             "base_commit": "a4bd1ff9988d8d11e4585037aa51a4e1b34cdc90",
+            "session_commit": "1fa87b0",
             "gpu": "2x RTX 4090 48GiB（本会话使用 cuda:1；另一会话同时跑 gen_a_g0/g1）",
             "data": {
                 "transitions": "runs/a_prime_sonic_exc/all_transitions.pt",
@@ -125,6 +126,7 @@ def main() -> int:
         "resample": resample,
         "checkpoint_meta_check": _json("delta_token_meta_check.json"),
         "legacy_equivalence": _json("legacy_equivalence.json"),
+        "ddp_smoke": _json("ddp_smoke.json"),
         "verdicts": {
             "teacher_shared_delta_math": "PASS",
             "teacher_reward_definition_aligned": "PASS",
@@ -135,6 +137,7 @@ def main() -> int:
             "legacy_teacher_semantics_unchanged": "PASS",
             "reward_only_vs_full_training": "PASS(2-step diagnostic; production NOT_RUN)",
             "checkpoint_metadata": "PASS",
+            "ddp_metric_aggregation": "PASS(1-step 2-GPU smoke)",
             "distill_overfit_128_256": "PASS",
             "distill_heldout_cos": "PASS(measured, ceiling ~0.26 H20 / ~0.33 H5)",
             "closed_loop_success_rate": "NOT_RUN",

@@ -569,19 +569,36 @@ class JointTrainerV3(JointTrainerV2):
         _vm = valid[:, None].to(pred.dtype)
         loss = (((pred - tgt.to(pred.dtype)) ** 2) * _vm).sum(-1).sum() / nv
         # DDP：指标是**本 rank 子批**上的，全局标签数 = 本 rank × world_size
-        _world = 1
+        _world, _dist = 1, None
         try:
-            import torch.distributed as _dist  # noqa: PLC0415
+            import torch.distributed as _dist_mod  # noqa: PLC0415
 
-            if _dist.is_available() and _dist.is_initialized():
-                _world = int(_dist.get_world_size())
+            if _dist_mod.is_available() and _dist_mod.is_initialized():
+                _world = int(_dist_mod.get_world_size())
+                _dist = _dist_mod
         except Exception:  # noqa: BLE001
-            _world = 1
+            _world, _dist = 1, None
         with torch.no_grad():
             _cos = tp.cosine(pred.detach(), g_main, mask=valid)
+            # ★ DDP：梯度是 all_reduce 过的全局 batch，**指标也必须是全局的**（否则只是 rank0 的
+            #   8~32 个窗口）。用一次 4 元 all_reduce 汇总 (Σcos, n_valid, Σ‖g‖, Σ‖g‖²)，
+            #   再把全局均值写进 meta；单卡时 `_world == 1` 完全不走这段。
+            _cos_g, _nv_g = float(_cos[valid].mean()), float(nv)
+            _gn_sum_g = float(gn[valid].sum())
+            _gn_sq_g = float((gn[valid] ** 2).sum())
+            if _world > 1 and _dist is not None:
+                _pack = torch.tensor([_cos_g * _nv_g, _nv_g, _gn_sum_g, _gn_sq_g],
+                                     device=self.device, dtype=torch.float64)
+                _dist.all_reduce(_pack, op=_dist.ReduceOp.SUM)
+                _nv_g = float(_pack[1])
+                if _nv_g > 0:
+                    _cos_g = float(_pack[0]) / _nv_g
+                    _gn_sum_g = float(_pack[2])
+                    _gn_sq_g = float(_pack[3])
+            _gn_mean_g = (_gn_sum_g / _nv_g) if _nv_g > 0 else float("nan")
             meta = {
-                "delta_token/grad_cos": float(_cos[valid].mean()),
-                "delta_token/grad_n_global": float(nv * _world),
+                "delta_token/grad_cos": _cos_g,
+                "delta_token/grad_n_global": float(_nv_g),
                 "delta_token/grad_world": float(_world),
                 "delta_token/grad_cos_scope": 0.0,   # 0 = train-sub-batch（不是 held-out）
                 "delta_token/grad_norm_ratio": float(
@@ -592,7 +609,8 @@ class JointTrainerV3(JointTrainerV2):
                 "delta_token/grad_n_valid": float(nv),
                 "delta_token/grad_valid_frac": float(nv) / float(n),
                 "delta_token/grad_H": float(H),
-                "delta_token/grad_norm_mean": float(gn[valid].mean()),
+                "delta_token/grad_norm_mean": float(gn[valid].mean()),          # 本 rank
+                "delta_token/grad_norm_mean_global": _gn_mean_g,                # DDP 全局
                 "delta_token/grad_norm_p50": float(gn[valid].median()),
                 "delta_token/grad_norm_max": float(gn[valid].max()),
                 "delta_token/teacher_disc": float(tcfg["reward"] == "discounted"),
