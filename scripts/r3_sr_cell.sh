@@ -93,7 +93,7 @@ for s in $SEEDS; do
   echo "[cell] seed=$s start $(date +%T)" | tee -a "$LOG"
   TASK="$TASK" SEED="$s" REPEAT=0 MAX_STEPS="$MAX_STEPS" ISAAC_GPU="$GPU" \
     SERVER_URL="http://127.0.0.1:$PORT" OUT_ROOT="$CELLDIR/seed$s" MODEL_LABEL="$LABEL" \
-    RECORD_VIDEO=0 \
+    RECORD_VIDEO=${RECORD_VIDEO:-0} \
     EXTRA_ARGS="--step_log_every_n 500" \
     bash scripts/ha_isaac_closedloop.sh >> "$CELLDIR/isaac_seed$s.log" 2>&1
   rc=$?
