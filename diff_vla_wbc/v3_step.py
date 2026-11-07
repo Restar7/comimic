@@ -1743,7 +1743,9 @@ class JointTrainerV3(JointTrainerV2):
                             references=_refs, prev_action=batch.prev_action[_sl],
                             horizon=int(cfg.horizon),
                         )
-                        _J20 = _dret(_ro, float(v3.gamma))          # ★ 与主训练同一口径
+                        # ★ 与主训练**逐字同一调用**：`discounted_return(rollout, γ, steps=_rh)`。
+                        #   `_rh = v3.reward_horizon`（0=满 H）。之前漏了 steps，reward_horizon>0 时会分叉。
+                        _J20 = _dret(_ro, float(v3.gamma), steps=_rh)   # ★ 与主训练同一口径
                         _g1t = torch.autograd.grad(_ro.rewards[0].sum(), _tg, retain_graph=True)[0]
                         _gHt = torch.autograd.grad(_J20.sum(), _tg)[0]
                     # 逐帧（不平均）+ 兼容旧消费者的平均版
@@ -1762,8 +1764,10 @@ class JointTrainerV3(JointTrainerV2):
                     if _hist is not None:
                         _h = _hist.detach().float()
                         _h = _h.permute(1, 0, 2) if _h.shape[0] == 10 else _h        # (B,10,W)
-                        _X["hist10"] = _h.cpu().numpy()
-                        _X["hist_width"] = int(_h.shape[-1])
+                        # 原始 93 维历史（可从 obs_deploy930 反推，默认不存以省 ~140MB/万条）
+                        if __import__("os").environ.get("J1_GRAD_DUMP_NO_RAW_HIST", "0") != "1":
+                            _X["hist10"] = _h.cpu().numpy()
+                            _X["hist_width"] = int(_h.shape[-1])
                         try:
                             from diff_vla_wbc.deploy_obs import to_deploy_obs_hist  # noqa: PLC0415
                             _xi = getattr(batch, "xi", None)
