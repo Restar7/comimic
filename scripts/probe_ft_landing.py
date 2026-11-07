@@ -119,7 +119,11 @@ def main() -> int:
             from diff_vla_wbc.delta_token import DeltaTokenNet  # noqa: PLC0415
 
             _meta = _d.get("delta_token_meta") or {}
-            _net = DeltaTokenNet(hidden=int(_meta.get("hidden", 512) or 512),
+            # ★ 2026-11-07：输入宽度从 state dict 反推（35 维 feats 或 64 维 state64 两种口径）
+            _sd0 = _d["delta_token_state"]["net.0.weight"].shape[1]
+            _fdim = int(_sd0) - 64
+            _net = DeltaTokenNet(feat_dim=_fdim,
+                                 hidden=int(_meta.get("hidden", 1024) or 1024),
                                  depth=int(_meta.get("depth", 2) or 2))
             _net.load_state_dict(_d["delta_token_state"], strict=False)
             _net = _net.to(a.device).eval()

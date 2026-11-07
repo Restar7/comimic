@@ -383,7 +383,11 @@ class Engine:
             from diff_vla_wbc.delta_token import DeltaTokenNet  # noqa: PLC0415
 
             _meta = d.get("delta_token_meta") or {}
-            _net = DeltaTokenNet(hidden=int(_meta.get("hidden", 512) or 512),
+            # ★ 2026-11-07：输入宽度从 state dict 反推（35 维 feats 或 64 维 state64 两种口径）
+            _sd0 = d["delta_token_state"]["net.0.weight"].shape[1]
+            _fdim = int(_sd0) - 64
+            _net = DeltaTokenNet(feat_dim=_fdim,
+                                 hidden=int(_meta.get("hidden", 1024) or 1024),
                                  depth=int(_meta.get("depth", 2) or 2))
             _miss, _unexp = _net.load_state_dict(d["delta_token_state"], strict=False)
             _net = _net.to(self.args.device).eval()
@@ -534,7 +538,12 @@ class Engine:
                 if _s64.size < 64:
                     raise SystemExit(
                         f"[server][delta-token] state64 宽度 {_s64.size} < 64，算不出偏差特征")
-                _feat = np.concatenate([_s64[0:6], _s64[35:64]]).astype(np.float32)
+                # ★ 2026-11-07：输入宽度随 ckpt 走 ——
+                #   35 维（老口径）= rot6d + dof_vel；64 维（第 2 刀）= 部署 state64 全量。
+                if int(getattr(self.delta_token_net, "feat_dim", 35)) == 64:
+                    _feat = np.asarray(_s64, np.float32).reshape(-1)[:64]
+                else:
+                    _feat = np.concatenate([_s64[0:6], _s64[35:64]]).astype(np.float32)
                 with torch.no_grad():
                     _tok0 = torch.from_numpy(chunk64[0]).to(self.args.device).float()[None]
                     _fe = torch.from_numpy(_feat).to(self.args.device).float()[None]

@@ -1144,37 +1144,56 @@ class JointTrainerV3(JointTrainerV2):
                     _r1 = self.bundle.reward(_n1, _A1[0], _A1[0], batch.references[0])
                     _J1 = _r1["total"].sum()
                     _g1 = torch.autograd.grad(_J1, _A1)[0][0]              # (B,29)
+                # ★ 2026-11-07：只标**子批**（`J1_GRAD_DUMP_N`）—— dump 的成本几乎全在
+                #   20 步带梯度 rollout 上，按 batch 线性增长。标 64 个比标 256 个快 4 倍，
+                #   是"要 3 万条标签"时把速度提上来的关键旋钮（0 = 全批）。
+                _dn = int(__import__("os").environ.get("J1_GRAD_DUMP_N", "0") or 0)
+                _sl = slice(0, _dn) if _dn > 0 else slice(None)
                 _X = {
-                    "state": batch.start_state.detach().float().cpu().numpy(),
-                    "act0": _rr.actions[0].detach().float().cpu().numpy(),
-                    "feats": self._delta_token_features(batch).detach().float().cpu().numpy(),
+                    "state": batch.start_state[_sl].detach().float().cpu().numpy(),
+                    "act0": _rr.actions[0][_sl].detach().float().cpu().numpy(),
+                    "feats": self._delta_token_features(batch)[_sl].detach().float().cpu().numpy(),
                 }
                 _pt2 = getattr(batch, "port_tokens", None)
                 if _pt2 is not None:
-                    _X["token"] = _pt2.detach().float().mean(1).cpu().numpy()
+                    _X["token"] = _pt2.detach().float().mean(1)[_sl].cpu().numpy()
                 _fr2 = getattr(batch, "frames", None)
                 if _fr2 is not None:
                     _X["ref0"] = self.bundle.ref_state_at(
-                        _fr2.to(self.device).long()).detach().float().cpu().numpy()
-                _X["g1"] = _g1.detach().float().cpu().numpy()
-                _X["r1"] = _r1["total"].detach().float().cpu().numpy()
+                        _fr2.to(self.device).long()).detach().float().cpu().numpy()[_sl]
+                _X["g1"] = _g1.detach().float().cpu().numpy()[_sl]
+                _X["r1"] = _r1["total"].detach().float().cpu().numpy()[_sl]
                 # ★★ `J1_GRAD_DUMP_TOK=1`：**token 空间**的理想修正 ∂J/∂token。
                 #   这不是 ∂J/∂A 换皮：Δtoken 该学的目标就是它（含解码器雅可比 J_dec^T ĝ）。
                 #   一次 backward 即得，比 20 次 Jacobian 连乘干净。用它回答"原路线（Δ 加在
                 #   token 上）到底有没有可学信息"，而不是靠 A 空间的结果反推。
                 if __import__("os").environ.get("J1_GRAD_DUMP_TOK", "0") == "1":
+                    from diff_vla_wbc.isaac_joint import FrameRef  # noqa: PLC0415
                     from diff_vla_wbc.rollout import imagine_with_tokens as _iwt  # noqa: PLC0415
                     _tp = getattr(batch, "port_tokens", None)
                     if _tp is None:
                         raise RuntimeError("没有 port_tokens")
                     if _tp.ndim == 2:
                         _tp = _tp[:, None, :]
+                    # ★ 只在**子批**上算 ĝ（`J1_GRAD_DUMP_N`）：20 步带梯度 rollout 的成本
+                    #   随 batch 线性增长 ⇒ 这是把"3 万条标签"从 7 小时压到 1 小时内的关键。
+                    _tp = _tp[_sl]
+                    _refs = []
+                    for _r in batch.references:
+                        _f = getattr(_r, "f", None)
+                        _refs.append(FrameRef(_f[_sl].to(self.device)) if _f is not None else _r)
+                    _hist = getattr(batch, "history", None)
+                    if _hist is not None:
+                        _hist = _hist[_sl] if _hist.shape[0] == _tp.shape[0] else _hist[:, _sl]
+                    _oh = getattr(batch, "obs_hist", None)
+                    _oh = None if _hist is not None else (
+                        _oh[_sl] if (_oh is not None and _oh.shape[0] == _tp.shape[0]) else None)
                     _tg = _tp.detach().float().clone().requires_grad_(True)
                     with torch.enable_grad(), self._wbc_ref_ctx():
                         _ro = _iwt(
-                            self.bundle, tokens=_tg, state=batch.start_state,
-                            obs_hist=batch.obs_hist, history=batch.history, xi=batch.xi,
-                            references=batch.references, prev_action=batch.prev_action,
+                            self.bundle, tokens=_tg, state=batch.start_state[_sl],
+                            obs_hist=_oh, history=_hist, xi=batch.xi[_sl],
+                            references=_refs, prev_action=batch.prev_action[_sl],
                             horizon=int(cfg.horizon),
                         )
                         _g1t = torch.autograd.grad(_ro.rewards[0].sum(), _tg, retain_graph=True)[0]
@@ -1185,11 +1204,20 @@ class JointTrainerV3(JointTrainerV2):
                         _ro.actions.shape[1], -1).cpu().numpy()                 # (B,H*29)
                 import os as _os  # noqa: PLC0415
                 _os.makedirs(_dumpdir, exist_ok=True)
+                # ★ DDP：每个 rank 各写各的文件（否则同名互相覆盖）
+                _rank = 0
+                try:
+                    import torch.distributed as _dist  # noqa: PLC0415
+                    if _dist.is_available() and _dist.is_initialized():
+                        _rank = int(_dist.get_rank())
+                except Exception:  # noqa: BLE001
+                    _rank = 0
                 _n = int(getattr(self, "_gdump_n", 0))
                 import numpy as _np2  # noqa: PLC0415
-                _np2.savez(f"{_dumpdir}/dump_{_n:03d}.npz", **_X)
+                _tag = str(__import__("os").environ.get("RUN", ""))[:16]
+                _np2.savez(f"{_dumpdir}/dump_{_tag}r{_rank}_{_n:04d}.npz", **_X)
                 self._gdump_n = _n + 1
-                print(f"[gradump] {_dumpdir}/dump_{_n:03d}.npz n={_X['g1'].shape[0]} "
+                print(f"[gradump] {_dumpdir}/dump_{_tag}r{_rank}_{_n:04d}.npz n={_X['g1'].shape[0]} "
                       f"|g1|={float(_np2.abs(_X['g1']).mean()):.5f}", flush=True)
             except Exception as _e3:  # noqa: BLE001
                 print(f"[gradump] FAILED: {_e3}", flush=True)
