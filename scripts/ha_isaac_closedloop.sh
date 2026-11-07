@@ -107,13 +107,27 @@ esac
 # 权重产生的 —— release decoder 复现录制动作的残差 1e-5 度；low_latency 是另一个模型，
 # 残差 5.0 度（最差单关节 19.5 度）。HF cache 里只有 low_latency，release 在 clone 里。
 # 证据见 docs/SONIC_DECODER_FOUND.md。
+# ★ 2026-11-07（会话 01）：`SONIC=1` 时显式打开 SONIC provider。
+#   上游默认 `HA_ALLOW_SONIC=0` ⇒ 静默用 SuperMimic。正式 eval 一直是由**调用方**
+#   （r3_sr_queue.sh 等）导出这三个变量才走 SONIC；脚本自己不会兜底，
+#   所以 `SONIC=1` 在这里补上"叶子脚本也能自证执行器"的能力。
+if [[ "${SONIC:-0}" == "1" ]]; then
+  export HA_ALLOW_SONIC=1
+  export HA_GMT_BACKEND=${HA_GMT_BACKEND:-sonic}
+  export HA_ACTION_SOURCE=${HA_ACTION_SOURCE:-sonic_wholebody}
+fi
 if [[ -z "${SONIC_DIR:-}" ]]; then
   RELEASE_DIR=$COMIMIC/../GR00T-WholeBodyControl/gear_sonic_deploy/policy/release
   if [[ -f "$RELEASE_DIR/model_decoder.onnx" && -f "$RELEASE_DIR/model_encoder.onnx" ]]; then
     SONIC_DIR=$RELEASE_DIR
-  else
-    echo "[closedloop] WARN: release 权重不在 $RELEASE_DIR，退回 HF cache 的 low_latency（口径与录制数据不一致）" >&2
+  elif [[ "${ALLOW_LOW_LATENCY_FALLBACK:-0}" == "1" ]]; then
+    echo "[closedloop] WARN: release 权重不在 $RELEASE_DIR，按 ALLOW_LOW_LATENCY_FALLBACK=1 退回 low_latency（口径与录制数据不一致）" >&2
     SONIC_DIR=$(ls -d "$HF_HOME"/hub/models--nvidia--GEAR-SONIC/snapshots/*/low_latency 2>/dev/null | head -1)
+  else
+    echo "[closedloop][FATAL] release 权重不在 $RELEASE_DIR/model_decoder.onnx" >&2
+    echo "[closedloop][FATAL] low_latency 是**另一个模型**（残差 5.0°，release 是 1e-5°）。" >&2
+    echo "[closedloop][FATAL] 不再静默降级；确实要做该 A/B 请显式 ALLOW_LOW_LATENCY_FALLBACK=1。" >&2
+    exit 3
   fi
 fi
 if [[ -z "$SONIC_DIR" || ! -f "$SONIC_DIR/model_decoder.onnx" ]]; then
@@ -140,6 +154,31 @@ else
   }
 fi
 
+# ---- 部署口径审计（会话 01）：把"这次到底跑的是什么"写进日志 + audit 目录 ---------
+# 只记录、不改变控制行为；provider 期望值由调用方用 EXPECT_PROVIDER 声明，跑完核对。
+source "$COMIMIC/scripts/_deploy_audit.sh"
+audit_init "${AUDIT_DIR:-$COMIMIC/runs/harness_01_deploy/audit}"
+audit_kv "script" "ha_isaac_closedloop.sh"
+audit_kv "task" "$TASK/$TASK_ID"
+audit_kv "seed" "$SEED"
+audit_kv "ha_allow_sonic" "${HA_ALLOW_SONIC:-0}"
+audit_kv "ha_gmt_backend" "${HA_GMT_BACKEND:-<unset>}"
+audit_kv "ha_action_source" "${HA_ACTION_SOURCE:-<unset>}"
+audit_kv "expected_provider" "${EXPECT_PROVIDER:-any}"
+audit_kv "sonic_vla_action_format" "${SONIC_VLA_ACTION_FORMAT:-<unset>}"
+audit_file "sonic_decoder" "$SONIC_DIR/model_decoder.onnx"
+audit_file "sonic_encoder" "$SONIC_DIR/model_encoder.onnx"
+audit_file "sm_ckpt" "$SM_CKPT"
+audit_file "robot_usd" "$SUPERMIMIC_ROBOT_USD"
+audit_file "ref_lib_token" "${SM_TOKEN_LIB:-$COMIMIC/runs/isaac_motion/ha_cmd/packed.pt}"
+audit_file "ref_lib_reward" "${SM_PACKED:-$COMIMIC/runs/isaac_motion/ha_cmd/packed.pt}"
+audit_kv "sm_token_source" "${SM_TOKEN_SOURCE:-http}"
+audit_kv "sm_token_start" "${SM_START_FRAME:-${SM_TOKEN_START:-0}}"
+audit_kv "server_url" "${SERVER_URL:-}"
+audit_python "$(command -v python 2>/dev/null || echo python3)"
+# Δtoken：server 侧日志里会打印 [server][delta-token] / [audit][server] delta_token_enabled
+audit_kv "note_delta" "Δtoken 由 server 侧加载；见 server.log 的 [audit][server] delta_token_*"
+
 STAMP=$(date +%Y%m%d_%H%M%S)
 RUN_DIR=$OUT_ROOT/${TASK}__seed${SEED}__repeat${REPEAT}__$STAMP
 mkdir -p "$RUN_DIR/videos_success" "$RUN_DIR/videos_failure"
@@ -160,6 +199,7 @@ echo "[closedloop] instruction=${TASK_INSTRUCTION:-<none>}"
 echo "[closedloop] usd=$SUPERMIMIC_ROBOT_USD"
 echo "[closedloop] out=$RUN_DIR  record_video_every_n=$RECORD_VIDEO"
 echo "[closedloop] start_frame=${SM_START_FRAME:-${SM_TOKEN_START:-0}} init_from_lib=${SM_INIT_FROM_LIB:-0}"
+echo "[closedloop][executor] HA_ALLOW_SONIC=${HA_ALLOW_SONIC:-0} gmt_backend=${HA_GMT_BACKEND:-<unset>} action_source=${HA_ACTION_SOURCE:-<unset>} expect=${EXPECT_PROVIDER:-any}"
 
 cd "$PROJECT_ROOT"
 # GUI over NoVNC: Xtigervnc has no hardware GLX, so the RTX viewport stays black unless

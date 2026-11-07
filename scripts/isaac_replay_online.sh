@@ -30,6 +30,16 @@ TOKEN_START=${TOKEN_START:-0}
 TOKEN_STRIDE=${TOKEN_STRIDE:-1}
 
 mkdir -p "$OUT/dump"
+source "$COMIMIC/scripts/_deploy_audit.sh"
+audit_init "${AUDIT_DIR:-$OUT/audit}"
+audit_kv "script" "isaac_replay_online.sh"
+audit_file "sm_ckpt" "$SM_CKPT"
+audit_file "ref_lib" "$LIB"
+audit_kv "token_start" "$TOKEN_START"
+audit_kv "token_stride" "$TOKEN_STRIDE"
+audit_kv "expected_provider" "${EXPECT_PROVIDER:-supermimic}"
+audit_python python3
+
 echo "[online] tasks=[$TASKS] seeds=[$SEEDS] steps=$MAX_STEPS gpu=$ISAAC_GPU"
 echo "[online] ckpt=$SM_CKPT"
 echo "[online] lib=$LIB start=$TOKEN_START stride=$TOKEN_STRIDE reset_noise_scale=$RESET_SCALE"
@@ -47,6 +57,17 @@ n_ok=0; n_bad=0
 for task in $TASKS; do
   clip=$(clip_of "$task") || { echo "[online] SKIP 未知 task=$task"; continue; }
   hands="$COMIMIC/runs/arm_tokens/$clip/hands.npy"
+  # ★ 2026-11-07（会话 01）真 bug：参考库 clip 的**起始行**不是 0。
+  #   double_desk 从 0 开始，pp_box 从 246502 开始；TOKEN_START 默认 0 会让
+  #   "PPBox 任务"回放 DoubleDesk 的参考运动（评审 §5.6 "frame 索引对不上"）。
+  case "$task" in
+    PPBox|ppbox|HOI_pp_box) _pat="HOI_pp_box" ;;
+    *)                      _pat="HOI_double_desk" ;;
+  esac
+  audit_lib_clip_row "$LIB" "$_pat" "$TOKEN_START" || {
+    echo "[online][FATAL] 参考库行号与 clip 不匹配（见上），拒绝出结论" >&2
+    n_bad=$((n_bad+1)); continue
+  }
   for seed in $SEEDS; do
     run="online_${task}_s${seed}"
     log="$OUT/$run.log"
@@ -63,6 +84,7 @@ for task in $TASKS; do
       HA_VLA_EXEC_STEPS=1 \
       bash "$COMIMIC/scripts/ha_isaac_closedloop.sh" > "$log" 2>&1
     rc=$?
+    audit_provider_check "$log" "${EXPECT_PROVIDER:-supermimic}" || { echo "[online][FAIL] provider 与期望不符（$log）" >&2; rc=10; }
     if [[ $rc -eq 0 ]]; then n_ok=$((n_ok+1)); else n_bad=$((n_bad+1)); echo "[online] rc=$rc 见 $log"; fi
     echo "[online] $(date +%T) done rc=$rc"
   done

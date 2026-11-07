@@ -57,6 +57,12 @@ def main() -> int:
     ap.add_argument("--n-noise", type=int, default=3, help="每个请求采几次噪声（测信噪比）")
     ap.add_argument("--max-req", type=int, default=24, help="用多少个请求（均匀取）")
     ap.add_argument("--horizon-used", type=int, default=20, help="部署实际执行的帧数")
+    ap.add_argument("--state-order", choices=("ha_v31", "standard"), default="ha_v31",
+                    help="线上 state64[6:35]/[35:64] 的关节序（与 server 的 --state-order 同口径）")
+    ap.add_argument("--delta-feat-joint-order", choices=("auto", "standard", "ha_v31"),
+                    default="auto",
+                    help="Δtoken 特征里关节块的顺序；auto = 读 ckpt meta，缺失则用训练历史约定 "
+                         "(standard)。与 server 的 --delta-feat-joint-order 同口径")
     a = ap.parse_args()
 
     import torch  # noqa: PLC0415
@@ -112,27 +118,35 @@ def main() -> int:
         if unexpected:
             raise SystemExit(f"[land] {name}: unexpected={len(unexpected)}（LoRA 配置不一致）")
         # ★ 2026-11-06：**命令层残差**也要按臂单独装载/清空（否则会串到下一个臂）。
-        #   shape 与 server 的 infer 完全一致：eng.infer 内部用 state64[:6]/[35:64] 算 Δ 并加到 token。
+        # ★ 2026-11-07（会话 01）：装载规则与 server **共用**
+        #   `diff_vla_wbc/delta_token_io.py`：feat 口径 35/64 由 metadata + 首层宽度反推，
+        #   关节序置换也一并做掉。以前这里写死 35 维 + hidden 默认 512，
+        #   对 64 维 ckpt 只能得到 "size mismatch"（看不出是口径问题），
+        #   对 1024 宽的 ckpt 直接装不上 —— 探针会把"装不上"当成"Δ 没效果"。
         eng.delta_token_net = None
+        eng.delta_token_spec = None
+        eng.delta_token_cap = 0.0
         _d = arm_sds[name]
         if isinstance(_d, dict) and _d.get("delta_token_state") is not None:
-            from diff_vla_wbc.delta_token import DeltaTokenNet  # noqa: PLC0415
+            from diff_vla_wbc.delta_token_io import (  # noqa: PLC0415
+                load_delta_token_from_checkpoint,
+            )
 
-            _meta = _d.get("delta_token_meta") or {}
-            # ★ 2026-11-07：输入宽度从 state dict 反推（35 维 feats 或 64 维 state64 两种口径）
-            _sd0 = _d["delta_token_state"]["net.0.weight"].shape[1]
-            _fdim = int(_sd0) - 64
-            _net = DeltaTokenNet(feat_dim=_fdim,
-                                 hidden=int(_meta.get("hidden", 1024) or 1024),
-                                 depth=int(_meta.get("depth", 2) or 2))
-            _net.load_state_dict(_d["delta_token_state"], strict=False)
-            _net = _net.to(a.device).eval()
-            for _p in _net.parameters():
-                _p.requires_grad_(False)
+            _fj = str(getattr(a, "delta_feat_joint_order", "auto") or "auto")
+            try:
+                _net, _spec = load_delta_token_from_checkpoint(
+                    _d, device=a.device, state_joint_order=str(a.state_order),
+                    feat_joint_order=None if _fj == "auto" else _fj,
+                )
+            except Exception as exc:  # noqa: BLE001 - 口径错误必须终止探针
+                raise SystemExit(f"[land] {name}: delta-token 加载失败：{exc}") from exc
             eng.delta_token_net = _net
-            eng.delta_token_cap = float(_meta.get("cap", 0.0) or 0.0)
-            print(f"[land] {name}: delta-token 已装载 params={_net.n_params} meta={_meta}",
-                  flush=True)
+            eng.delta_token_spec = _spec
+            eng.delta_token_cap = float(_spec.cap)
+            print(f"[land] {name}: delta-token 已装载 params={_net.n_params} "
+                  f"feat_dim={_spec.feat_dim} layout={_spec.feat_layout} "
+                  f"cap={_spec.cap:g} feat_joint_order={_spec.feat_joint_order} "
+                  f"sources={_spec.sources}", flush=True)
         eng._head_loaded = True
 
     # ---- 3) 逐请求、逐噪声：三臂用**同一个噪声种子** ⇒ Δa 是干净的配对差 ----

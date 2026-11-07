@@ -57,6 +57,11 @@ for vspec in "${VSPECS[@]}"; do
           bash "$COMIMIC/scripts/ha_isaac_closedloop.sh" \
           >> "$OUT/runs/${VNAME}__${task}__seed${seed}__repeat${r}.log" 2>&1
         rc=$?
+        # ★ 2026-11-07（会话 01）：执行器核对 —— 期望值默认 supermimic（本脚本按项目默认路由），
+        #   SONIC=1 时调用方应传 EXPECT_PROVIDER=sonic。不匹配 ⇒ 本轮记失败，绝不进成功率表。
+        source "$COMIMIC/scripts/_deploy_audit.sh"
+        audit_provider_check "$OUT/runs/${VNAME}__${task}__seed${seed}__repeat${r}.log" \
+          "${EXPECT_PROVIDER:-supermimic}" || { echo "[batch][FAIL] provider 不符" >&2; rc=10; }
         echo "[batch] $(date +%T) done rc=$rc variant=$VNAME task=$task seed=$seed repeat=$r"
       done
     done

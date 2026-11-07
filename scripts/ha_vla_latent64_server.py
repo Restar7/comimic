@@ -212,6 +212,98 @@ def assert_state_layout_matches_training_data(layout: str, state_order: str = "h
           flush=True)
 
 
+def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def runtime_audit(engine, args) -> dict:
+    """★ 2026-11-07（会话 01）：把**部署口径可对账的事实**一次性写进日志。
+
+    为什么需要（docs/REVIEW_TWO_ROUTES_BPTT_VS_DISTILL_20261107.md §5.6/§7）：
+    闭环结论反复被"其实跑的是另一个 provider / 另一个参考库 / checkpoint 里根本没有 Δ"
+    污染。这些事实以前只散落在 stdout 的十几行里，事后无法从产物反查。这里统一成
+    ``[audit] key=value`` 一行一条 + 一个 JSON 摘要（``runs/harness_01_deploy`` 用）。
+    """
+    import platform
+
+    import torch
+
+    from diff_vla_wbc.delta_token_io import sha256_file  # noqa: PLC0415
+
+    info: dict = {
+        "python": sys.executable,
+        "python_version": platform.python_version(),
+        "torch": torch.__version__,
+        "numpy": np.__version__,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "device": str(args.device),
+        "token_space": str(getattr(engine, "token_space", "")),
+        "state_order": str(getattr(args, "state_order", "")),
+        "state_layout": str(getattr(args, "state_layout", "")),
+        "token_quant": str(getattr(args, "token_quant", "none")),
+        "fm_steps": int(getattr(args, "fm_steps", -1)),
+        "sample_avg": int(getattr(args, "sample_avg", 1)),
+    }
+    try:
+        import transformers  # noqa: PLC0415
+
+        info["transformers"] = transformers.__version__
+    except Exception:  # noqa: BLE001
+        info["transformers"] = "missing"
+    try:
+        import onnxruntime  # noqa: PLC0415
+
+        info["onnxruntime"] = onnxruntime.__version__
+    except Exception:  # noqa: BLE001
+        info["onnxruntime"] = "missing"
+
+    # ---- VLA checkpoint（目录）与 head checkpoint（文件）----
+    if getattr(args, "ckpt", None) and Path(args.ckpt).is_dir():
+        ck = Path(args.ckpt)
+        info["vla_ckpt"] = str(ck.resolve())
+        files = sorted(p for p in ck.iterdir() if p.is_file())
+        info["vla_ckpt_files"] = len(files)
+        info["vla_ckpt_bytes"] = int(sum(p.stat().st_size for p in files))
+        # 7 GB 级权重全量 hash 会拖慢启动；默认只 hash 小文件（config/meta），
+        # 需要完整指纹时 AUDIT_FULL_HASH=1。
+        _full = os.environ.get("AUDIT_FULL_HASH", "0") == "1"
+        hashes = {}
+        for p in files:
+            if p.stat().st_size > (1 << 31) or (p.suffix in (".safetensors", ".bin") and not _full):
+                hashes[p.name] = f"size={p.stat().st_size}(skipped;AUDIT_FULL_HASH=1 to hash)"
+                continue
+            try:
+                hashes[p.name] = sha256_file(p)
+            except Exception as exc:  # noqa: BLE001
+                hashes[p.name] = f"ERR:{exc}"
+        info["vla_ckpt_sha256"] = hashes
+    if getattr(args, "head_ckpt", ""):
+        hp = Path(args.head_ckpt)
+        info["head_ckpt"] = str(hp.resolve())
+        info["head_ckpt_sha256"] = (sha256_file(hp) if hp.is_file() else "MISSING")
+
+    # ---- Δtoken ----
+    spec = getattr(engine, "delta_token_spec", None)
+    info["delta_token_enabled"] = bool(getattr(engine, "delta_token_net", None) is not None)
+    info["delta_token_spec"] = (spec.as_dict() if spec is not None else None)
+    info["delta_token_cap"] = float(getattr(engine, "delta_token_cap", 0.0) or 0.0)
+    info["token_dim"] = 64
+    info["feat_dim"] = (int(spec.feat_dim) if spec is not None else None)
+
+    for k, v in info.items():
+        print(f"[audit][server] {k}={v}", flush=True)
+    return info
+
+
 def resolve_token_quant(value) -> str:
     """校验并归一化部署侧量化口径（**委托** :func:`diff_vla_wbc.quant.resolve_deploy_mode`）。
 
@@ -237,6 +329,13 @@ class Engine:
         self.processor = None
         self.image_hw = (224, 224)
         self._log_req = 0
+        # ★ 命令层残差：这三个属性**必须**在 `_load()` 之前就存在 ——
+        #   会话 01 之前的代码只在 head ckpt 里出现 delta_token_state 时才创建，
+        #   于是"没加载 Δ"和"加载失败"在日志里长得一样。现在默认显式 None/0，
+        #   并在 `_audit_banner` 里把"是否启用"打成一行可对账的事实。
+        self.delta_token_net = None
+        self.delta_token_spec = None
+        self.delta_token_cap = 0.0
         # 部署侧 token 量化（2026-11-04）：none / ste / hard，前向行为见 diff_vla_wbc/quant.py
         self._quant_mode = str(getattr(args, "token_quant", "none") or "none").lower()
         self._quant_n = 0
@@ -375,30 +474,48 @@ class Engine:
             print(f"[server][head][state-extra] mode={self.state_extra_mode} "
                   f"scale={[round(float(x), 5) for x in _sc]}", flush=True)
 
-        # ---- 命令层残差：token' = token + g(token0, [rot6d(6), dof_vel(29)]) ----
-        # 与 state_extra 一样：mode/权重都从 ckpt 读 ⇒ 训练开了部署自动生效，
-        # 特征直接取自线上 state64（[0:6] 朝向、[35:64] 关节速度），**第三方客户端零改动**。
+        # ---- 命令层残差：token' = token + g(token0, feat(state64)) ----
+        # ★ 2026-11-07（会话 01）：加载规则收敛到 `diff_vla_wbc/delta_token_io.py`：
+        #   feat 口径（35 / 64）先由 metadata、再从**第一层输入宽度**反推，权重结构严格校验，
+        #   任何不一致当场 SystemExit —— 绝不静默退回 35 维、也绝不静默跳过 Δ 模块
+        #   （那会把"配置错了"伪装成"Δ 没效果"）。
+        #   旧写法有两个真 bug：① 固定按 35 维建网 ⇒ 64 维 ckpt 在 load_state_dict 上
+        #   抛 "size mismatch"（报错但看不出是口径问题）；② `--lora-*` 之外还默认
+        #   hidden=512，与 1024 的 ckpt 冲突时同样只能靠 shape error 发现。
         self.delta_token_net = None
+        self.delta_token_spec = None
+        self.delta_token_cap = 0.0
         if isinstance(d, dict) and d.get("delta_token_state") is not None:
-            from diff_vla_wbc.delta_token import DeltaTokenNet  # noqa: PLC0415
+            from diff_vla_wbc.delta_token_io import (  # noqa: PLC0415
+                ckpt_sha256_of_tensor_dict,
+                load_delta_token_from_checkpoint,
+            )
 
-            _meta = d.get("delta_token_meta") or {}
-            # ★ 2026-11-07：输入宽度从 state dict 反推（35 维 feats 或 64 维 state64 两种口径）
-            _sd0 = d["delta_token_state"]["net.0.weight"].shape[1]
-            _fdim = int(_sd0) - 64
-            _net = DeltaTokenNet(feat_dim=_fdim,
-                                 hidden=int(_meta.get("hidden", 1024) or 1024),
-                                 depth=int(_meta.get("depth", 2) or 2))
-            _miss, _unexp = _net.load_state_dict(d["delta_token_state"], strict=False)
-            _net = _net.to(self.args.device).eval()
-            for _p in _net.parameters():
-                _p.requires_grad_(False)
+
+            _fj = str(getattr(self.args, "delta_feat_joint_order", "auto") or "auto")
+            try:
+                _net, _spec = load_delta_token_from_checkpoint(
+                    d, device=self.args.device,
+                    state_joint_order=str(getattr(self.args, "state_order", "ha_v31")),
+                    feat_joint_order=None if _fj == "auto" else _fj,
+                )
+            except Exception as exc:  # noqa: BLE001 - 契约错误必须终止进程
+                raise SystemExit(f"[server][delta-token] 加载失败：{exc}") from exc
             self.delta_token_net = _net
-            # ★ cap 必须从 ckpt 的 meta 带过来：训练时它是"软缩放"，部署不跟着做就是口径漂移
-            self.delta_token_cap = float(_meta.get("cap", 0.0) or 0.0)
-            print(f"[server][head][delta-token] 已加载 params={_net.n_params} "
-                  f"meta={_meta} missing={len(_miss)} unexpected={len(_unexp)} "
-                  f"⇒ 前向 token + g(state)，客户端无需改动", flush=True)
+            self.delta_token_spec = _spec
+            self.delta_token_cap = float(_spec.cap)
+            print(f"[server][delta-token] loaded params={_net.n_params} "
+                  f"token_dim={_spec.token_dim} feat_dim={_spec.feat_dim} "
+                  f"layout={_spec.feat_layout} hidden={_spec.hidden} depth={_spec.depth} "
+                  f"cap={_spec.cap:g} feat_joint_order={_spec.feat_joint_order} "
+                  f"state_joint_order={_spec.state_joint_order}", flush=True)
+            print(f"[server][delta-token] sources={_spec.sources}", flush=True)
+            print(f"[server][delta-token] weights_sha256="
+                  f"{ckpt_sha256_of_tensor_dict(d['delta_token_state'])}", flush=True)
+            print(f"[server][delta-token] meta_raw={d.get('delta_token_meta') or {}}", flush=True)
+        else:
+            print("[server][delta-token] ckpt 里没有 delta_token_state ⇒ Δ模块关闭"
+                  "（如果这一轮训练开了 DELTA_TOKEN，说明装错了 checkpoint）", flush=True)
         self._head_loaded = True
 
     # ---------------------------------------------------------------- inference
@@ -531,33 +648,31 @@ class Engine:
                 fingers = np.mean(np.stack(_fins, 0), 0).astype(np.float32)
             else:
                 chunk64, fingers = _toks[0], _fins[0]
-            # ★ 命令层残差：用**本次请求的 state64** 算 Δ，广播到整段 chunk。
-            #   与训练侧同口径（rotlocal6 就是 state64[:6]；dof_vel 就是 [35:64]）。
+            # ★ 命令层残差：用**本次请求的 state64** 算 Δ，广播到整段 chunk（= 训练侧
+            #   `d.unsqueeze(1)` 的同一个语义：整段 40 帧共用第 0 帧 token 上算出的 Δ）。
+            #   特征构造（含 **关节序置换** 与 35/64 两种口径）全部走
+            #   `delta_token_io`，与 `probe_ft_landing.py`、与训练侧 `_delta_token_features`
+            #   共用同一份实现 —— 这是唯一防"训练/部署特征不同"的地方。
             if getattr(self, "delta_token_net", None) is not None:
-                _s64 = np.asarray(state64, dtype=np.float32).reshape(-1)
-                if _s64.size < 64:
-                    raise SystemExit(
-                        f"[server][delta-token] state64 宽度 {_s64.size} < 64，算不出偏差特征")
-                # ★ 2026-11-07：输入宽度随 ckpt 走 ——
-                #   35 维（老口径）= rot6d + dof_vel；64 维（第 2 刀）= 部署 state64 全量。
-                if int(getattr(self.delta_token_net, "feat_dim", 35)) == 64:
-                    _feat = np.asarray(_s64, np.float32).reshape(-1)[:64]
-                else:
-                    _feat = np.concatenate([_s64[0:6], _s64[35:64]]).astype(np.float32)
-                with torch.no_grad():
-                    _tok0 = torch.from_numpy(chunk64[0]).to(self.args.device).float()[None]
-                    _fe = torch.from_numpy(_feat).to(self.args.device).float()[None]
-                    from diff_vla_wbc.delta_token import apply_norm_cap  # noqa: PLC0415
+                from diff_vla_wbc.delta_token_io import (  # noqa: PLC0415
+                    delta_features_from_state64,
+                    delta_from_token_chunk,
+                )
 
-                    _d = apply_norm_cap(self.delta_token_net(_tok0, _fe),
-                                        float(getattr(self, "delta_token_cap", 0.0) or 0.0))
-                    _d = _d[0].detach().cpu().numpy().astype(np.float32)
+                _spec = self.delta_token_spec
+                if _spec is None:
+                    raise SystemExit("[server][delta-token] 网络已装载但 spec 为空（不该发生）")
+                _s64 = np.asarray(state64, dtype=np.float32).reshape(-1)
+                _feat = delta_features_from_state64(_s64, _spec)
+                _d = delta_from_token_chunk(chunk64[0], _feat, self.delta_token_net, _spec)
                 chunk64 = (chunk64 + _d[None, :]).astype(np.float32)
                 self._dt_n = int(getattr(self, "_dt_n", 0)) + 1
                 if self._dt_n % 20 == 1:
-                    print(f"[server][delta-token] #%d ‖Δtoken‖=%.4f rot6d=%s"
+                    print("[server][delta-token] #%d ‖Δtoken‖=%.4f feat[0:6]=%s "
+                          "|d|=%.4f hand_untouched=%s"
                           % (self._dt_n, float(np.linalg.norm(_d)),
-                             np.round(_feat[:6], 3).tolist()), flush=True)
+                             np.round(_feat[:6], 3).tolist(), float(np.linalg.norm(_d)), True),
+                          flush=True)
             # ★ 2026-11-01（滞后性检验）：token 空间一阶外推 = "提前量"
             #   tok_t ← tok_t + β (tok_t − tok_{t−1})，跨请求用**未外推**的上次末 token 作 t−1，
             #   避免外推逐次复利放大。
@@ -768,6 +883,14 @@ def main() -> int:
                     help="order of the 29 joints inside the incoming 64-d vla_state "
                          "(ha_v31 = HumanoidArena asset order, which the current ckpt was "
                          "trained on; standard = trackerlab/MuJoCo order)")
+    ap.add_argument("--delta-feat-joint-order", choices=("auto", "standard", "ha_v31"),
+                    default=os.environ.get("DELTA_FEAT_JOINT_ORDER", "auto"),
+                    help="★ 2026-11-07（会话 01）：Δtoken 的**特征里**关节块要按哪个顺序喂。"
+                         "训练侧的 start_state 来自 runs/isaac_motion/ha_cmd/packed.pt，其 q/qd 是 "
+                         "MJCF/STANDARD_29 序（scripts/build_ha_command_lib.py 转序 + 数据侧对拍），"
+                         "而线上 state64 的 dof_pos/dof_vel 是 HA_V31 序 ⇒ auto 会做一次置换。"
+                         "auto = 先读 ckpt 的 delta_token_meta.feat_joint_order，没有就用训练历史约定 "
+                         "(standard)。只有当你能证明某份 ckpt 是在 HA_V31 序的 state 上训的，才传 ha_v31")
     ap.add_argument("--state-layout", choices=("train_v1", "legacy"), default="legacy",
                     help="46 维 state 的分块布局。**默认 legacy = [joints29|hands14|gravity3]**，"
                          "这是 data/npz/ha_tokens 里 g1_state_46 的真实布局，也是 checkpoint 的 "
@@ -826,6 +949,17 @@ def main() -> int:
         random.seed(int(args.seed))
         print(f"[server] 采样已播种 seed={int(args.seed)}（评测可复现）", flush=True)
     Handler.engine = Engine(args)
+    # ★ 部署口径对账信息（provider 由 `ha_isaac_closedloop.sh` 侧记录；这里记模型侧）
+    try:
+        _audit = runtime_audit(Handler.engine, args)
+        _adir = os.environ.get("AUDIT_OUT_DIR", "")
+        if _adir:
+            Path(_adir).mkdir(parents=True, exist_ok=True)
+            (Path(_adir) / "server_audit.json").write_text(
+                json.dumps(_audit, indent=1, ensure_ascii=False), encoding="utf-8")
+            print(f"[audit][server] wrote {Path(_adir) / 'server_audit.json'}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - 审计不能挡住服务
+        print(f"[audit][server][WARN] runtime_audit 失败：{exc}", flush=True)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.verbose = args.verbose
     print(f"[server] listening on http://{args.host}:{args.port}/infer "

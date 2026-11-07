@@ -72,6 +72,9 @@ for task in $TASKS; do
       HA_VLA_EXEC_STEPS=${HA_VLA_EXEC_STEPS:-20} \
         bash scripts/ha_isaac_closedloop.sh > "$log" 2>&1
       rc=$?
+      source "$COMIMIC/scripts/_deploy_audit.sh"
+      audit_provider_check "$log" "${EXPECT_PROVIDER:-supermimic}" \
+        || { echo "[replay][FAIL] provider 不符（$log）" >&2; rc=10; }
       if [[ $rc -eq 0 ]]; then n_ok=$((n_ok+1)); else n_bad=$((n_bad+1)); echo "[replay] rc=$rc 见 $log"; fi
       echo "[replay] $(date +%T) done rc=$rc"
     done

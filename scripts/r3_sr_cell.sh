@@ -12,6 +12,23 @@
 #   GPU=0|1  PORT=18xxx  CELLDIR=...  SEEDS="0 1 2"  MAX_STEPS=3000  LABEL=...
 set -uo pipefail
 
+# ★ 2026-11-07（会话 01）：
+#   * 现状（实测）：导出 `HA_ALLOW_SONIC` 的是**调用方**队列脚本
+#     （`r3_sr_queue.sh:29-31` 等 13 个），正式 eval 一直走 SONIC
+#     （`runs/closedloop_r3` 88/88 日志是 [SonicActionProvider]）。
+#     **但本脚本自己不导出** ⇒ 单独调用 + 干净环境会静默落到 SuperMimic
+#     （`runs/closedloop_sr/sr1_WRONG_ACTION_SOURCE_supermimic/` 就是那次的负对照）。
+#   * `SONIC=1` ⇒ 由本脚本显式导出三件套，不再依赖调用方。
+#   * head ckpt 里有 delta_token_state ⇒ Δtoken 已启用 ⇒ 必须 SONIC（除非显式
+#     ALLOW_DELTA_WITH_SUPERMIMIC=1 做对照），否则 audit_delta_required 会非零退出。
+SONIC=${SONIC:-0}
+if [[ "$SONIC" == "1" ]]; then
+  export HA_ALLOW_SONIC=1
+  export HA_GMT_BACKEND=${HA_GMT_BACKEND:-sonic}
+  export HA_ACTION_SOURCE=${HA_ACTION_SOURCE:-sonic_wholebody}
+fi
+EXPECT_PROVIDER=${EXPECT_PROVIDER:-$([[ "$SONIC" == "1" ]] && echo sonic || echo any)}
+
 COMIMIC=/inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic
 TASK=${TASK:?}; HEAD=${HEAD:-none}
 GPU=${GPU:?}; PORT=${PORT:?}; CELLDIR=${CELLDIR:?}
@@ -21,6 +38,19 @@ CKPT=${CKPT:-runs/groot_sonic_vla_ha_b64_lr1e-5/checkpoint-8000}
 mkdir -p "$CELLDIR"
 LOG=$CELLDIR/cell.log
 cd "$COMIMIC" || exit 1
+source "$COMIMIC/scripts/_deploy_audit.sh"
+audit_init "${AUDIT_DIR:-$CELLDIR/audit}"
+audit_kv "script" "r3_sr_cell.sh"
+audit_kv "task" "$TASK"; audit_kv "head" "$HEAD"; audit_kv "gpu" "$GPU"; audit_kv "port" "$PORT"
+audit_kv "sonic_requested" "$SONIC"
+audit_kv "ha_allow_sonic" "${HA_ALLOW_SONIC:-0}"
+audit_kv "expected_provider" "$EXPECT_PROVIDER"
+audit_file "vla_ckpt_dir" "$CKPT"
+audit_file "head_ckpt" "$HEAD"
+audit_file "sonic_decoder" "${SONIC_DIR:-$COMIMIC/../GR00T-WholeBodyControl/gear_sonic_deploy/policy/release}/model_decoder.onnx"
+audit_file "ref_lib" "${SM_TOKEN_LIB:-$COMIMIC/runs/isaac_motion/ha_cmd/packed.pt}"
+audit_python python3
+audit_delta_required "$HEAD" || { echo "[cell][FATAL] Δtoken 与执行器不匹配（见上）" | tee -a "$LOG"; exit 2; }
 echo "[cell] start $(date +%F' '%T) task=$TASK head=$HEAD gpu=$GPU port=$PORT seeds='$SEEDS' max_steps=$MAX_STEPS" | tee "$LOG"
 
 # ---- server（head==none 时就是未微调底模），整格复用 -------------------------
@@ -43,6 +73,20 @@ for _ in $(seq 1 150); do
 done
 grep -q "listening on" "$CELLDIR/server.log" 2>/dev/null || { echo "[cell] server 超时" | tee -a "$LOG"; kill "$SPID" 2>/dev/null; exit 3; }
 echo "[cell] server ready" | tee -a "$LOG"
+_DT=$(grep -m1 "\[server\]\[delta-token\] loaded" "$CELLDIR/server.log" 2>/dev/null || true)
+if [[ -n "$_DT" ]]; then
+  echo "[cell][delta-token] ${_DT#*] }" | tee -a "$LOG"
+  audit_kv "delta_token_enabled" "1"
+  audit_kv "delta_token_detail" "$_DT"
+elif grep -q "\[server\]\[delta-token\] ckpt 里没有" "$CELLDIR/server.log" 2>/dev/null; then
+  echo "[cell][delta-token] 未启用（head ckpt 里没有 delta_token_state）" | tee -a "$LOG"
+  audit_kv "delta_token_enabled" "0"
+else
+  echo "[cell][delta-token][WARN] server.log 里没有 delta-token 结论行（可能加载失败）" | tee -a "$LOG"
+  audit_kv "delta_token_enabled" "UNKNOWN"
+fi
+# 服务端自己记录的口径（feat_dim/cap/token_dim/ckpt sha）
+grep -m20 "\[audit\]\[server\]" "$CELLDIR/server.log" 2>/dev/null | sed 's/^/[cell] /' | tee -a "$LOG" || true
 
 # ---- 逐 seed 跑（每 seed 一个 Isaac 进程，server 不复位不重启）----------------
 for s in $SEEDS; do
@@ -53,6 +97,13 @@ for s in $SEEDS; do
     EXTRA_ARGS="--step_log_every_n 500" \
     bash scripts/ha_isaac_closedloop.sh >> "$CELLDIR/isaac_seed$s.log" 2>&1
   rc=$?
+  audit_provider_check "$CELLDIR/isaac_seed$s.log" "$EXPECT_PROVIDER"
+  prc=$?
+  if [[ "$prc" -ne 0 ]]; then
+    echo "[cell][FAIL] seed=$s provider 核对失败（见 isaac_seed$s.log）" | tee -a "$LOG"
+    printf '{"seed": %s, "success": false, "failure_reason": "provider_mismatch", "episode_steps": 0, "max_steps": %s, "duration_sec": 0}\n' "$s" "$MAX_STEPS" > "$CELLDIR/ep_seed$s.json"
+    continue
+  fi
   R=$(ls -dt "$CELLDIR/seed$s"/*/result.json 2>/dev/null | head -1)
   if [[ -n "$R" && -f "$R" ]]; then
     cp -f "$R" "$CELLDIR/ep_seed$s.json"
