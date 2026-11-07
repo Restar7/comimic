@@ -1701,6 +1701,16 @@ class JointTrainerV3(JointTrainerV2):
                 if _fr2 is not None:
                     _X["ref0"] = self.bundle.ref_state_at(
                         _fr2.to(self.device).long()).detach().float().cpu().numpy()[_sl]
+                # ★ 2026-11-07：`frame` / `clip_id` 也落盘 —— 便宜（8 B/条）且以后能：
+                #   ① 按参考片段做分层采样/留出；② 从运动库重取该窗口的参考历史。
+                #   注：**root p/v 的 10 帧历史不在数据管线里**（npz 只有 joint_pos/vel/body_quat），
+                #   所以不做"重采就能补回来"的假设 —— 这条限制写进文档。
+                _fr0 = getattr(batch, "frames", None)
+                if _fr0 is not None:
+                    _X["frame"] = _fr0[_sl].detach().cpu().numpy()
+                _cid = getattr(batch, "clip_ids", None)
+                if _cid is not None:
+                    _X["clip_id"] = _cid[_sl].detach().cpu().numpy()
                 _X["g1"] = _g1.detach().float().cpu().numpy()[_sl]
                 _X["r1"] = _r1["total"].detach().float().cpu().numpy()[_sl]
                 # ★★ `J1_GRAD_DUMP_TOK=1`：**token 空间**的理想修正 ∂J/∂token。
