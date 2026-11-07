@@ -196,8 +196,11 @@ def start_weights(env: Env, delta: float) -> torch.Tensor:
     real = torch.load(str(_abs(env.bptt_args.get("real_transitions",
                                                  DEFAULTS["real_transitions"]))),
                       map_location="cpu", weights_only=False)
-    pk = torch.load(str(_abs(env.bptt_args.get("ref_drift_lib", DEFAULTS["ref_drift_lib"]))),
-                    map_location="cpu", weights_only=False)
+    # ★ `args.json` 里 `ref_drift_lib` 可能是 `null`（bptt1 就是这样）：空值必须回落到
+    #   DEFAULTS（= runs/isaac_motion/ha_cmd_exec/packed.pt）。规范 §3.1 明确要求
+    #   漂移参考库是 **ha_cmd_exec**，不是 `motion_packed` 的 `ha_cmd`。
+    _ref_lib = env.bptt_args.get("ref_drift_lib") or DEFAULTS["ref_drift_lib"]
+    pk = torch.load(str(_abs(_ref_lib)), map_location="cpu", weights_only=False)
     ref_all = torch.as_tensor(pk["ref"]).float()
     fr = real["frames"].long()
     st = real["states"].float()
@@ -213,6 +216,40 @@ def start_weights(env: Env, delta: float) -> torch.Tensor:
     if zero.numel():
         w[zero] = w[(zero - 1).clamp(min=0)]
     return w
+
+
+def eligible_start_mask(env: Env, *, horizon: int, drift: float = 0.10,
+                        h_tail: int = 0, min_frame: int = 10) -> tuple[torch.Tensor, dict]:
+    """**可作 rollout 起点**的 0/1 权重（规范 §3.1 + §3.4），供 on-the-fly `multinomial` 用。
+
+    约束（缺一不可）：
+      * ``‖state[:3] − ref[frame][:3]‖ ≤ drift`` 且该帧真被采到过（`start_weights`，含
+        "``w==0`` 用前一帧回填"的 bptt1 原坑，照抄不修）；
+      * ``f ≥ 10``：`history` 需要前 10 帧；
+      * ``f + H + H_tail ≤ clip_end``：尾部参考帧必须真实存在（否则 `teacher_references`
+        会把它们 clamp 成重复帧 ⇒ 尾部价值退化成常数）；
+      * 由此 ``f..f+H`` 必然落在**同一个 clip** 内（帧在 clip 内连续）。
+    """
+    w0 = start_weights(env, float(drift))
+    lib = env.lib
+    n = int(lib.num_frames)
+    cid = torch.as_tensor(lib.clip_id).detach().cpu().long()
+    clip_end = torch.as_tensor(lib.clip_end).detach().cpu().long()
+    end = clip_end[cid]
+    ar = torch.arange(n, dtype=torch.long)
+    ok = (w0 > 0)
+    ok[: int(min_frame)] = False
+    ok &= (ar + int(horizon) + int(h_tail) <= end)
+    w = torch.zeros(n, dtype=torch.float32)
+    w[ok] = 1.0
+    info = dict(
+        n_frames=n, n_eligible=int(ok.sum()), n_drift_eligible=int((w0 > 0).sum()),
+        horizon=int(horizon), h_tail=int(h_tail), drift=float(drift), min_frame=int(min_frame),
+        uniform_over_eligible=True,
+        eligible_per_clip=int(ok.sum().item()),
+    )
+    return w, info
+
 
 
 def clip_groups(lib) -> tuple[np.ndarray, list[str]]:
@@ -236,11 +273,17 @@ def build_windows(args) -> Path:
     allowed = (w > 0).nonzero(as_tuple=False).flatten()
     frames_ok = torch.zeros(int(lib.num_frames), dtype=torch.bool)
     frames_ok[allowed] = True
-    # 起点必须在 [HISTORY, num_frames-H-2]，且往后 H+1 帧都在同一 clip 内
-    min_f, max_f = 10, int(lib.num_frames) - H - 3
+    # 起点硬约束（规范 §3.4）：f ≥ 10；f + H + H_tail ≤ clip_end（尾部参考帧必须真实存在）；
+    # 由此 f..f+H 必然同 clip（帧在 clip 内连续），不需要跨 clip 借参考。
+    h_tail = int(getattr(args, "h_tail", 0) or 0)
+    min_f = 10
+    _ar = torch.arange(int(lib.num_frames), dtype=torch.long)
+    _cid_all = torch.as_tensor(lib.clip_id).detach().cpu().long()
+    _end_all = torch.as_tensor(lib.clip_end).detach().cpu().long()[_cid_all]
     frames_ok[:min_f] = False
-    frames_ok[max_f:] = False
-    log(f"可作起点的帧 {int(frames_ok.sum())} / {int(lib.num_frames)}")
+    frames_ok &= (_ar + H + h_tail <= _end_all)
+    log(f"可作起点的帧 {int(frames_ok.sum())} / {int(lib.num_frames)}"
+        f"（f≥{min_f}, f+H+h_tail={H + h_tail}≤clip_end）")
 
     # ---- 按 clip 切分（episode 级，不按帧）----
     frame_clip = cid
@@ -267,6 +310,18 @@ def build_windows(args) -> Path:
         if pool.numel() == 0:
             log(f"[warn] split={split} 没有可用帧")
             picked[split] = torch.zeros(0, dtype=torch.long)
+            continue
+        # ★ 规范 §3.2：起点分布必须是"**合格帧上均匀**"，不是按 clip 分层。
+        #   `--uniform-frames 1` ⇒ 在 split 的合格帧里**无放回均匀**抽 n_target 个。
+        #   评测集用这个口径建立；训练走 on-the-fly 的 `multinomial(w,B)`（同一分布）。
+        if bool(int(getattr(args, "uniform_frames", 0) or 0)):
+            rng_u = np.random.default_rng(int(args.seed) + {"train": 1, "val": 2, "test": 3}[split])
+            take = min(int(n_target), int(pool.numel()))
+            sel_u = rng_u.choice(pool.numpy(), size=take, replace=False)
+            picked[split] = torch.tensor(sorted(int(f) for f in sel_u), dtype=torch.long)
+            n_clip_pool = len({int(frame_clip[f]) for f in pool.tolist()})
+            log(f"split={split}: {take} 窗口（uniform over eligible frames；"
+                f"{len(pool)} 合格帧 / {n_clip_pool} clip）")
             continue
         # clip 分层：每个 clip 尽量均匀取
         sel: list[int] = []
@@ -340,6 +395,11 @@ def build_windows(args) -> Path:
         val_clips=[names[c] for c in val_clips],
         test_clips=[names[c] for c in test_clips],
         bptt_args=str(args.bptt_args) if args.bptt_args else "",
+        # ★ 规范 §3.2 / §11：起点必须是"合格帧上均匀"，分层会压平 clip 长度权重 ⇒ 另一个分布
+        uniform_over_eligible=bool(int(getattr(args, "uniform_frames", 0) or 0)),
+        h_tail=int(getattr(args, "h_tail", 0) or 0),
+        n_eligible_frames=int((frames_ok & (w > 0)).sum()),
+        data_mode="cached_pool",
         created=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
     payload = dict(
@@ -365,60 +425,133 @@ def build_windows(args) -> Path:
     return out_dir / "windows.pt"
 
 
-@torch.no_grad()
+class FrozenVLASampler:
+    """冻结官方 VLA（checkpoint-8000）+ 处理器 + codec：**同一批帧**上采样 token chunk。
+
+    `build` 用它缓存评测集的 token；v5 的 on-the-fly 训练用它**每步现场采样**
+    （每次新 flow-matching 初噪 ⇒ 每步 token 噪声都是新的，规范 §3.3）。
+    采样前向按 ``vla_batch`` 分块（2B VLM + 1.09B DiT 的显存与 256 帧同批不划算）。
+    """
+
+    def __init__(self, args, env: Env, *, log_ready: bool = True):
+        from diff_vla_wbc.action_codec import ActionCodec
+        from diff_vla_wbc.g1_tasks import TaskObservationBuilder, TaskFrameIndex
+        try:
+            from diff_vla_wbc.g1_tasks import load_gr00t_processor
+        except ImportError:  # 老版本命名
+            from diff_vla_wbc.g1_tasks import load_processor as load_gr00t_processor  # type: ignore
+        from diff_vla_wbc.gr00t_vlm import Gr00tVLM
+
+        self.device = env.device
+        self.files = sorted(_abs(args.motion).glob("*.npz"))
+        self.ckpt = _abs(args.vlm_ckpt)
+        self.vlm_path = _abs(args.vlm_path)
+        self.fm_steps = int(getattr(args, "fm_steps", 4) or 4)
+        self.vla_batch = max(1, int(getattr(args, "vla_batch", 32) or 32))
+        t0 = time.time()
+        self.processor = load_gr00t_processor(self.ckpt)
+        self.codec = ActionCodec(self.processor, device=self.device)
+        self.vlm = Gr00tVLM.from_pretrained(
+            self.vlm_path, checkpoint=self.ckpt, device=self.device,
+            action_horizon=40, max_state_dim=132, freeze_vlm=True,
+            attn_implementation="sdpa")
+        self.vlm.action_head.eval()
+        # ★ 只冻 **backbone** 不等于冻 VLA：action head（1.09B）是新建的、默认可训。
+        #   bptt1 踩过这个坑（`train_joint_v2.py` 的 `--freeze-vla` 注释逐字记录）：
+        #   不冻 head 会让 4 步 FM 采样**保留 1.09B 参数的计算图**，B=256 直接 OOM。
+        #   这里显式冻结全部参数（推理数值不变，只是不再建图）。
+        n_frozen = 0
+        for _p in self.vlm.parameters():
+            if _p.requires_grad:
+                _p.requires_grad_(False)
+                n_frozen += int(_p.numel())
+        self.builder = TaskObservationBuilder(TaskFrameIndex(self.files))
+        if log_ready:
+            log(f"VLA 就绪 {time.time()-t0:.1f}s（fm_steps={self.fm_steps}, "
+                f"vla_batch={self.vla_batch}, 冻结参数 {n_frozen:,}）")
+
+    @property
+    def token_horizon(self) -> int:
+        return int(self.vlm.action_head.action_horizon)
+
+    def _ckpt_fingerprint(self) -> str:
+        """VLA checkpoint 指纹：config + shard index + 每个权重 shard 的文件名/大小/前 16 MB。
+
+        **不**整文件哈希（34 GB，含 optimizer 的 global_step 目录）；只要唯一标识即可。
+        """
+        import hashlib  # noqa: PLC0415
+        parts: list[str] = []
+        for name in ("config.json", "model.safetensors.index.json", "latest"):
+            q = self.ckpt / name
+            if q.exists():
+                parts.append(f"{name}:{sha256_file(q)}")
+        for shard in sorted(self.ckpt.glob("model-*.safetensors")):
+            parts.append(f"{shard.name}:{shard.stat().st_size}:{sha256_file(shard, 1 << 24)}")
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
+
+    @property
+    def meta(self) -> dict:
+        return dict(vlm_ckpt=str(self.ckpt), vlm_path=str(self.vlm_path),
+                    vlm_ckpt_sha256=self._ckpt_fingerprint(),
+                    action_horizon=self.token_horizon, fm_steps=self.fm_steps,
+                    vla_batch=self.vla_batch)
+
+    def sample(self, frames: torch.Tensor, *, seed: int, fm_steps: int | None = None
+               ) -> torch.Tensor:
+        """``frames (B,)`` → ``tokens (B,40,64)``（**device 上、float32**，未加 Δ）。
+
+        每个 chunk 用 ``seed + chunk_index`` 派生独立噪声（同一批内不同 chunk 不复用噪声；
+        同 ``seed`` 可复现）。
+        """
+        from diff_vla_wbc.fm_bc import sample_once_with_grad
+        from diff_vla_wbc.g1_tasks import processed_batch
+
+        fr_all = torch.as_tensor(frames).detach().cpu().long()
+        n = int(fr_all.numel())
+        if n == 0:
+            return torch.zeros(0, self.token_horizon, TOKEN_DIM, device=self.device)
+        steps = int(self.fm_steps if fm_steps is None else fm_steps)
+        outs = []
+        head = self.vlm.action_head
+        for s in range(0, n, self.vla_batch):
+            fr = fr_all[s:s + self.vla_batch]          # CPU 帧号：builder 按 npz 索引读图
+            batch = processed_batch(self.processor, self.builder, fr)
+            bb_in, act_in = self.vlm.prepare_input(dict(batch))
+            with torch.no_grad():
+                bb_out = self.vlm.backbone(bb_in)
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(seed) + s // self.vla_batch)
+            noise = torch.randn(int(act_in["state"].shape[0]), int(head.action_horizon),
+                                int(head.action_dim), device=self.device, dtype=head.dtype,
+                                generator=gen)
+            # `sample_once_with_grad` 在 no_grad 下会主动 raise；VLA 全冻 ⇒ 天然不建图
+            with torch.enable_grad():
+                x_norm = sample_once_with_grad(head, bb_out, act_in, initial_noise=noise,
+                                               num_steps=steps)
+            outs.append(self.codec.decode(x_norm.detach())[..., :TOKEN_DIM].float())
+        return torch.cat(outs, 0)
+
+
 def _cache_vla_tokens(args, env: Env, frames: torch.Tensor, out_dir: Path) -> None:
     """跑官方 VLA（checkpoint-8000）在**同一批帧**上采 token chunk 并落盘。
 
     为什么必须缓存：VLA 冻结**不代表输出固定**（flow matching 有随机初噪）。
     训练里每一步都会重采，实验要复现就必须把**实际采到的那一段**存下来。
+    （v5 主训练改成 on-the-fly 现场采样；这里的缓存只服务**固定评测集**，规范 §3.3/§8 M2。）
     """
-    from diff_vla_wbc.action_codec import ActionCodec
-    from diff_vla_wbc.fm_bc import sample_once_with_grad
-    from diff_vla_wbc.g1_tasks import TaskObservationBuilder, processed_batch
-    try:
-        from diff_vla_wbc.g1_tasks import load_gr00t_processor
-    except ImportError:  # 老版本命名
-        from diff_vla_wbc.g1_tasks import load_processor as load_gr00t_processor  # type: ignore
-    from diff_vla_wbc.gr00t_vlm import Gr00tVLM
-
-    dev = env.device
-    files = sorted(_abs(args.motion).glob("*.npz"))
-    ckpt = _abs(args.vlm_ckpt)
     t0 = time.time()
-    processor = load_gr00t_processor(ckpt)
-    codec = ActionCodec(processor, device=dev)
-    vlm = Gr00tVLM.from_pretrained(_abs(args.vlm_path), checkpoint=ckpt, device=dev,
-                                   action_horizon=40, max_state_dim=132, freeze_vlm=True,
-                                   attn_implementation="sdpa")
-    vlm.action_head.eval()
-    builder = TaskObservationBuilder(files) if not hasattr(args, "bucket_mode") else None
-    from diff_vla_wbc.g1_tasks import TaskFrameIndex
-    builder = TaskObservationBuilder(TaskFrameIndex(files))
-    log(f"VLA 就绪 {time.time()-t0:.1f}s")
-    outs, outs2 = [], []
-    for s in range(0, int(frames.numel()), int(args.vla_batch)):
-        fr = frames[s:s + int(args.vla_batch)]
-        batch = processed_batch(processor, builder, fr)
-        bb_in, act_in = vlm.prepare_input(dict(batch))
-        with torch.no_grad():
-            bb_out = vlm.backbone(bb_in)
-        head = vlm.action_head
-        for rep, sink in ((0, outs), (1, outs2)):
-            gen = torch.Generator(device=dev)
-            gen.manual_seed(int(args.seed) * 1000 + rep)
-            noise = torch.randn(int(act_in["state"].shape[0]), int(head.action_horizon),
-                                int(head.action_dim), device=dev, dtype=head.dtype, generator=gen)
-            with torch.enable_grad():
-                x_norm = sample_once_with_grad(head, bb_out, act_in, initial_noise=noise,
-                                               num_steps=int(args.fm_steps))
-            sink.append(codec.decode(x_norm.detach())[..., :TOKEN_DIM].float().cpu())
-        log(f"  [vla] {s + fr.numel()}/{int(frames.numel())} ({time.time()-t0:.1f}s)")
-    tok = torch.cat(outs, 0)
-    tok2 = torch.cat(outs2, 0)
-    torch.save({"tokens_vla": tok, "tokens_vla_rep2": tok2,
-                "vlm_ckpt": str(ckpt), "fm_steps": int(args.fm_steps)},
+    sampler = FrozenVLASampler(args, env)
+    tok = sampler.sample(frames, seed=int(args.seed) * 1000 + 0).detach().cpu()
+    tok2 = sampler.sample(frames, seed=int(args.seed) * 1000 + 1).detach().cpu()
+    manifest = dict(sampler.meta, tokens_sha256=tensor_hash(tok), tokens_rep2_sha256=tensor_hash(tok2),
+                    n=int(tok.shape[0]), T=int(tok.shape[1]), token_dim=int(tok.shape[2]),
+                    seed=int(args.seed), created=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    data_mode="cached_pool")
+    torch.save({"tokens_vla": tok, "tokens_vla_rep2": tok2, "manifest": manifest},
                out_dir / "vla_tokens.pt")
-    log(f"vla_tokens.pt 写入：{tuple(tok.shape)}；两次采样 |Δ|={float((tok-tok2).abs().mean()):.5f}")
+    (out_dir / "vla_token_manifest.json").write_text(json.dumps(manifest, indent=1))
+    log(f"vla_tokens.pt 写入：{tuple(tok.shape)}；两次采样 |Δ|="
+        f"{float((tok-tok2).abs().mean()):.5f}（{time.time()-t0:.0f}s）")
 
 
 # --------------------------------------------------------------------------- 目标函数
@@ -438,6 +571,7 @@ class WindowSet:
     state64: torch.Tensor         # (N,64) 部署 state64
     token0: torch.Tensor          # (N,64) = tokens[:,0]
     clip_id: torch.Tensor = None  # (N,) 所属 clip（分组 CV / 聚类用）
+    hist64: torch.Tensor = None   # (N,10,64) 过去 10 帧的 **state64**（HA 序），部署口径
     tag: str = ""
 
     def __len__(self) -> int:
@@ -451,7 +585,7 @@ class WindowSet:
         return dataclasses.replace(self, **{
             k: getattr(self, k)[sel] for k in
             ("frames", "state", "history", "xi", "prev_action", "refs_f",
-             "ref0_state", "tokens", "state64", "token0", "clip_id")
+             "ref0_state", "tokens", "state64", "token0", "clip_id", "hist64")
         })
 
     def to(self, dev: torch.device, H: int, *, tokens: torch.Tensor | None = None,
@@ -465,6 +599,7 @@ class WindowSet:
             tokens=(self.tokens if tokens is None else tokens).to(dev, non_blocking=True),
             state64=(self.state64 if state64 is None else state64).to(dev, non_blocking=True),
             token0=(self.token0 if token0 is None else token0).to(dev, non_blocking=True),
+            hist64=(None if self.hist64 is None else self.hist64.to(dev, non_blocking=True)),
         )
 
 
@@ -551,7 +686,8 @@ class DeltaParam(torch.nn.Module):
 
     def __init__(self, kind: str, n: int, *, hidden: int = 1024, depth: int = 2,
                  init_std: float = 4e-4, cap: float = 0.0, seed: int = 0,
-                 state_dim: int = 64, token_dim: int = TOKEN_DIM):
+                 state_dim: int = 64, token_dim: int = TOKEN_DIM,
+                 chunk_len: int = 40, ctx_dim: int = 128, hist_frames: int = 10):
         super().__init__()
         self.kind = kind
         self.cap = float(cap)
@@ -563,10 +699,27 @@ class DeltaParam(torch.nn.Module):
             with torch.no_grad():
                 nn_.normal_(0.0, init_std, generator=g)
             self.const = nn_
-        elif kind == "mlp":
+        elif kind in ("mlp", "mlp_frame", "mlp_frame_ctx", "mlp_frame_flat",
+                      "mlp_frame_hist"):
             from diff_vla_wbc.delta_token import DeltaTokenNet
 
-            net = DeltaTokenNet(token_dim=token_dim, feat_dim=state_dim,
+            # ★ per-frame 变体：把**整段 chunk**塞进输入（两种方式）
+            #   mlp_frame_ctx  : z = g(chunk) 128 维全局摘要 → Δ_t = f(token_t, z, state64)
+            #   mlp_frame_flat : Δ_t = f(token_t, flatten(chunk), state64)（极宽，样本饥渴）
+            _fd = state_dim
+            self.ctx = None
+            if kind == "mlp_frame_ctx":
+                self.ctx = torch.nn.Sequential(
+                    torch.nn.Linear(token_dim * int(chunk_len), 256), torch.nn.SiLU(),
+                    torch.nn.Linear(256, int(ctx_dim)))
+                _fd = state_dim + int(ctx_dim)
+            elif kind == "mlp_frame_flat":
+                _fd = state_dim + token_dim * int(chunk_len)
+            elif kind == "mlp_frame_hist":
+                # ★ 部署可取：客户端本来就逐帧握着 robot，可上传最近 10 帧的 q(29)+qd(29)。
+                #   训练侧用的是同一份 `history`（WBC obs 历史，term 序 [q|qd|ang_vel|gravity|a_prev]）。
+                _fd = (state_dim + token_dim * int(chunk_len) + int(hist_frames) * 64)
+            net = DeltaTokenNet(token_dim=token_dim, feat_dim=_fd,
                                 hidden=hidden, depth=depth, init_std=init_std)
             with torch.no_grad():
                 # 与生产一致的初始化，但**显式播种**（可复现）
@@ -577,6 +730,13 @@ class DeltaParam(torch.nn.Module):
                         lm.weight.copy_(w * (math.sqrt(2.0 / fan_in)))
                         if lm.bias is not None:
                             lm.bias.zero_()
+                if self.ctx is not None:
+                    for lm in self.ctx:
+                        if isinstance(lm, torch.nn.Linear):
+                            w = torch.empty_like(lm.weight).normal_(0.0, 1.0, generator=g)
+                            lm.weight.copy_(w * (math.sqrt(2.0 / lm.weight.shape[1])))
+                            if lm.bias is not None:
+                                lm.bias.zero_()
                 last = [m for m in net.net if isinstance(m, torch.nn.Linear)][-1]
                 last.weight.copy_(torch.empty_like(last.weight).normal_(0.0, init_std, generator=g))
                 log(f"[mlp] params={sum(p.numel() for p in net.parameters()):,} "
@@ -592,13 +752,14 @@ class DeltaParam(torch.nn.Module):
         else:
             raise ValueError(kind)
 
-    def raw(self, token0: torch.Tensor, state64: torch.Tensor) -> torch.Tensor:
+    def raw(self, token0: torch.Tensor, state64: torch.Tensor,
+            hist: torch.Tensor | None = None) -> torch.Tensor:
         if self.kind == "base":
             return torch.zeros(token0.shape[0], token0.shape[-1],
                                device=token0.device, dtype=token0.dtype)
         if self.kind == "constant":
             return self.const.expand(token0.shape[0], -1)
-        if self.kind == "mlp":
+        if self.kind in ("mlp", "mlp_frame"):
             return self.net(token0, state64)
         if self.kind == "oracle":
             if token0.shape[0] != self.per_window.shape[0]:
@@ -606,8 +767,52 @@ class DeltaParam(torch.nn.Module):
             return self.per_window
         raise ValueError(self.kind)
 
-    def forward(self, token0: torch.Tensor, state64: torch.Tensor) -> torch.Tensor:
-        return apply_cap(self.raw(token0, state64), self.cap)
+    def forward(self, token0: torch.Tensor, state64: torch.Tensor,
+                hist: torch.Tensor | None = None) -> torch.Tensor:
+        return apply_cap(self.raw(token0, state64, hist), self.cap)
+
+    @staticmethod
+    def _hist_feat(hist: torch.Tensor | None, B: int, T: int, device) -> torch.Tensor:
+        """``hist64 (B,10,64)`` → ``(B, 640)``。
+
+        **必须是 state64 空间的历史**（HA_V31 序 + rotlocal6 + dof_pos + dof_vel），
+        因为客户端能发出去的就是"上一批 state64"。用 WBC 的 obs93 历史会造成
+        "训练用 STANDARD 序、推理用 HA 序"的静默置换错误。
+        """
+        if hist is None:
+            raise ValueError("mlp_frame_hist 需要 hist64（batch 里没有）")
+        h = hist.to(device).float()
+        if h.shape[-1] != 64:
+            raise ValueError(f"hist64 最后一维应为 64，得到 {tuple(h.shape)}")
+        return h.reshape(B, -1)
+
+    def full(self, tokens: torch.Tensor, state64: torch.Tensor,
+             hist: torch.Tensor | None = None) -> torch.Tensor:
+        """``(B,T,64)`` 的完整 Δ。
+
+        * 共享语义（base/constant/mlp/oracle）：同一个 Δ 广播到整段（= 部署现状）；
+        * ``mlp_frame``：**每帧一个 Δ_t**，``Δ_t = f(token_t, state64)``
+          （token_t 就是"未来第 t 帧的命令"，即用上了整段未来 chunk）。
+        """
+        if self.kind in ("mlp_frame", "mlp_frame_ctx", "mlp_frame_flat",
+                         "mlp_frame_hist"):
+            B, T, _ = tokens.shape
+            x = tokens.reshape(B * T, -1)
+            if self.kind == "mlp_frame":
+                feat = state64[:, None, :].expand(B, T, -1)
+            elif self.kind == "mlp_frame_ctx":
+                z = self.ctx(tokens.reshape(B, -1))                       # (B, ctx)
+                feat = torch.cat([state64, z], -1)[:, None, :].expand(B, T, -1)
+            elif self.kind == "mlp_frame_hist":
+                flat = tokens.reshape(B, -1)
+                hf = self._hist_feat(hist, B, T, tokens.device)
+                feat = torch.cat([state64, flat, hf], -1)[:, None, :].expand(B, T, -1)
+            else:
+                flat = tokens.reshape(B, -1)
+                feat = torch.cat([state64, flat], -1)[:, None, :].expand(B, T, -1)
+            d = self.net(x, feat.reshape(B * T, -1))
+            return apply_cap(d, self.cap).reshape(B, T, -1)
+        return self.forward(tokens[:, 0], state64)[:, None, :].expand(-1, tokens.shape[1], -1)
 
     def trainable(self) -> list[torch.nn.Parameter]:
         return [p for p in self.parameters() if p.requires_grad]
@@ -637,11 +842,31 @@ def load_windows(env: Env, args, H: int, tokens_kind: str | None = None) -> Wind
         tokens = d["tokens_label"].float()
     s64 = state64_from(env.bundle, d["state"], d["frames"], "cpu",
                        use_full=bool(env.bptt_args.get("delta_token_fullstate", True)))
+    # ★ 部署口径的 10 帧历史：**在 state64 空间里按帧回溯**（HA_V31 序 + rotlocal6），
+    #   与客户端能发的"上一帧 state64"逐位同口径。
+    #   注意：**不能**用 WBC 的 obs93 历史（那里面 q 是 STANDARD 序、且 a_prev 是教师推导值）。
+    _hist64 = None
+    try:
+        _rs = env.recorded_states
+        _fr = d["frames"].long().to(_rs.device)
+        _lib = env.lib
+        _first = env.bundle.clip_start_of(_fr.to(env.device)).to("cpu").long()
+        rows = torch.clamp(_fr.cpu()[:, None] - torch.arange(9, -1, -1)[None, :],
+                           min=_first[:, None])
+        flat = _rs[rows.reshape(-1).cpu()].reshape(len(_fr), 10, -1).float()
+        _hist64 = state64_from(env.bundle, flat.reshape(-1, flat.shape[-1]).cpu(),
+                               rows.reshape(-1), "cpu",
+                               use_full=bool(env.bptt_args.get("delta_token_fullstate", True))
+                               ).reshape(len(_fr), 10, -1)
+        log(f"[hist] 10 帧 state64 历史构造完成 {tuple(_hist64.shape)}（HA 序，部署口径）")
+    except Exception as _e:  # noqa: BLE001
+        log(f"[warn] 10 帧 state64 历史构造失败：{_e}")
+    out_ws = None
     ws = WindowSet(
         frames=d["frames"], state=d["state"], history=d["history"], xi=d["xi"],
         prev_action=d["prev_action"], refs_f=d["refs_f"], ref0_state=d["ref0_state"],
         tokens=tokens, tokens_name=kind, state64=s64, token0=tokens[:, 0].clone(),
-        clip_id=d.get("clip_id"),
+        clip_id=d.get("clip_id"), hist64=_hist64,
     )
     ws.meta = d.get("meta", {})  # type: ignore[attr-defined]
     ws.tokens_label = d["tokens_label"]  # type: ignore[attr-defined]
@@ -672,11 +897,13 @@ def _eval_arm(env: Env, ws: WindowSet, arm: DeltaParam | None, H: int, dev,
     with torch.no_grad(), fixed_rng(seed):
         b = ws.to(dev, H)
         if arm is None:
+            delta_f = torch.zeros(len(ws), b["tokens"].shape[1], TOKEN_DIM, device=dev)
             delta = torch.zeros(len(ws), TOKEN_DIM, device=dev)
         else:
-            delta = arm(b["token0"], b["state64"])
+            delta_f = arm.full(b["tokens"], b["state64"], b.get("hist64"))
+            delta = delta_f.mean(1)
         batch = dict(b)
-        batch["tokens"] = b["tokens"] + delta[:, None, :]
+        batch["tokens"] = b["tokens"] + delta_f
         J, extra = window_returns(env.bundle, batch, H)
         # 动作变化 RMS：与 Δ=0 的同一起点动作比（判 deployability 的唯一硬指标）
         ro0 = imagine_with_tokens(env.bundle, tokens=b["tokens"], state=b["state"],
@@ -705,11 +932,16 @@ def run_arm(env: Env, ws_fit: WindowSet, ws_eval: dict[str, WindowSet], *,
             freeze_bias: bool = False, only_bias: bool = False,
             zero_state: bool = False,
             zero_token: bool = False, shuffle_state: bool = False,
-            shuffle_token: bool = False, extra_metrics: bool = True) -> dict:
+            shuffle_token: bool = False, extra_metrics: bool = True,
+            resample: bool = False, bs: int = 0, window_norm: bool = False,
+            window_norm_floor: float = 0.2, act_weight: float = 0.0,
+            act_eps: float = 0.30, act_hinge_cap: float = 2.0) -> dict:
     """训一个 arm 并返回收敛曲线 + 各 split 的逐窗口回报（`per_window`）。"""
     n = len(ws_fit)
     arm = DeltaParam(kind, n, hidden=hidden, depth=depth, init_std=init_std, cap=cap,
-                     seed=seed).to(dev)
+                     seed=seed, chunk_len=int(ws_fit.tokens.shape[1]),
+                     hist_frames=(10 if ws_fit.hist64 is None else int(ws_fit.hist64.shape[1])
+                                  )).to(dev)
     if zero_state or zero_token or shuffle_state or shuffle_token:
         _patch_inputs(arm, ws_fit, ws_eval, zero_state=zero_state, zero_token=zero_token,
                       shuffle_state=shuffle_state, shuffle_token=shuffle_token, seed=seed)
@@ -735,15 +967,61 @@ def run_arm(env: Env, ws_fit: WindowSet, ws_eval: dict[str, WindowSet], *,
         params = arm.trainable()
     opt = torch.optim.Adam(params, lr=float(lr))
     b = ws_fit.to(dev, H)
+    # ★ population 模式：**每步重新抽窗口**（老 BPTT/v13 就是这个口径：起点每步重采）。
+    #   固定窗口全批量 = 过拟合实验；重采 = 对"总体目标"做 SGD。两者必须分开报。
+    _bs = int(bs) if int(bs or 0) > 0 else n
+    _resample = bool(resample) and _bs < n
+    _gen = torch.Generator(device="cpu").manual_seed(int(seed) + 31337)
+    # ★ 老 BPTT 口径的两个附加项（与 `v3_step.train_step` 同语义）：
+    #   window_norm：每窗口按**自身回报绝对值**归一化（floor=0.2×median），削弱大回报窗口主导；
+    #   act hinge  ：relu(动作RMS/eps − 1)²，中心 = **底模 token（Δ=0）在同一状态/参考下的动作**
+    #                （`trust_center=base` 的口径）。Δ=0 的动作序列与步数无关 ⇒ 只算一次，不额外变慢。
+    act_ref = None
+    if act_weight > 0:
+        from diff_vla_wbc.isaac_joint import FrameRef as _FR
+        from diff_vla_wbc.rollout import imagine_with_tokens as _iwt
+
+        with torch.no_grad():
+            _ro0 = _iwt(env.bundle, tokens=b["tokens"], state=b["state"], obs_hist=None,
+                        history=b["history"], xi=b["xi"],
+                        references=[_FR(b["refs_f"][:, t]) for t in range(H)],
+                        prev_action=b["prev_action"], horizon=H, obs_noise=0.0)
+            act_ref = _ro0.actions.detach().float()
     hist: list[dict] = []
     t0 = time.time()
     base_eval = None
     for step in range(1, int(steps) + 1):
-        delta = arm(b["token0"], b["state64"])
-        batch = dict(b)
-        batch["tokens"] = b["tokens"] + delta[:, None, :]
-        J, extra = window_returns(env.bundle, batch, H)
-        loss = -J.mean() + float(lam) * delta.pow(2).sum(-1).mean()
+        _idx = None
+        if _resample:
+            idx = torch.randint(0, n, (_bs,), generator=_gen)
+            bstep = {k: (v[idx] if torch.is_tensor(v) and v.shape[:1] == (n,) else v)
+                     for k, v in b.items()}
+            _idx = idx
+        else:
+            bstep = b
+        delta_f = arm.full(bstep["tokens"], bstep["state64"], bstep.get("hist64"))
+        delta = delta_f.reshape(-1, delta_f.shape[-1])
+        batch = dict(bstep)
+        batch["tokens"] = bstep["tokens"] + delta_f
+        J, extra = window_returns(env.bundle, batch, H, want_actions=(act_ref is not None))
+        if window_norm:
+            _a = J.detach().abs()
+            _fl = float(window_norm_floor) * float(_a.median())
+            _den = _a.clamp_min(max(_fl, 1e-6))
+            loss_r = -(J / _den).mean()
+        else:
+            loss_r = -J.mean()
+        loss = loss_r + float(lam) * delta.pow(2).sum(-1).mean()
+        act_pen = 0.0
+        if act_ref is not None:
+            _ar = act_ref if _idx is None else act_ref[:, _idx]
+            _da = extra["rollout"].actions.float() - _ar
+            _rms = (_da.pow(2).mean(-1) + 1e-12).sqrt()          # (H,B)
+            _exc = torch.relu(_rms / float(act_eps) - 1.0)
+            _q = torch.clamp(_exc, max=float(act_hinge_cap))
+            _pen = _q.pow(2) + 2.0 * float(act_hinge_cap) * (_exc - _q)
+            act_pen = float(act_weight) * _pen.mean()
+            loss = loss + act_pen
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = float(torch.nn.utils.clip_grad_norm_(
@@ -753,7 +1031,7 @@ def run_arm(env: Env, ws_fit: WindowSet, ws_eval: dict[str, WindowSet], *,
             with torch.no_grad():
                 hist.append(dict(step=step, J=float(J.mean()), J_std=float(J.std()),
                                  loss=float(loss), delta_norm=float(delta.norm(dim=-1).mean()),
-                                 grad_norm=gnorm, act_rms=0.0,
+                                 grad_norm=gnorm, act_rms=0.0, act_pen=float(act_pen),
                                  survival=float(extra["survival"].mean()),
                                  secs=time.time() - t0))
     # ---- 评测 ----
@@ -766,16 +1044,20 @@ def run_arm(env: Env, ws_fit: WindowSet, ws_eval: dict[str, WindowSet], *,
     # Δ 与输入的关系（诊断：是否真的按状态变）
     with torch.no_grad():
         bf = ws_fit.to(dev, H)
-        d_fit = arm(bf["token0"], bf["state64"])
+        d_fit = arm.full(bf["tokens"], bf["state64"], bf.get("hist64")).mean(1)
         _perm = torch.randperm(n, device=dev)
-        d_perm = arm(bf["token0"], bf["state64"][_perm])
+        d_perm = arm.full(bf["tokens"], bf["state64"][_perm], bf.get("hist64")).mean(1)
         state_sens = float((d_fit - d_perm).norm(dim=-1).mean()
                            / d_fit.norm(dim=-1).mean().clamp_min(1e-9))
-        d_tok_perm = arm(bf["token0"][_perm], bf["state64"])
+        d_tok_perm = arm.full(bf["tokens"][_perm], bf["state64"], bf.get("hist64")).mean(1)
         token_sens = float((d_fit - d_tok_perm).norm(dim=-1).mean()
                            / d_fit.norm(dim=-1).mean().clamp_min(1e-9))
     out = dict(kind=kind, lr=float(lr), steps=int(steps), seed=int(seed), cap=float(cap),
                lam=float(lam), n_fit=n, hist=hist, per_window=per_window,
+               resample=_resample, bs=(_bs if _resample else n),
+               window_norm=bool(window_norm), act_weight=float(act_weight),
+               act_eps=float(act_eps),
+               draws=int(steps) * (_bs if _resample else n),
                state_sens=state_sens, token_sens=token_sens,
                delta_mean=per_window.get("fit", {}).get("delta", torch.zeros(1))[:n].mean(0),
                n_params=sum(p.numel() for p in arm.parameters()),
@@ -1026,7 +1308,10 @@ def cmd_arms(env: Env, args) -> list[dict]:
                 continue
             seeds = [int(args.seed)] if arm_kind == "base" else args.seeds
             for sd in seeds:
-                for lr in (args.lrs if arm_kind in ("constant", "mlp") else [0.0]):
+                for lr in (args.lrs if arm_kind in ("constant", "mlp", "mlp_frame",
+                                                   "mlp_frame_ctx", "mlp_frame_flat",
+                                                   "mlp_frame_hist")
+                           else [0.0]):
                     t0 = time.time()
                     r = run_arm(env, fit, eval_sets, kind=arm_kind, H=H, cap=float(args.cap),
                                 lam=float(args.lam), lr=float(lr), steps=int(args.steps),
@@ -1035,6 +1320,11 @@ def cmd_arms(env: Env, args) -> list[dict]:
                                 init_std=float(args.init_std),
                                 freeze_bias=bool(args.freeze_bias),
                                 only_bias=bool(getattr(args, "only_bias", False)),
+                                resample=bool(getattr(args, "resample", False)),
+                                bs=int(getattr(args, "bs", 0) or 0),
+                                window_norm=bool(getattr(args, "window_norm", False)),
+                                act_weight=float(getattr(args, "act_weight", 0.0) or 0.0),
+                                act_eps=float(getattr(args, "act_eps", 0.30) or 0.30),
                                 zero_state=("zero_state" in ablate),
                                 zero_token=("zero_token" in ablate),
                                 shuffle_state=("shuffle_state" in ablate),
@@ -1044,6 +1334,10 @@ def cmd_arms(env: Env, args) -> list[dict]:
                         steps=int(args.steps), cap=float(args.cap), lam=float(args.lam),
                         tokens=ws.tokens_name, tag=args.tag,
                         ablate="+".join(ablate) or "none",
+                        resample=bool(r.get("resample", False)),
+                        draws=int(r.get("draws", 0)),
+                        window_norm=bool(r.get("window_norm", False)),
+                        act_weight=float(r.get("act_weight", 0.0)),
                         n_params=r["n_params"], secs=round(time.time() - t0, 1),
                         state_sens=r["state_sens"], token_sens=r["token_sens"],
                         delta_norm=r["per_window"]["fit"]["delta_norm"],
@@ -1115,7 +1409,7 @@ def per_window_grad(env: Env, ws: WindowSet, H: int, dev, *, cap: float = 0.0) -
 
 def _grouped_cv_predict(X: np.ndarray, Y: np.ndarray, groups: np.ndarray,
                         ridge: float = 1e-2, folds: int = 5,
-                        mlp: bool = False, seed: int = 0) -> dict:
+                        mlp: bool = False, seed: int = 0, steps: int = 600) -> dict:
     """按 **clip 分组** 的 K 折：用 X 预测 Y，返回 held-out 的 R² / 余弦 / 逐元素相关。"""
     X = np.asarray(X, np.float64)
     Y = np.asarray(Y, np.float64)
@@ -1137,7 +1431,7 @@ def _grouped_cv_predict(X: np.ndarray, Y: np.ndarray, groups: np.ndarray,
         Xtr = np.concatenate([(X[tr] - mu) / sd, np.ones((tr.sum(), 1))], 1)
         Xte = np.concatenate([(X[te] - mu) / sd, np.ones((te.sum(), 1))], 1)
         if mlp:
-            pred[te] = _fit_torch_mlp(Xtr, Y[tr], Xte, seed=seed + f)
+            pred[te] = _fit_torch_mlp(Xtr, Y[tr], Xte, seed=seed + f, steps=int(steps))
         else:
             W = np.linalg.solve(Xtr.T @ Xtr + ridge * np.eye(Xtr.shape[1]), Xtr.T @ Y[tr])
             pred[te] = Xte @ W
@@ -1156,6 +1450,9 @@ def _grouped_cv_predict(X: np.ndarray, Y: np.ndarray, groups: np.ndarray,
 
 def _fit_torch_mlp(Xtr, Ytr, Xte, *, seed: int = 0, hidden: int = 256, steps: int = 600,
                    lr: float = 3e-3) -> np.ndarray:
+    # ★ 小矩阵的逐 op 开销在 128 线程下会比单线程慢几十倍（libgomp 调度 > 计算本身）。
+    #   这里显式限线程；不影响数值，只影响速度。
+    # 线程数用环境变量控制（运行中调用 set_num_threads 在某些 UCX 环境下会段错误）
     torch.manual_seed(int(seed))
     X = torch.tensor(Xtr, dtype=torch.float32)
     Y = torch.tensor(Ytr, dtype=torch.float32)
@@ -1216,7 +1513,9 @@ def cmd_gradstruct(env: Env, args) -> list[dict]:
         ("token+state", Xboth, Y), ("token+state→res", Xboth, Y - Y.mean(0)),
     ]:
         for kind in ("ridge", "mlp"):
-            m = _grouped_cv_predict(X, y, groups, mlp=(kind == "mlp"), seed=int(args.seed))
+            m = _grouped_cv_predict(X, y, groups, mlp=(kind == "mlp"), seed=int(args.seed),
+                                    folds=int(getattr(args, "cv_folds", 5)),
+                                    steps=int(getattr(args, "cv_steps", 600)))
             pred_rows.append(dict(features=name, model=kind, target=("res" if "res" in name else "g"),
                                   **m))
             log(f"[grad][cv] {name:16s} {kind:5s} R²={m['r2']:+.3f} cos={m['cos_mean']:+.3f} "
@@ -1265,6 +1564,107 @@ def _pairwise_cos(g: torch.Tensor, max_pairs: int = 20000) -> dict:
     return dict(mean=float(c.mean()), median=float(c.median()),
                 p10=float(c.quantile(0.1)), p90=float(c.quantile(0.9)),
                 frac_neg=float((c < 0).float().mean()))
+
+
+# =========================================================================== 实验 4b
+def _per_frame_grad(env: Env, ws: WindowSet, H: int, dev) -> torch.Tensor:
+    """``g[i,t] = ∂J_i/∂token[i,t]``（**逐帧**，不广播）→ (N,T,64)。
+
+    与 `per_window_grad` 的关系：把 Δ 广播到整段时，梯度 = ``Σ_t g[i,t]``。
+    所以"共享 Δ"能表达的只有 t 方向的和，t 方向的变化被结构性地扔掉了。
+    """
+    b = ws.to(dev, H)
+    T = int(b["tokens"].shape[1])
+    delta = torch.zeros(len(ws), T, TOKEN_DIM, device=dev, requires_grad=True)
+    batch = dict(b)
+    batch["tokens"] = b["tokens"] + delta
+    J, _ = window_returns(env.bundle, batch, H)
+    return torch.autograd.grad(J.sum(), delta)[0].detach()
+
+
+def _var_share(g: torch.Tensor) -> dict:
+    """把 g[i,t] 拆成 μ + a[t] + b[i] + c[i,t]，报各层的平方和占比。
+
+    * μ     —— 全局常数方向（常向量能表达的全部）
+    * a[t]  —— **系统性帧剖面**（部署时 t 已知！per-frame Δ 白捡的部分）
+    * b[i]  —— 窗口特有常数（只有逐窗口 Oracle 能表达）
+    * c[i,t]—— 窗口×帧 交互（需要"未来 token + 状态"这种条件化才可能表达）
+    """
+    N, T, D = g.shape
+    mu = g.reshape(-1, D).mean(0)
+    gt = g - mu
+    a = gt.mean(0)[None, :, :].expand(N, T, D)          # (N,T,D)
+    gt2 = gt - a
+    b = gt2.mean(1, keepdim=True).expand(N, T, D)
+    c = gt2 - b
+    tot = float(g.pow(2).sum())
+    return dict(total_sq=tot,
+                mu_share=float((mu.pow(2) * N * T).sum() / tot),
+                t_profile_share=float(a.pow(2).sum() / tot),
+                window_share=float(b.pow(2).sum() / tot),
+                interaction_share=float(c.pow(2).sum() / tot),
+                mu_norm=float(mu.norm()),
+                t_profile_norm=float(gt.mean(0).norm()),
+                window_norm=float(gt2.mean(1).norm(dim=-1).mean()),
+                interaction_rms=float(c.pow(2).mean().sqrt()),
+                shared_grad_norm=float(g.sum(1).norm(dim=-1).mean()),
+                perframe_grad_norm=float(g.norm(dim=-1).mean()))
+
+
+def cmd_gradframe(env: Env, args) -> dict:
+    """问答：**把未来整段 token chunk 当输入 / 每帧单独 Δ，能不能救回可学性？**
+
+    三问：
+      (1) 理想修正里，有多少是"t 剖面"（t 已知 ⇒ per-frame Δ 白捡）、
+          有多少是"窗口×帧"交互（只有条件化输入才可能拿到）；
+      (2) 用**整段 chunk（20×64）+ state64** 预测共享梯度，cos 能不能从 0.31 抬起来；
+      (3) 换成"每帧单独 Δ"，Oracle 的头寸变成多少（结构性上限）。
+    """
+    dev, H = env.device, int(args.horizon)
+    ws = load_windows(env, args, H)
+    sp = split_sets(ws)
+    wtr = sp["train"].index(slice(0, min(len(sp["train"]), int(args.n_grad))))
+    out: dict = {"n": len(wtr), "H": H, "T_used": min(H, int(wtr.tokens.shape[1]))}
+    g = _per_frame_grad(env, wtr, H, dev)
+    share = _var_share(g)
+    out["var_share"] = share
+    log(f"[frame] n={len(wtr)} ‖g[i,t]‖={share['perframe_grad_norm']:.4e} "
+        f"‖Σ_t g‖={share['shared_grad_norm']:.4e}")
+    log(f"[frame] 平方和占比: μ={share['mu_share']:.3f} t剖面={share['t_profile_share']:.3f} "
+        f"窗口={share['window_share']:.3f} 交互={share['interaction_share']:.3f}")
+
+    # ---- (2) 特征对比：token0 vs 整段 chunk ----
+    gs = g.sum(1).cpu().numpy()                       # 共享 Δ 的梯度（= 现在的目标）
+    st = wtr.state64.numpy()
+    tok0 = wtr.token0.numpy()
+    Tu = int(out["T_used"])
+    chunk = wtr.tokens[:, :Tu].reshape(len(wtr), -1).numpy()      # (N, Tu*64)
+    chunk_mean = wtr.tokens[:, :Tu].mean(1).numpy()
+    groups = wtr.clip_id.numpy()
+    feats = {
+        "token0+state64(现状)": np.concatenate([tok0, st], 1),
+        "chunk_mean+state64": np.concatenate([chunk_mean, st], 1),
+        f"chunk{Tu}x64+state64": np.concatenate([chunk, st], 1),
+        # 对照：只用 chunk 的**前 5 帧**（= 更少的未来）看"未来长度"是否有边际收益
+        "chunk[:5]x64+state64": np.concatenate(
+            [wtr.tokens[:, :min(5, Tu)].reshape(len(wtr), -1).numpy(), st], 1),
+    }
+    cv_rows = []
+    for name, X in feats.items():
+        for kind in ("ridge", "mlp"):
+            m = _grouped_cv_predict(X, gs, groups, mlp=(kind == "mlp"), seed=int(args.seed),
+                                    folds=int(getattr(args, "cv_folds", 3)),
+                                    steps=int(getattr(args, "cv_steps", 400)))
+            cv_rows.append(dict(features=name, model=kind, target="shared_grad(Σ_t g)", **m))
+            log(f"[frame][cv] {name:26s} {kind:5s} R²={m['r2']:+.3f} cos={m['cos_mean']:+.3f}")
+    out["cv"] = cv_rows
+    np.savez(str(Path(args.out) / f"perframe_grad_{args.tag or 'main'}.npz"),
+             g=g.cpu().numpy(), frames=wtr.frames.numpy(), clip_id=groups)
+    (Path(args.out) / f"gradframe_{args.tag or 'main'}.json").write_text(
+        json.dumps(out, indent=1, default=float))
+    _tag = args.tag or "main"
+    log(f"[frame] -> {Path(args.out) / f'gradframe_{_tag}.json'}")
+    return out
 
 
 # =========================================================================== 实验 5：视界
@@ -1453,6 +1853,10 @@ def build_cli() -> argparse.ArgumentParser:
     b.add_argument("--vla-batch", type=int, default=16)
     b.add_argument("--fm-steps", type=int, default=4)
     b.add_argument("--skip-vla", action="store_true")
+    b.add_argument("--uniform-frames", type=int, default=0,
+                   help="1=在 split 的**合格帧上均匀**抽窗（规范 §3.2；评测集用这个口径）")
+    b.add_argument("--h-tail", type=int, default=0,
+                   help="尾部预留步数（β>0 / S1 才用；默认 0 ⇒ f+H≤clip_end）")
 
     e0 = sub.add_parser("exp0", help="梯度路径审计 + 有限差分")
     _common(e0)
@@ -1479,14 +1883,31 @@ def build_cli() -> argparse.ArgumentParser:
     ar.add_argument("--freeze-bias", action="store_true")
     ar.add_argument("--only-bias", action="store_true",
                     help="只训输出层 bias（常量捷径的严格版本）")
+    ar.add_argument("--window-norm", action="store_true",
+                    help="每窗口按自身 |ret| 归一化（= bptt1 的 WINDOW_NORM=1）")
+    ar.add_argument("--act-weight", type=float, default=0.0,
+                    help="动作空间 trust hinge 权重（= bptt1 的 ACT_WEIGHT）")
+    ar.add_argument("--act-eps", type=float, default=0.30)
+    ar.add_argument("--resample", action="store_true",
+                    help="每步重抽窗口（= population SGD，老 BPTT 口径）")
+    ar.add_argument("--bs", type=int, default=0, help="重采时的 minibatch 大小（0=全批量）")
     ar.add_argument("--ablate", nargs="*", default=[],
                     choices=["shuffle_state", "shuffle_token", "zero_state", "zero_token"])
     ar.add_argument("--vla-tokens", type=Path, default=None)
 
     gs = sub.add_parser("gradstruct", help="实验 4：逐窗口梯度结构 + 可预测性")
     _common(gs)
-    gs.add_argument("--n-grad", type=int, default=256)
+    gs.add_argument("--n-grad", type=int, default=3072)
+    gs.add_argument("--cv-folds", type=int, default=5)
+    gs.add_argument("--cv-steps", type=int, default=600)
     gs.add_argument("--vla-tokens", type=Path, default=None)
+
+    gf = sub.add_parser("gradframe", help="实验 4b：整段 chunk 输入 / 每帧 Δ 的可学性")
+    _common(gf)
+    gf.add_argument("--n-grad", type=int, default=3072)
+    gf.add_argument("--cv-folds", type=int, default=3)
+    gf.add_argument("--cv-steps", type=int, default=400)
+    gf.add_argument("--vla-tokens", type=Path, default=None)
 
     hz = sub.add_parser("horizon", help="实验 5：H=2/5/20")
     _common(hz)
@@ -1526,6 +1947,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd_arms(env, a)
     elif a.cmd == "gradstruct":
         cmd_gradstruct(env, a)
+    elif a.cmd == "gradframe":
+        cmd_gradframe(env, a)
     elif a.cmd == "horizon":
         cmd_horizon(env, a)
     else:
