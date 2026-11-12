@@ -1,8 +1,8 @@
 # C 线 λ 修正主线 · 完整交接计划（新会话可直接接手）
 
-> 更新：2026-11-10 02:40 CST ｜ 执行者：C 线 Agent
+> 更新：2026-11-10 10:35 CST ｜ 执行者：C 线 Agent
 > **本文自包含**：读完这一份就能接着跑，不需要翻别的文档。
-> 交付物保护：`lora300_ddp/checkpoint_lora_best.pt` **全程不动**；新主线单独目录；任一 Gate 不过即回滚。
+> 交付物保护：`lora300_ddp/checkpoint_lora_best.pt` **全程不动**（已核 sha 仍是 `6942eab9…`）；新主线单独目录；任一 Gate 不过即回滚。
 
 ---
 
@@ -10,12 +10,13 @@
 
 | 事项 | 状态 |
 |---|---|
-| **正在跑** | `p14/main300`：**2 卡 DDP、从 scratch 300 步**，`λ_lim=0.00832` + `λ_margin=0.0679`（2026-11-10 **02:33 起**，约 6.1 s/步 ⇒ **~03:10 完成**） |
-| 日志 | `runs/dual_actor_wm6/c_lora/p14/train_main.log` |
-| 输出 | `runs/dual_actor_wm6/c_lora/p14/main300/` |
-| 已完成 | ① H=10/WM6 **重标定**（`p13/calib_h10/`）；② 发现了 `λ_lim` 超罚 3.7 倍的证据 |
-| 待做 | 训练健康检查 → Isaac 开环门 → **先单评 VisionNavi（6 seeds）** → 不行调 λ_recovery → 过了再护栏 → **6 任务 × 6 seeds（只跑 C，不跑 base）** |
-| 起步检查 | `ls runs/dual_actor_wm6/c_lora/p14/main300/summary.json` 是否已生成 |
+| **训练事故** | `p14/main300` 跑到 **it=115/300** 于 **02:53** 被整体杀掉（同秒 `c7` 两个 driver 也一起死）⇒ **容器/会话被回收，不是 OOM/代码 bug**（日志无 error/NaN，训练步时 6.4–6.8 s，末行 `187.1s/step` 是 `c7` 抢 0/1 卡导致）。**没有 `summary.json`** |
+| **现在在跑** | `p14/main300r`：从 `main300 @ update=100` **续训到 300**（10:26 起，约 6.5 s/步 ⇒ **~10:50 完成**）。`--resume` + `--peak-budget-json` 钉死 + critic 从 `critic_0100.pt` 续 |
+| 日志 / 输出 | `p14/train_main300r.log` / `p14/main300r/`（被中断的 `p14/main300/` **原样保留**，其 `checkpoint_lora_best.pt` = update 100） |
+| 已完成 | ① H=10/WM6 重标定（`p13/calib_h10/`）；② `λ_lim` 超罚 3.7 倍的证据；③ **`p14@100` 二次标定**（`p14/calib_ck100/`，见 §1.5）；④ update-100 健康数据（见 §1.6） |
+| 待做 | 训练跑满 300 → Gate A → Isaac 开环门 → **先单评 VisionNavi（6 seeds）** → 不行调 λ_recovery → 过了再护栏 → **6 任务 × 6 seeds（只跑 C，不跑 base）** |
+| 起步检查 | `ls runs/dual_actor_wm6/c_lora/p14/main300r/summary.json` 是否已生成 |
+| 停摆的旁支 | `c7`（旧交付物 base-vs-c 配对 6 任务 × 10 seed = 120 集）只完成 **8/120** 就一起被杀；**按决定等 Gate E 之后再跑** |
 
 ---
 
@@ -49,6 +50,15 @@
 
 **核心结论**：现配方 `λ_lim=0.0307` 的梯度占比 = `0.0307×1.868/0.039` = **147%**（同向分量 61%）⇒ **限位惩罚主导，是当前收益饱和的嫌疑主因**。改成标定值 `0.00832` 后回到 40% 预算。
 
+**A/B 清理结论（2026-11-10 复核，重要）**：上表"V8C 旧 λ（H20/WM0）"里的 `0.03068` **只是这个 λ 的标定口径**——它被原样搬进了 H=10/WM6 的训练。实测两份 `config.json`：交付物 `critic10/lora300_ddp` 与 `p14/main300` 的 `horizon=10`、`rollout_k=20`、WM sha `8edb59cf…`、eval_set、`lr/batch/updates/seed/critic*` **全部相同**，只有两处不同：
+
+| 项 | 旧（交付物） | 新（p14） |
+|---|---|---|
+| `lambda_lim` | 0.03068 | **0.00832** |
+| `lambda_margin`（κ） | 0（0.15） | **0.067918（0.05）** |
+
+⇒ 本轮是**干净的两变量对照**（λ_lim ↓3.7×，新增 margin），不需要再担心"H20/WM0 混着比"。
+
 ### 1.3 当前闭环基线（**按 seed 去重**，成功率=该 seed 至少成功一次）
 
 | 任务 | C(lora300_ddp) | C-V8C | base(B线) | base(r3) |
@@ -81,6 +91,40 @@ source scripts/harness03_env.sh        # 提供 trackerTask/trackerLab 的 PYTHO
 | 7 | `--record-video N` 不抽帧 | 这条链路实际每步都录；想快就设 0 |
 | 8 | 训练 OOM | 闭环在跑时不要同卡训练；训练 batch 8+accum4 可省一半显存 |
 | 9 | `c2_reward.py` 的 J10/J20 | **不可引用**（`frame_count` 是局部计数器）；只用 `success/episode_steps/joint_limit/action_rate` |
+| 10 | 训练续跑没有 `last` | trainer **只在收尾**写 `checkpoint_lora_last.pt`，中途被杀就没有它 ⇒ `--resume` 直接报错。做法：`cp checkpoint_lora_0100.pt checkpoint_lora_last.pt`（`trainer_state.pt` 也停在 100 步，自洽）；**不要开 `--strict-resume`**（存盘时 `fingerprint=None`，开了 fail-closed）；用 `--peak-budget-json` 钉死 b_j，否则 b_j 按新模型重标、续训段不可比 |
+| 11 | `trainer_state.pt` **不含 critic 权重** | resume 时 critic 走 `--critic-warm-from` ⇒ 要传 `p14/main300/critic_0100.pt`，否则裁判从预训权重重来（Adam 动量仍会丢，属已知损耗） |
+| 12 | 闭环评估与 DDP 抢卡 | 本次死因之一：`c7` 在 0/1 卡跑闭环，把训练步时从 6.5 s 拖到 187 s。**开训前先 `pgrep -af c2_driver[.]py` 确认没有闭环在占卡** |
+
+### 1.5 `p14@100` 二次标定（`p14/calib_ck100/`，adapter = p14 best）
+
+| 量 | p13（adapter=旧交付） | p14@100 | 判读 |
+|---|---|---|---|
+| ‖g_J‖ | 0.03885 | **0.04689**（+21%） | 模型更"可学"了 |
+| ‖g_lim‖ | 1.868 | 1.778 | −5% |
+| ‖g_margin‖ | 0.0429 | 0.0318 | −26% |
+| cos(g_lim, g_J) | +0.417 | +0.314 | 更正交 |
+| cos(g_margin, g_J) | +0.463 | **+0.073** | **几乎正交**（margin 不再帮 reward，只剩安全补偿） |
+| ‖g_rec‖ | 2.235 | 2.420 | ⇒ λ_rec 应为 **0.00581** |
+
+**换成本轮实际梯度预算**：`λ_lim` 占比 **31.5%**（预算 40%；旧配方 147%）、`λ_margin` 占比 **4.6%**（预算 7.5%）。
+
+- ⇒ §3 的兜底「λ_lim 折中到 0.012」**不触发、也不需要**（真取 0.012 = 45%，反而略超预算）。
+- ⇒ 想打满 margin 预算需 `λ_margin=0.1105`（这就是 C'-3 的实测依据）。
+- ⇒ `recovery_z0` 随 adapter 微动（body_linvel 0.567 / body_angvel 0.897）；本轮 `λ_recovery=0`，不受影响。
+
+### 1.6 update-100 的实测（部分 Gate A 证据，`p14/main300/val.jsonl`）
+
+| 项 | 实测 | Gate A 阈值 | 结论 |
+|---|---|---|---|
+| val `dJ` | **+0.00479** CI[+0.00370,+0.00596] | — | **已超旧交付物最好值 +0.00456** |
+| val 越限率 | 2.84% | ≤2.9% | ✅ |
+| `q_raw_absmax` | 4.420 | ≤4.5 | ✅ |
+| `L_lim` 趋势 | 1.60 → 1.08 | 下降 | ✅ |
+| `L_margin` 趋势 | 0.0399 → 0.0232 | 下降 | ✅ |
+| 限位代价 | vio 2.84% vs 旧 2.79–2.85%，逐关节 p99 基本持平 | — | **λ_lim 砍 3.7 倍没换来任何越限恶化** |
+
+> **旧配方在 300 步内封顶于 +0.00456（it=100），之后横盘 0.0033–0.0046** ⇒「限位惩罚压死收益」成立。
+> 但新配方是否同样在 100–150 附近饱和，只能看 `main300r` 的 150/200/250/300 四次 val。
 
 ---
 
@@ -108,11 +152,11 @@ source scripts/harness03_env.sh        # 提供 trackerTask/trackerLab 的 PYTHO
 
 ```bash
 cd /inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic-c-wm6
-ls runs/dual_actor_wm6/c_lora/p14/main300/summary.json     # 出现即完成
-grep -oE "it= +[0-9]+ J=[0-9.-]+ .*Llim=[0-9.]+.*Lmar=[0-9.]+" runs/dual_actor_wm6/c_lora/p14/train_main.log | tail -3
+ls runs/dual_actor_wm6/c_lora/p14/main300r/summary.json     # 出现即完成
+grep -oE "it= +[0-9]+ J=[0-9.-]+ .*Llim=[0-9.]+.*Lmar=[0-9.]+" runs/dual_actor_wm6/c_lora/p14/train_main300r.log | tail -3
 python3 -c "
 import json
-d=json.load(open('runs/dual_actor_wm6/c_lora/p14/main300/summary.json'))
+d=json.load(open('runs/dual_actor_wm6/c_lora/p14/main300r/summary.json'))
 print('updates',d['updates'],'best',d['best']); print('test',{k:d['test_once'][k] for k in ('dJ','dJ_ci_lo','dJ_ci_hi','limit_violation_frac','q_raw_abs_max')})"
 ```
 
@@ -122,12 +166,46 @@ print('updates',d['updates'],'best',d['best']); print('test',{k:d['test_once'][k
 |---|---|---|
 | 1 | `updates` | == 300 |
 | 2 | `L_margin` | 首段→末段**下降**。⚠️ 它的**损失贡献很小是正常的**（实测 `Lmar≈0.013`、`λ·L≈0.0009`，占 J 仅 0.1%）——margin 的强度是**梯度预算 7.5%**（标定保证），**不要用损失占比判断**；只看它是否在下降、以及越限率是否改善 |
-| 3 | `λ_lim·L_lim` | 损失占 J 的 **2–5%**（旧配方 4–8%）；梯度占比应为 **~40%**（旧配方 147%） |
+| 3 | **λ_lim 的梯度预算占比** | **≤40%**（旧配方 147%）。⚠️ **不要再用 `λ_lim·L_lim` 占 J 的比例判断**：实测只有 1.06%（旧 3.67%），那是 `L_lim` 自身从 1.60 掉到 1.08 造成的，与 λ 强度无关（见 §1.5/§1.6）。口径改为**现测梯度** |
 | 4 | val 越限率 | ≤ **2.9%**（pristine 2.81%） |
 | 5 | `q_raw_absmax` | ≤ **4.5** |
 | 6 | NaN / grad 爆炸 | 无 |
 
-> 若 Gate A 的 4/5 恶化：λ_lim 折中到 **0.012**（60% 预算）重训，其余不变。
+**第 3 条怎么现测**（约 2 min，只读，写新目录、不动交付物）：
+
+```bash
+cd /inspire/hdd/global_user/liumengfan-253108110079/wsc-workspace/comimic-c-wm6
+set +u; source scripts/harness03_env.sh; unset CUDA_VISIBLE_DEVICES
+python3 scripts/calibrate_c_v8_losses.py \
+  --ft8000 ../comimic/runs/groot_sonic_vla_ha_b64_lr1e-5/checkpoint-8000 \
+  --vlm-path ../comimic/groot_repro/nvidia/Cosmos-Reason2-2B-weights \
+  --eval-set ../comimic-wt03/runs/temporal_ac_bptt_v5/eval_set \
+  --limits-npz ../comimic-wt03/runs/three_track_v6/physical/limits_standard29.npz \
+  --adapter runs/dual_actor_wm6/c_lora/p14/main300r/checkpoint_lora_best.pt \
+  --H 10 --windows 48 --batch 16 --device cuda:0 --seed 0 \
+  --recovery-aggregate worst_window --margin-kappa 0.05 \
+  --wm ../comimic-wt03/runs/wm_base6_v1/wm_candidates/wm_base6_best_candidate/wm.pt \
+  --strict-wm-hash 8edb59cf --bptt-args ../comimic/runs/bptt1/args.json \
+  --out runs/dual_actor_wm6/c_lora/p14/calib_final
+# 然后：占比 = λ_lim × ‖g_abs‖ / ‖g_J‖（λ_margin × ‖g_margin‖ / ‖g_J‖ 同理）
+```
+
+> 若 Gate A 的 4/5 恶化：按 §1.5 的实测重解 λ（`λ_lim = 0.40·‖g_J‖/‖g_lim‖`），**不要照抄 0.012 这个数**——在 p14@100 的 adaper 上新解出的 40% 预算值其实是 **0.01055**，0.012 会超出预算。
+
+### 3.1 需要再次续训/重训时的配方（已踩过的坑）
+
+```bash
+cd .../comimic-c-wm6/runs/dual_actor_wm6/c_lora
+cp p14/main300/checkpoint_lora_0100.pt p14/main300/checkpoint_lora_last.pt   # 收尾才写 last，被杀就没有
+bash run_p14_resume.sh        # = OUT=main300r + WARM_FROM=critic_0100.pt
+                              #   EXTRA_ARGS='--lambda-* … --resume p14/main300
+                              #               --peak-budget-json p14/main300/peak_budget.json'
+```
+
+- **不要**加 `--strict-resume`（存盘时 `fingerprint=None`，会 fail-closed）；
+- `--peak-budget-json` 必须钉死，否则 b_j 按新模型重标，续训段与已跑段不可比；
+- critic 必须用 `critic_0100.pt` 续（`trainer_state.pt` 不含 critic 权重）；
+- 续训**不必**重标 `recovery_z0`（本轮 `λ_recovery=0`）。
 
 ---
 
@@ -137,7 +215,7 @@ print('updates',d['updates'],'best',d['best']); print('test',{k:d['test_once'][k
 # B1 生成 job（~3 min）
 export WT=$PWD; set +u; source scripts/harness03_env.sh
 python3 scripts/c_wm6/probe_c_vs_base_isaac_plan.py \
-  --adapter runs/dual_actor_wm6/c_lora/p14/main300/checkpoint_lora_best.pt \
+  --adapter runs/dual_actor_wm6/c_lora/p14/main300r/checkpoint_lora_best.pt \
   --eval-set ../comimic-wt03/runs/temporal_ac_bptt_v5/eval_set \
   --H 10 --per-task 8 --select random --split-key test --seed 777 \
   --wm ../comimic-wt03/runs/wm_base6_v1/wm_candidates/wm_base6_best_candidate/wm.pt \
@@ -179,7 +257,7 @@ nohup python3 scripts/c_wm6/c2_driver.py \
   --tasks VisionNavi --seeds 0 1 2 3 4 5 --arms c \
   --max-steps 3000 --workers 1 --episode-timeout 3600 --record-video 2 \
   --out runs/dual_actor_wm6/c_lora/c2/p14_nav \
-  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300/checkpoint_lora_best.pt \
+  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300r/checkpoint_lora_best.pt \
   --lora-tag p14 > runs/dual_actor_wm6/c_lora/c2/p14_nav.log 2>&1 &
 ```
 
@@ -201,10 +279,10 @@ nohup python3 scripts/c_wm6/c2_driver.py \
 
 | 顺序 | 改什么 | 配置 | 说明 |
 |---|---|---|---|
-| **C'-1** | **加 λ_recovery** | `--lambda-recovery 0.005214`、`--recovery-z0-json p13/calib_h10/recovery_z0.json`、`--recovery-aggregate worst_window --recovery-worst-t 0.25 --recovery-worst-b 0.10` | 预算 30%；**从 scratch 300 步重训**（保持血缘干净） |
+| **C'-1** | **加 λ_recovery** | `--lambda-recovery 0.005214`（p13 标定）或 **0.00581**（§1.5 用 p14@100 重解）、`--recovery-z0-json p13/calib_h10/recovery_z0.json`、`--recovery-aggregate worst_window --recovery-worst-t 0.25 --recovery-worst-b 0.10` | 预算 30%；**从 scratch 300 步重训**（保持血缘干净） |
 | **C'-2** | λ_recovery 降到一半 | `0.0026` | 若 C'-1 让护栏掉 |
-| **C'-3** | λ_margin 加倍 | `0.1358` | 只针对摔倒 |
-| **C'-4** | λ_lim 再降 | `0.0042`（20% 预算） | 若怀疑限位仍主导 |
+| **C'-3** | λ_margin 打到满预算 | **`0.1105`**（§1.5 实测：0.0679 只占 4.6%，满 7.5% 需 0.1105；原写的 0.1358 会到 9.2%） | 只针对摔倒 |
+| **C'-4** | λ_lim 再降 | `0.0042`（20% 预算）；但 §1.5 已实测 p14@100 时 40% 预算对应 λ=0.01055，**降到 0.0042 前先重测** | 若怀疑限位仍主导 |
 
 **注意**：每次重训后必须**重跑 Gate B（开环门）+ Gate C（nav 6 seeds）**，不允许只看训练曲线。
 
@@ -217,7 +295,7 @@ C2_SERVERS=c C2_PORT_C=18081 C2_GPU_C=1 C2_ISAAC_GPU=1 \
 python3 scripts/c_wm6/c2_driver.py --tasks OpenDoor SitSofa Boxing --seeds 0 1 2 3 --arms c \
   --max-steps 3000 --workers 1 --episode-timeout 3600 --record-video 2 \
   --out runs/dual_actor_wm6/c_lora/c2/p14_guard \
-  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300/checkpoint_lora_best.pt --lora-tag p14
+  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300r/checkpoint_lora_best.pt --lora-tag p14
 ```
 
 **Gate D**：OpenDoor **≥5/6**（当前 6/6）、SitSofa **≥4/6**（当前 5/6）、Boxing **≥4/6**（当前 4/6）。
@@ -237,14 +315,14 @@ C2_SERVERS=c C2_PORT_C=18080 C2_GPU_C=0 C2_ISAAC_GPU=0 \
 python3 scripts/c_wm6/c2_driver.py --tasks PPBox DoubleDesk SitSofa --seeds 0 1 2 3 4 5 --arms c \
   --max-steps 3000 --workers 1 --episode-timeout 3600 --record-video 2 \
   --out runs/dual_actor_wm6/c_lora/c2/final_p14_A \
-  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300/checkpoint_lora_best.pt --lora-tag p14
+  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300r/checkpoint_lora_best.pt --lora-tag p14
 
 # 卡1
 C2_SERVERS=c C2_PORT_C=18081 C2_GPU_C=1 C2_ISAAC_GPU=1 \
 python3 scripts/c_wm6/c2_driver.py --tasks VisionNavi OpenDoor Boxing --seeds 0 1 2 3 4 5 --arms c \
   --max-steps 3000 --workers 1 --episode-timeout 3600 --record-video 2 \
   --out runs/dual_actor_wm6/c_lora/c2/final_p14_B \
-  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300/checkpoint_lora_best.pt --lora-tag p14
+  --lora-ckpt runs/dual_actor_wm6/c_lora/p14/main300r/checkpoint_lora_best.pt --lora-tag p14
 ```
 
 **Gate E（最终）**
@@ -310,9 +388,9 @@ PY
 ## 11. 新会话接手清单（照着做）
 
 1. `date`、`nvidia-smi`：看有没有残留进程/占卡；
-2. `ls runs/dual_actor_wm6/c_lora/p14/main300/summary.json`：训练是否已完成；
-3. 若完成 → 走 §3 Gate A；若还在跑 → 等（`grep "it="` 看进度）；
-4. 若发现进程死了且没有 summary → 看 `p14/train_main.log` 尾部，**不要自动重跑**，先判因（OOM / NaN / 被杀）；
+2. `ls runs/dual_actor_wm6/c_lora/p14/main300r/summary.json`：训练是否已完成（`main300` 是 02:53 被杀的那次，只有 update-100 的 best）；
+3. 若完成 → 走 §3 Gate A；若还在跑 → 等（`grep "it=" runs/dual_actor_wm6/c_lora/p14/train_main300r.log`）；
+4. 若发现进程死了且没有 summary → 看 `p14/train_main300r.log` 尾部，**不要自动重跑**，先判因（被回收 / OOM / NaN）——本次死因就是**会话被回收**：同秒 `c7` 两个 driver 也一起消失，host uptime 82 天、容器服务在 09:58 才重建；
 5. 之后严格按 §4 → §5 → §6 → §7 的顺序，**不要跳 Gate**。
 
 ---
@@ -351,11 +429,15 @@ exec python3 -m torch.distributed.run --standalone --nproc_per_node=2 --master_p
 调用示例（本次主线）：
 
 ```bash
+# 首段（从 scratch 300 步，即被杀的那次；已完成 update 100）
 OUT=runs/dual_actor_wm6/c_lora/p14/main300 LR=1e-4 UPDATES=300 PLAN_STEPS=10 RANK_BATCH=16 \
 WARM_FROM=runs/dual_actor_wm6/c_lora/critic_pretrain_tail10/critic_pretrain.pt \
 EXTRA_ARGS='--lambda-lim 0.00832 --lambda-margin 0.067918 --margin-kappa 0.05 \
             --recovery-z0-json runs/dual_actor_wm6/c_lora/p13/calib_h10/recovery_z0.json' \
 bash runs/dual_actor_wm6/c_lora/run_p13_ddp.sh
+
+# 续训段（当前在跑，见 §3.1）
+bash runs/dual_actor_wm6/c_lora/run_p14_resume.sh
 ```
 
 ---

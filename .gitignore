@@ -97,3 +97,11 @@ third_party/SuperMimic-Reproduced/logs_smoke_ft318/
 # 冒烟/调试日志目录（只有 *.log）
 logs_smoke/
 recording_data/
+
+# 本机 web 入口说明（含访问 token，只留本地）
+dsh-web-url.txt
+
+# PPT 静态服务目录 / 解包产物（33 MB 生成 deck 与 unzip 副本，由 pptx 重新生成）
+docs/ppt_work/serve/
+docs/ppt_work/unz/
+docs/ppt_work/DOWNLOAD_URL.txt

@@ -37,6 +37,7 @@ export TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1
 TASK=${TASK:-DoubleDesk}
 SEED=${SEED:-0}
 REPEAT=${REPEAT:-0}
+EPISODE_SEED=${EPISODE_SEED:-$SEED}
 MAX_STEPS=${MAX_STEPS:-300}
 SERVER_URL=${SERVER_URL:-http://127.0.0.1:18080}
 ISAAC_GPU=${ISAAC_GPU:-0}
@@ -212,7 +213,7 @@ fi
 exec ${VGL_PREFIX} python -u script/eval_scripts/sonic/sim_eval_vla.py \
   --task "$TASK_ID" \
   --env_config_yaml "$TASK_YAML" \
-  --seed "$SEED" --repeat_idx "$REPEAT" \
+  --seed "$SEED" --repeat_idx "$REPEAT" --episode_seed "$EPISODE_SEED" \
   --max_steps "$MAX_STEPS" \
   --sm_ckpt "$SM_CKPT" --sm_obs_mode "${SM_OBS_MODE:-auto}" --sm_token_source "$SM_TOKEN_SOURCE" \
   --sm_token_npy "${SM_TOKEN_NPY:-}" --sm_hands_npy "${SM_HANDS_NPY:-}" \

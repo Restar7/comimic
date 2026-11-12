@@ -350,6 +350,7 @@ class Engine:
                     str(getattr(args, "state_order", "ha_v31")),
                     str(getattr(args, "layout_check_npz", LAYOUT_CHECK_GLOB)))
             self._load()
+        self._load_delta_v5()
 
     # ---- S0.3/J3：训练与服务端的 FM 步数必须一致（vla_meta.json 由 export_vla_ckpt 写入）
     def _check_fm_steps(self) -> int | None:
@@ -427,6 +428,38 @@ class Engine:
         if getattr(self.args, "head_ckpt", ""):
             self._load_head(self.args.head_ckpt)
         print(f"[server] model loaded, image_hw={self.image_hw}", flush=True)
+
+
+    def _load_delta_v5(self) -> None:
+        # ---- v5：**per-frame** Δtoken（TemporalDeltaActorV5）+ state_hist_10 ----
+        self.delta_v5_net = None
+        self.delta_v5_spec = None
+        _v5ckpt = str(getattr(self.args, "delta_v5_ckpt", "") or "")
+        if _v5ckpt:
+            import torch as _torch  # noqa: PLC0415
+            from diff_vla_wbc.delta_token_io_v5 import (  # noqa: PLC0415
+                load_delta_token_v5_from_checkpoint)
+            _obj = _torch.load(_v5ckpt, map_location="cpu", weights_only=False)
+            try:
+                _net5, _spec5 = load_delta_token_v5_from_checkpoint(
+                    _obj, device=self.args.device,
+                    state_joint_order=str(getattr(self.args, "delta_v5_state_order", "ha_v31")),
+                    hist_joint_order=str(getattr(self.args, "delta_v5_hist_order", "standard")))
+            except Exception as exc:  # noqa: BLE001
+                raise SystemExit(f"[server][delta-v5] 加载失败：{exc}") from exc
+            if _net5 is None:
+                raise SystemExit(f"[server][delta-v5] {_v5ckpt} 不是 v5 checkpoint")
+            self.delta_v5_net = _net5
+            self.delta_v5_spec = _spec5
+            print(f"[server][delta-v5] loaded params={_net5.n_params} T/K/H="
+                  f"{_spec5.T}/{_spec5.K}/{_spec5.H} cap={_spec5.cap:g} "
+                  f"state_order={_spec5.state_joint_order} hist_order={_spec5.hist_joint_order}",
+                  flush=True)
+            print(f"[server][delta-v5] meta="
+                  f"{ {k: v for k, v in _spec5.meta.items() if k in ('data_mode','seed','train_commit')} }",
+                  flush=True)
+            if getattr(self, "delta_token_net", None) is not None:
+                print("[server][delta-v5] WARN v4 的 delta_token_state 也在，v5 优先", flush=True)
 
     def _load_head(self, path: str) -> None:
         """S3 §3.2：把联合微调后的 action head 权重装进**已验证**的 server。
@@ -516,12 +549,12 @@ class Engine:
         else:
             print("[server][delta-token] ckpt 里没有 delta_token_state ⇒ Δ模块关闭"
                   "（如果这一轮训练开了 DELTA_TOKEN，说明装错了 checkpoint）", flush=True)
-        self._head_loaded = True
+
 
     # ---------------------------------------------------------------- inference
     def infer(self, rgb: np.ndarray, state64: np.ndarray, task: str,
               state_extra6=None, state46_in=None,
-              hands14_in=None) -> tuple[np.ndarray, np.ndarray]:
+              hands14_in=None, state_hist_10=None) -> tuple[np.ndarray, np.ndarray]:
         with self.lock:
             # ★ 2026-11-03 真 bug（手部幅度只有 1/5 的根因）：
             #   客户端其实**发了真实的 46 维状态**（29 关节 + 14 手 + 重力，
@@ -648,12 +681,47 @@ class Engine:
                 fingers = np.mean(np.stack(_fins, 0), 0).astype(np.float32)
             else:
                 chunk64, fingers = _toks[0], _fins[0]
-            # ★ 命令层残差：用**本次请求的 state64** 算 Δ，广播到整段 chunk（= 训练侧
-            #   `d.unsqueeze(1)` 的同一个语义：整段 40 帧共用第 0 帧 token 上算出的 Δ）。
+            # ★ v5（per-frame）：用 state64 + hist10 算 (T,64) 的 Δ，**按帧**只加 t<K。
+            #   关节序/default 一致性由 `delta_from_chunk_full_v5(check_consistency=True)`
+            #   在运行期 fail-closed 校验（hist10[-1] 必须与 state64 对齐）。
+            if getattr(self, "delta_v5_net", None) is not None:
+                from diff_vla_wbc.delta_token_io_v5 import (  # noqa: PLC0415
+                    apply_delta_per_frame, delta_from_chunk_full_v5)
+                if state_hist_10 is None:
+                    raise RuntimeError(
+                        "[server][delta-v5] 请求缺 state_hist_10（客户端需 SM_VLA_HIST10=1）")
+                _h10 = np.asarray(state_hist_10, dtype=np.float32).copy()
+                if int(getattr(self.args, "delta_v5_hist_absolute", 1)) == 1:
+                    _dq_meta = (self.delta_v5_spec.meta or {}).get("hist_default_joint_pos")
+                    if _dq_meta is None:
+                        raise RuntimeError("[server][delta-v5] ckpt meta 缺 hist_default_joint_pos")
+                    _dq_meta = np.asarray(_dq_meta, dtype=np.float32).reshape(-1)
+                    if _dq_meta.size != 29:
+                        raise RuntimeError("[server][delta-v5] hist_default_joint_pos 不是 29 维")
+                    # 客户端给的是**绝对角**；q_block 的关节序由 --delta-v5-hist-order 决定。
+                    # 训练 default 存的是 standard 序 ⇒ 若 hist 是 ha_v31，先换到 ha 序再减。
+                    if str(getattr(self.args, "delta_v5_hist_order", "standard")) == "ha_v31":
+                        from diff_vla_wbc.delta_token_io_v5 import joint_permutation  # noqa: PLC0415
+                        _dq_meta = _dq_meta[joint_permutation("standard", "ha_v31")]
+                    _h10[:, :29] = _h10[:, :29] - _dq_meta[None, :]
+                _d5 = delta_from_chunk_full_v5(
+                    chunk64, state64, _h10, self.delta_v5_net, self.delta_v5_spec,
+                    hist_state_tol=float(getattr(self.args, "delta_v5_tol", 5e-3)))
+                chunk64 = apply_delta_per_frame(chunk64, _d5, self.delta_v5_spec)
+                self._dt5_n = int(getattr(self, "_dt5_n", 0)) + 1
+                if self._dt5_n % 20 == 1:
+                    _K = int(self.delta_v5_spec.K)
+                    print(f"[server][delta-v5] #{self._dt5_n} |Δ|mean(t<K)="
+                          f"{float(np.linalg.norm(_d5[:_K], axis=-1).mean()):.4f} "
+                          f"max={float(np.linalg.norm(_d5[:_K], axis=-1).max()):.4f} "
+                          f"tail_zero={bool(np.abs(_d5[_K:]).max() == 0.0)} "
+                          f"hist_last_q0={float(_h10[-1, 0]):+.3f}", flush=True)
+            # ★ 命令层残差（v4，共享 Δ）：只在 v5 未启用时走
             #   特征构造（含 **关节序置换** 与 35/64 两种口径）全部走
             #   `delta_token_io`，与 `probe_ft_landing.py`、与训练侧 `_delta_token_features`
             #   共用同一份实现 —— 这是唯一防"训练/部署特征不同"的地方。
-            if getattr(self, "delta_token_net", None) is not None:
+            if (getattr(self, "delta_v5_net", None) is None
+                    and getattr(self, "delta_token_net", None) is not None):
                 from diff_vla_wbc.delta_token_io import (  # noqa: PLC0415
                     delta_features_from_state64,
                     delta_from_token_chunk,
@@ -811,8 +879,10 @@ class Handler(BaseHTTPRequestHandler):
             _e6 = req["observation"].get("state_extra6")
             _s46 = req["observation"].get("state46")
             _h14in = req["observation"].get("hands14")
+            _h10in = req["observation"].get("state_hist_10")
             chunk, hands = self.engine.infer(rgb, state, task, state_extra6=_e6,
-                                             state46_in=_s46, hands14_in=_h14in)
+                                             state46_in=_s46, hands14_in=_h14in,
+                                             state_hist_10=_h10in)
             dt_ms = (time.time() - t0) * 1e3
             # One line per request: proves the sim is really driving the VLA (闭环证据) and
             # gives the latency series for ablation reporting.  Cheap: ~1 line per 40 steps.
@@ -883,6 +953,18 @@ def main() -> int:
                     help="order of the 29 joints inside the incoming 64-d vla_state "
                          "(ha_v31 = HumanoidArena asset order, which the current ckpt was "
                          "trained on; standard = trackerlab/MuJoCo order)")
+    ap.add_argument("--delta-v5-ckpt", type=Path, default=None,
+                    help="v5 **per-frame** Δtoken checkpoint（TemporalDeltaActorV5）；与 v4 的 "
+                         "--delta-token 互斥，优先走 v5")
+    ap.add_argument("--delta-v5-state-order", choices=("ha_v31", "standard"), default="ha_v31",
+                    help="请求里 state64 的关节序（HA client 发的是 asset 序 = ha_v31）")
+    ap.add_argument("--delta-v5-hist-order", choices=("ha_v31", "standard"), default="standard",
+                    help="请求里 state_hist_10 的关节序（HA provider 的 obs 历史 = standard）")
+    ap.add_argument("--delta-v5-hist-absolute", type=int, default=1,
+                    help="1=请求的 state_hist_10 的 q 块是**绝对角**（client 默认），server 减 ckpt 里的 "
+                         "hist_default_joint_pos；0=已经是 q−default")
+    ap.add_argument("--delta-v5-tol", type=float, default=5e-3,
+                    help="hist10[-1] 与 state64 的一致性容差（rad）；对不上直接报错")
     ap.add_argument("--delta-feat-joint-order", choices=("auto", "standard", "ha_v31"),
                     default=os.environ.get("DELTA_FEAT_JOINT_ORDER", "auto"),
                     help="★ 2026-11-07（会话 01）：Δtoken 的**特征里**关节块要按哪个顺序喂。"
@@ -891,6 +973,10 @@ def main() -> int:
                          "而线上 state64 的 dof_pos/dof_vel 是 HA_V31 序 ⇒ auto 会做一次置换。"
                          "auto = 先读 ckpt 的 delta_token_meta.feat_joint_order，没有就用训练历史约定 "
                          "(standard)。只有当你能证明某份 ckpt 是在 HA_V31 序的 state 上训的，才传 ha_v31")
+    ap.add_argument("--no-layout-check", action="store_true",
+                    help="跳过 46 维布局校验（不推荐；仅 layout_check_npz 不可用时）")
+    ap.add_argument("--layout-check-npz", default="data/npz/ha_tokens",
+                    help="布局校验用的训练 npz 目录/glob（默认相对 cwd）")
     ap.add_argument("--state-layout", choices=("train_v1", "legacy"), default="legacy",
                     help="46 维 state 的分块布局。**默认 legacy = [joints29|hands14|gravity3]**，"
                          "这是 data/npz/ha_tokens 里 g1_state_46 的真实布局，也是 checkpoint 的 "

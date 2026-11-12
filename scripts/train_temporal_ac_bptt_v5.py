@@ -421,6 +421,9 @@ def main() -> int:  # noqa: C901
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--warmup-updates", type=int, default=50)
     ap.add_argument("--use-history", type=int, default=1)
+    ap.add_argument("--init-actor", default="",
+                    help="★本实验唯一与 v5 文档不同的地方：从 v5 格式 ckpt 初始化 Actor"
+                         "（监督蒸馏预训练），其余超参/损失/结构/流程与文档完全一致")
     ap.add_argument("--actor-kind", default="temporal", choices=["temporal", "pos_template"],
                     help="temporal=v5 条件化 Actor；pos_template=逐帧常量模板（防伪对照 A2）")
     ap.add_argument("--lambda-raw", type=float, default=0.0,
@@ -530,6 +533,19 @@ def main() -> int:  # noqa: C901
         actor = TemporalDeltaActorV5(cfg).to(dev)
     d03.log(f"[v5] Actor {actor.n_params:,} 参数 d_in={actor.d_in} | T={T_chunk} K={K} H={H} "
             f"| history={'ON' if a.use_history else 'OFF'}")
+    # ★ 初始化（唯一偏离：不随机初始化，而是加载监督蒸馏的 Actor）
+    if str(getattr(a, "init_actor", "") or ""):
+        _ck = torch.load(str(a.init_actor), map_location="cpu", weights_only=False)
+        _sd = (_ck.get("delta_token_v5_state") or _ck.get("state_dict") or _ck)
+        _res = actor.load_state_dict(_sd, strict=True)
+        with torch.no_grad():
+            _z = torch.zeros(2, T_chunk, 64, device=dev)
+            _s = torch.zeros(2, 64, device=dev)
+            _hh = torch.zeros(2, 10, actor.cfg.hist_dim, device=dev)
+            _d = actor(_z, _s, _hh, mask_full[None].expand(2, -1), cap=float(a.cap))
+        d03.log(f"[v5][init] Actor 从 {a.init_actor} 初始化（strict=True OK）"
+                f" ‖Δ‖(零输入)={float(_d.norm(dim=-1).mean()):.5f}"
+                f" spec={_ck.get('delta_token_v5_spec', {}) if isinstance(_ck, dict) else {}}")
 
     enc_params, head_params = [], []
     _enc_prefix = ("token_proj", "pe_chunk", "chunk_encoder", "chunk_norm", "hist_gru", "pe_pos")

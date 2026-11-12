@@ -124,6 +124,12 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--holdout-groups", type=int, default=2, help="按 frame 分 10 段，留出前 N 段")
+    # ★ 2026-11-07 修 bug：逐帧标签只有前 K 帧非零（t≥K 的 token 影响不到 K 步回报，标签精确为 0）。
+    #   以前这里没有 mask ⇒ ① 一半输出维度在学"输出 0"；② 报出的 cos 是 40 帧平均，
+    #   20 个零帧各贡献 cos=0 ⇒ **数字被 2× 稀释，跨脚本不可比**（B1~B5 vs v5 的 0.397）。
+    #   `--mask-frames 0` = 旧行为（只为复现历史数字，不要用于新结论）。
+    ap.add_argument("--mask-frames", type=int, default=20,
+                    help="只在这些帧上计损失/cos（0=全部，旧行为）；应等于 teacher 的 reward 视界")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -146,6 +152,15 @@ def main() -> int:
         out_dim = TOKEN_DIM
     print(f"[target] {'逐帧' if a.per_frame else '共享'}  out_dim={out_dim}  "
           f"‖y‖ 均值={np.linalg.norm(Y.reshape(len(Y), -1, 64), axis=-1).mean():.4f}")
+
+    # ---- 监督 mask：只在前 K 帧（逐帧标签在 t≥K 上精确为 0）----
+    Km = T if int(a.mask_frames) <= 0 else min(int(a.mask_frames), T)
+    mask = np.zeros((N, T), np.float32)
+    mask[:, :Km] = 1.0
+    if a.per_frame:
+        print(f"[mask] 只监督前 {Km}/{T} 帧（旧口径会把 cos 稀释 {Km / T:.2f}×）")
+    else:
+        print(f"[mask] 共享 Δ：不适用逐帧 mask（K={Km}）")
 
     # 按 frame 分段留出（同一片段不跨两侧）
     fr = d["frame"].astype(np.float64)
@@ -172,16 +187,21 @@ def main() -> int:
     Xm, Xs = X.mean(0), X.std(0) + 1e-8
     Xn = torch.tensor((X - Xm) / Xs, device=dev)
     Yt = torch.tensor(Y, device=dev)
+    Mt = torch.tensor(mask, device=dev)
     itr = torch.tensor(tr, device=dev)
     ite = torch.tensor(te, device=dev)
 
-    def cos_of(idx: torch.Tensor) -> float:
+    def cos_of(idx: torch.Tensor, masked: bool = True) -> float:
+        """masked=True → 只在有效帧上平均（口径与 `pretrain_v5_supervised.py` 一致）。"""
         with torch.no_grad():
             p = net(Xn[idx])
             y = Yt[idx]
             p = p.reshape(len(idx), -1, 64)
             y = y.reshape(len(idx), -1, 64)
             c = (p * y).sum(-1) / (p.norm(dim=-1).clamp_min(1e-9) * y.norm(dim=-1).clamp_min(1e-9))
+            if masked and a.per_frame:
+                m = Mt[idx]
+                return float((c * m).sum() / m.sum().clamp_min(1e-6))
             return float(c.mean())
 
     best, best_state = -1.0, None
@@ -194,15 +214,20 @@ def main() -> int:
             opt.zero_grad(set_to_none=True)
             p = net(Xn[j]).reshape(len(j), -1, 64)
             y = Yt[j].reshape(len(j), -1, 64)
-            loss = ((p - y) ** 2).sum(-1).mean()
+            if a.per_frame and Km < T:
+                m = Mt[j]
+                loss = (((p - y) ** 2).sum(-1) * m).sum() / m.sum().clamp_min(1e-6)
+            else:
+                loss = ((p - y) ** 2).sum(-1).mean()
             loss.backward()
             opt.step()
             tot += float(loss) * len(j)
         sched.step()
         if ep % 5 == 4 or ep == int(a.epochs) - 1:
             c_te, c_tr = cos_of(ite), cos_of(itr[:4096])
-            print(f"[ep {ep:3d}] loss={tot / len(idx):.5f}  held-out cos={c_te:+.3f}  train cos={c_tr:+.3f}",
-                  flush=True)
+            c_te_old = cos_of(ite, masked=False) if a.per_frame else c_te
+            print(f"[ep {ep:3d}] loss={tot / len(idx):.5f}  held-out cos={c_te:+.3f}  train cos={c_tr:+.3f}"
+                  f"  (旧口径 {c_te_old:+.3f})", flush=True)
             if c_te > best:
                 best = c_te
                 best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
